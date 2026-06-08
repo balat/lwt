@@ -1,0 +1,4 @@
+(executable
+ (name bench_bind)
+ (enabled_if (>= %{ocaml_version} "5.0"))
+ (libraries lwt lwt.unix lwt_effects unix))
