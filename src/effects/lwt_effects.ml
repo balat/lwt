@@ -60,22 +60,74 @@ let cancel (type a) (p : a t) : unit =
   | Fulfilled _ | Rejected _ -> ()
 
 (* ------------------------------------------------------------------ *)
+(* Fiber-local storage (Lwt.key)                                      *)
+(* ------------------------------------------------------------------ *)
+
+(* Same trick as Lwt (no Obj.magic): each key owns a typed scratch cell, and the
+   storage maps a key id to a "refresh" closure that writes the stored value
+   into that cell. The current storage is restored on every fiber resume/start
+   (see [run_scheduler] and the [Await]/[Yield] handler), so a value set with
+   [with_value] survives suspensions and is inherited by spawned fibers. *)
+module Storage_map = Map.Make (Int)
+
+type storage = (unit -> unit) Storage_map.t
+type 'a key = { id : int; mutable value : 'a option }
+
+let next_key_id = ref 0
+
+let new_key () =
+  let id = !next_key_id in
+  incr next_key_id;
+  { id; value = None }
+
+let empty_storage : storage = Storage_map.empty
+let current_storage = ref empty_storage
+
+let get_from_storage key storage =
+  match Storage_map.find_opt key.id storage with
+  | Some refresh ->
+    refresh ();
+    let value = key.value in
+    key.value <- None;
+    value
+  | None -> None
+
+let modify_storage key value storage =
+  match value with
+  | Some _ -> Storage_map.add key.id (fun () -> key.value <- value) storage
+  | None -> Storage_map.remove key.id storage
+
+let get key = get_from_storage key !current_storage
+
+let with_value key value f =
+  let saved = !current_storage in
+  current_storage := modify_storage key value saved;
+  match f () with
+  | r ->
+    current_storage := saved;
+    r
+  | exception e ->
+    current_storage := saved;
+    raise e
+
+(* ------------------------------------------------------------------ *)
 (* Scheduler state                                                    *)
 (* ------------------------------------------------------------------ *)
 
 (* A ready unit of work in the run queue. [Resume] avoids allocating a
    [fun () -> continue k r] closure for every suspension: the waiter pushes the
-   continuation and its result directly. *)
+   continuation and its result directly. Each task carries the fiber-local
+   storage to restore before it runs. *)
 type task =
-  | Thunk of (unit -> unit)
-  | Resume : 'b * ('b, unit) Effect.Deep.continuation -> task
+  | Thunk of storage * (unit -> unit)
+  | Resume : storage * 'b * ('b, unit) Effect.Deep.continuation -> task
 
 (* Growable ring buffer used as the run queue. Stdlib.Queue allocates a list
    cell on every push; this allocates only when it has to grow. Capacity is kept
    a power of two so indexing uses [land] instead of [mod]. A sentinel fills
    freed slots so consumed continuations are not retained. *)
 module Run_queue = struct
-  let sentinel : task = Thunk ignore
+  let sentinel : task = Thunk (Storage_map.empty, ignore)
 
   type t = { mutable a : task array; mutable head : int; mutable len : int }
 
@@ -106,7 +158,8 @@ module Run_queue = struct
 end
 
 let run_queue : Run_queue.t = Run_queue.create ()
-let enqueue (f : unit -> unit) : unit = Run_queue.push run_queue (Thunk f)
+let enqueue (f : unit -> unit) : unit =
+  Run_queue.push run_queue (Thunk (!current_storage, f))
 
 (* Shared [Ok ()] outcome: events and [pause] all resolve unit promises, so
    there is no need to allocate a fresh [Ok ()] each time. *)
@@ -215,8 +268,10 @@ let handler : (unit, unit) Effect.Deep.handler =
     | Await p ->
       Some
         (fun k ->
-          add_waiter p (fun r -> Run_queue.push run_queue (Resume (r, k))))
-    | Yield -> Some (fun k -> Run_queue.push run_queue (Resume ((), k)))
+          let s = !current_storage in
+          add_waiter p (fun r -> Run_queue.push run_queue (Resume (s, r, k))))
+    | Yield ->
+      Some (fun k -> Run_queue.push run_queue (Resume (!current_storage, (), k)))
     | _ -> None
   in
   { retc; exnc; effc }
@@ -306,13 +361,18 @@ let rec run_scheduler () : unit =
   end
   else begin
     (match Run_queue.pop run_queue with
-    | Thunk f -> f ()
-    | Resume (v, k) -> Effect.Deep.continue k v);
+    | Thunk (s, f) ->
+      current_storage := s;
+      f ()
+    | Resume (s, v, k) ->
+      current_storage := s;
+      Effect.Deep.continue k v);
     run_scheduler ()
   end
 
 let run (type a) (main : unit -> a t) : a =
   !on_reset ();
+  current_storage := empty_storage;
   let outcome = ref None in
   spawn (fun () ->
     let r = try await_result (main ()) with e -> Error e in

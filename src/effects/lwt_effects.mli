@@ -206,6 +206,15 @@ val async_exception_hook : (exn -> unit) ref
 val dont_wait : (unit -> unit t) -> (exn -> unit) -> unit
 val ignore_result : 'a t -> unit
 
+(** Fiber-local storage, as {!Lwt.key}. A value set with {!with_value} is visible
+    to {!get} for the dynamic extent of the callback, survives suspensions, and
+    is inherited by fibers spawned (via {!async}) during that extent. *)
+type 'a key
+
+val new_key : unit -> 'a key
+val get : 'a key -> 'a option
+val with_value : 'a key -> 'a option -> (unit -> 'b) -> 'b
+
 val no_cancel : 'a t -> 'a t
 (** Approximation (cancellation isolation is not modelled). *)
 

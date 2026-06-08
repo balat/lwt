@@ -220,6 +220,54 @@ let () =
   in
   check "finalize runs cleanup" (r = 99 && List.rev !steps = [ "body"; "final" ])
 
+(* Fiber-local storage: scope, survival across suspension, async inheritance,
+   per-fiber isolation. *)
+let () =
+  let k = new_key () in
+  let inside, outside =
+    run (fun () ->
+      let+ inside = with_value k (Some 42) (fun () ->
+        let* () = pause () in
+        return (get k))
+      in
+      (inside, get k))
+  in
+  check "storage in scope (survives suspension)" (inside = Some 42);
+  check "storage out of scope" (outside = None)
+
+let () =
+  let k = new_key () in
+  let r =
+    run (fun () ->
+      with_value k (Some 7) (fun () ->
+        let child = async (fun () -> let* () = pause () in return (get k)) in
+        child))
+  in
+  check "storage inherited by async child" (r = Some 7)
+
+let () =
+  let k = new_key () in
+  let results = ref [] in
+  run (fun () ->
+    let a =
+      async (fun () ->
+        with_value k (Some "a") (fun () ->
+          let* () = pause () in
+          results := ("a", get k) :: !results;
+          return ()))
+    in
+    let b =
+      async (fun () ->
+        with_value k (Some "b") (fun () ->
+          let* () = pause () in
+          results := ("b", get k) :: !results;
+          return ()))
+    in
+    let* () = a in
+    b);
+  check "storage per-fiber isolation"
+    (List.sort compare !results = [ ("a", Some "a"); ("b", Some "b") ])
+
 let () =
   if !failures = 0 then print_endline "\nAll tests passed."
   else begin
