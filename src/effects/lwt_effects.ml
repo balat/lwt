@@ -63,8 +63,19 @@ let cancel (type a) (p : a t) : unit =
 (* Scheduler state                                                    *)
 (* ------------------------------------------------------------------ *)
 
-let run_queue : (unit -> unit) Queue.t = Queue.create ()
-let enqueue (f : unit -> unit) : unit = Queue.push f run_queue
+(* A ready unit of work in the run queue. [Resume] avoids allocating a
+   [fun () -> continue k r] closure for every suspension: the waiter pushes the
+   continuation and its result directly. *)
+type task =
+  | Thunk of (unit -> unit)
+  | Resume : 'b * ('b, unit) Effect.Deep.continuation -> task
+
+let run_queue : task Queue.t = Queue.create ()
+let enqueue (f : unit -> unit) : unit = Queue.push (Thunk f) run_queue
+
+(* Shared [Ok ()] outcome: events and [pause] all resolve unit promises, so
+   there is no need to allocate a fresh [Ok ()] each time. *)
+let ok_unit : (unit, exn) result = Ok ()
 
 (* Number of engine events (timers, fd waits) this scheduler is currently
    waiting for. We track it ourselves rather than reading Lwt_engine's counts:
@@ -72,24 +83,25 @@ let enqueue (f : unit -> unit) : unit = Queue.push f run_queue
    descriptor, which would otherwise make the scheduler block forever. *)
 let outstanding = ref 0
 
-(* Register a one-shot engine event for the pending promise [p]. When the event
-   fires (or [p] is cancelled) the event is stopped, the outstanding count is
-   decremented, and [p] is resolved with [result] (on a normal fire). *)
-let setup_event (type a) (p : a t)
-    (register : (Lwt_engine.event -> unit) -> Lwt_engine.event)
-    (result : (a, exn) result) : unit =
+(* Register a one-shot engine event resolving the pending unit promise [p]. The
+   fire callback uses its own [ev] argument to stop itself (no ref cell), and is
+   guarded by [p]'s state so a double fire cannot double-decrement. Cancellation
+   stops the captured event and decrements the count. *)
+let setup_event (p : unit t)
+    (register : (Lwt_engine.event -> unit) -> Lwt_engine.event) : unit =
   incr outstanding;
-  let event = ref Lwt_engine.fake_event in
-  let finished = ref false in
-  let finish () =
-    if not !finished then begin
-      finished := true;
+  let fire ev =
+    match p.st with
+    | Pending _ ->
       decr outstanding;
-      Lwt_engine.stop_event !event
-    end
+      Lwt_engine.stop_event ev;
+      fill p ok_unit
+    | Return _ | Fail _ -> ()
   in
-  event := register (fun _ev -> finish (); fill p result);
-  set_on_cancel p finish
+  let event = register fire in
+  set_on_cancel p (fun () ->
+    decr outstanding;
+    Lwt_engine.stop_event event)
 
 (* ------------------------------------------------------------------ *)
 (* Effects                                                            *)
@@ -160,9 +172,7 @@ let handler : (unit, unit) Effect.Deep.handler =
       b Effect.t -> ((b, unit) Effect.Deep.continuation -> unit) option =
     function
     | Await p ->
-      Some
-        (fun k ->
-          add_waiter p (fun r -> enqueue (fun () -> Effect.Deep.continue k r)))
+      Some (fun k -> add_waiter p (fun r -> Queue.push (Resume (r, k)) run_queue))
     | _ -> None
   in
   { retc; exnc; effc }
@@ -204,14 +214,14 @@ let pick (ps : 'a t list) : 'a t =
 
 let pause () : unit t =
   let p = new_pending () in
-  enqueue (fun () -> fill p (Ok ()));
+  enqueue (fun () -> fill p ok_unit);
   p
 
 let sleep (d : float) : unit t =
   if d <= 0. then pause ()
   else begin
     let p = new_pending () in
-    setup_event p (fun cb -> Lwt_engine.on_timer d false cb) (Ok ());
+    setup_event p (fun cb -> Lwt_engine.on_timer d false cb);
     p
   end
 
@@ -221,8 +231,11 @@ let sleep (d : float) : unit t =
 
 let rec run_scheduler () : unit =
   match Queue.take_opt run_queue with
-  | Some thunk ->
-    thunk ();
+  | Some (Thunk f) ->
+    f ();
+    run_scheduler ()
+  | Some (Resume (v, k)) ->
+    Effect.Deep.continue k v;
     run_scheduler ()
   | None ->
     if !outstanding > 0 then begin
@@ -257,34 +270,39 @@ module Io = struct
   (* Suspend the current fiber until [fd] is readable / writable, using the
      engine. The promise's cancel action stops the engine event so a cancelled
      wait leaks nothing. *)
-  let wait fd register =
+  let wait register fd =
     let p = new_pending () in
-    setup_event p (fun cb -> register fd cb) (Ok ());
+    setup_event p (register fd);
     await p
 
-  let wait_readable fd = wait fd Lwt_engine.on_readable
-  let wait_writable fd = wait fd Lwt_engine.on_writable
+  let wait_readable fd = wait Lwt_engine.on_readable fd
+  let wait_writable fd = wait Lwt_engine.on_writable fd
 
-  let retry_eagain op fd wait_ready =
-    let rec loop () =
-      match op () with
-      | result -> result
-      | exception
-          Unix.Unix_error ((Unix.EAGAIN | Unix.EWOULDBLOCK | Unix.EINTR), _, _)
-        ->
-        wait_ready fd;
-        loop ()
-    in
-    loop ()
+  (* Specialised retry loops (rather than a generic [retry_eagain op]) so the
+     hot path allocates no per-call operation closure. *)
+  let rec read fd buf off len =
+    match Unix.read fd buf off len with
+    | n -> n
+    | exception
+        Unix.Unix_error ((Unix.EAGAIN | Unix.EWOULDBLOCK | Unix.EINTR), _, _) ->
+      wait_readable fd;
+      read fd buf off len
 
-  let read fd buf off len =
-    retry_eagain (fun () -> Unix.read fd buf off len) fd wait_readable
+  let rec write fd buf off len =
+    match Unix.write fd buf off len with
+    | n -> n
+    | exception
+        Unix.Unix_error ((Unix.EAGAIN | Unix.EWOULDBLOCK | Unix.EINTR), _, _) ->
+      wait_writable fd;
+      write fd buf off len
 
-  let write fd buf off len =
-    retry_eagain (fun () -> Unix.write fd buf off len) fd wait_writable
-
-  let accept fd =
-    retry_eagain (fun () -> Unix.accept fd) fd wait_readable
+  let rec accept fd =
+    match Unix.accept fd with
+    | res -> res
+    | exception
+        Unix.Unix_error ((Unix.EAGAIN | Unix.EWOULDBLOCK | Unix.EINTR), _, _) ->
+      wait_readable fd;
+      accept fd
 
   let connect fd addr =
     match Unix.connect fd addr with
