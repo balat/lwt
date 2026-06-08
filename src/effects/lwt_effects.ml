@@ -70,8 +70,43 @@ type task =
   | Thunk of (unit -> unit)
   | Resume : 'b * ('b, unit) Effect.Deep.continuation -> task
 
-let run_queue : task Queue.t = Queue.create ()
-let enqueue (f : unit -> unit) : unit = Queue.push (Thunk f) run_queue
+(* Growable ring buffer used as the run queue. Stdlib.Queue allocates a list
+   cell on every push; this allocates only when it has to grow. Capacity is kept
+   a power of two so indexing uses [land] instead of [mod]. A sentinel fills
+   freed slots so consumed continuations are not retained. *)
+module Run_queue = struct
+  let sentinel : task = Thunk ignore
+
+  type t = { mutable a : task array; mutable head : int; mutable len : int }
+
+  let create () = { a = Array.make 16 sentinel; head = 0; len = 0 }
+  let is_empty q = q.len = 0
+
+  let grow q =
+    let cap = Array.length q.a in
+    let a' = Array.make (2 * cap) sentinel in
+    for i = 0 to q.len - 1 do
+      a'.(i) <- q.a.((q.head + i) land (cap - 1))
+    done;
+    q.a <- a';
+    q.head <- 0
+
+  let push q x =
+    if q.len = Array.length q.a then grow q;
+    q.a.((q.head + q.len) land (Array.length q.a - 1)) <- x;
+    q.len <- q.len + 1
+
+  (* Caller must ensure [not (is_empty q)]; avoids allocating an option. *)
+  let pop q =
+    let x = q.a.(q.head) in
+    q.a.(q.head) <- sentinel;
+    q.head <- (q.head + 1) land (Array.length q.a - 1);
+    q.len <- q.len - 1;
+    x
+end
+
+let run_queue : Run_queue.t = Run_queue.create ()
+let enqueue (f : unit -> unit) : unit = Run_queue.push run_queue (Thunk f)
 
 (* Shared [Ok ()] outcome: events and [pause] all resolve unit promises, so
    there is no need to allocate a fresh [Ok ()] each time. *)
@@ -178,8 +213,10 @@ let handler : (unit, unit) Effect.Deep.handler =
       b Effect.t -> ((b, unit) Effect.Deep.continuation -> unit) option =
     function
     | Await p ->
-      Some (fun k -> add_waiter p (fun r -> Queue.push (Resume (r, k)) run_queue))
-    | Yield -> Some (fun k -> Queue.push (Resume ((), k)) run_queue)
+      Some
+        (fun k ->
+          add_waiter p (fun r -> Run_queue.push run_queue (Resume (r, k))))
+    | Yield -> Some (fun k -> Run_queue.push run_queue (Resume ((), k)))
     | _ -> None
   in
   { retc; exnc; effc }
@@ -250,7 +287,7 @@ let default_idle () : bool =
     (* Servicing Lwt's paused promises may have produced ready work (a fiber
        resumed via [of_lwt]); only block in the loop if nothing is ready, and
        then only if no Lwt pause is still pending. *)
-    if Queue.is_empty run_queue then
+    if Run_queue.is_empty run_queue then
       Lwt_engine.iter (Lwt.paused_count () = 0);
     true
   end
@@ -264,14 +301,15 @@ let idle_hook : (unit -> bool) ref = ref default_idle
 let set_idle (f : unit -> bool) : unit = idle_hook := f
 
 let rec run_scheduler () : unit =
-  match Queue.take_opt run_queue with
-  | Some (Thunk f) ->
-    f ();
+  if Run_queue.is_empty run_queue then begin
+    if !idle_hook () then run_scheduler ()
+  end
+  else begin
+    (match Run_queue.pop run_queue with
+    | Thunk f -> f ()
+    | Resume (v, k) -> Effect.Deep.continue k v);
     run_scheduler ()
-  | Some (Resume (v, k)) ->
-    Effect.Deep.continue k v;
-    run_scheduler ()
-  | None -> if !idle_hook () then run_scheduler ()
+  end
 
 let run (type a) (main : unit -> a t) : a =
   !on_reset ();
