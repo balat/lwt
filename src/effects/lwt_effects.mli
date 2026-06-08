@@ -6,6 +6,12 @@
     asynchronicity of a function stays visible in its type, while making the
     common case of {!bind} a plain function application with no heap allocation.
 
+    {b Benchmarks & write-up.} A comparative study (this scheduler vs classic
+    Lwt, Eio and Miou — scheduling, bind, ping-pong, echo TCP, and cohttp, with
+    charts and how to interpret them) lives in the companion benchmarks
+    repository: {{:https://github.com/ocsigen/lwt-effects-bench}
+    ocsigen/lwt-effects-bench}.
+
     {1 Representation}
 
     A value of type ['a t] is a {e promise cell}: it is either already resolved
