@@ -108,6 +108,13 @@ let bench_uring () =
 let () =
   Printf.printf "I/O ping-pong over a socketpair (%d round trips)\n%!"
     round_trips;
-  measure "Lwt (epoll)" bench_lwt;
-  measure "Lwt_effects (epoll)" bench_eff;
-  measure "Lwt_effects (io_uring)" bench_uring
+  (* Optional second argument selects a single back end, for isolated profiling
+     (e.g. under strace -c). *)
+  match if Array.length Sys.argv > 2 then Sys.argv.(2) else "all" with
+  | "lwt" -> measure "Lwt (epoll)" bench_lwt
+  | "eff" -> measure "Lwt_effects (epoll)" bench_eff
+  | "uring" -> measure "Lwt_effects (io_uring)" bench_uring
+  | _ ->
+    measure "Lwt (epoll)" bench_lwt;
+    measure "Lwt_effects (epoll)" bench_eff;
+    measure "Lwt_effects (io_uring)" bench_uring
