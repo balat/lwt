@@ -105,6 +105,35 @@ let bench_uring () =
   Unix.close a;
   Unix.close b
 
+(* Lwt_effects over io_uring with a registered fixed buffer (zero-copy) *)
+let bench_uring_fixed () =
+  let open Lwt_effects in
+  let module F = Lwt_effects_uring.Fixed in
+  let a, b = Unix.socketpair Unix.PF_UNIX Unix.SOCK_STREAM 0 in
+  Lwt_effects_uring.run (fun () ->
+    let cchunk = F.alloc () and schunk = F.alloc () in
+    F.blit_string "x" cchunk;
+    F.blit_string "x" schunk;
+    let rec client n =
+      if n > 0 then begin
+        ignore (F.write ~len:1 a cchunk);
+        ignore (F.read ~len:1 a cchunk);
+        client (n - 1)
+      end
+    in
+    let rec server n =
+      if n > 0 then begin
+        ignore (F.read ~len:1 b schunk);
+        ignore (F.write ~len:1 b schunk);
+        server (n - 1)
+      end
+    in
+    let c = async (fun () -> client round_trips; return_unit) in
+    let s = async (fun () -> server round_trips; return_unit) in
+    both c s >>= fun _ -> return_unit);
+  Unix.close a;
+  Unix.close b
+
 let () =
   Printf.printf "I/O ping-pong over a socketpair (%d round trips)\n%!"
     round_trips;
@@ -114,7 +143,9 @@ let () =
   | "lwt" -> measure "Lwt (epoll)" bench_lwt
   | "eff" -> measure "Lwt_effects (epoll)" bench_eff
   | "uring" -> measure "Lwt_effects (io_uring)" bench_uring
+  | "uringf" -> measure "Lwt_effects (io_uring fixed)" bench_uring_fixed
   | _ ->
     measure "Lwt (epoll)" bench_lwt;
     measure "Lwt_effects (epoll)" bench_eff;
-    measure "Lwt_effects (io_uring)" bench_uring
+    measure "Lwt_effects (io_uring)" bench_uring;
+    measure "Lwt_effects (io_uring fixed)" bench_uring_fixed
