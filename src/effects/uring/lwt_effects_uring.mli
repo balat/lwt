@@ -5,18 +5,59 @@
     their completion, allowing batched submission and removing the explicit
     readiness syscall. *)
 
-val run : ?queue_depth:int -> (unit -> 'a Lwt_effects.t) -> 'a
+val run :
+  ?queue_depth:int ->
+  ?buffer_blocks:int ->
+  ?block_size:int ->
+  (unit -> 'a Lwt_effects.t) ->
+  'a
 (** [run main] is like {!Lwt_effects.run}, but drives the scheduler with an
     io_uring (created with the given [queue_depth], default 256) instead of
-    {!Lwt_engine}. I/O inside [main] must use the {!Io} module below. *)
+    {!Lwt_engine}. I/O inside [main] uses {!Io} or {!Fixed}.
+
+    A fixed buffer of [buffer_blocks] (default 256) chunks of [block_size]
+    (default 4096) bytes is registered with the kernel for {!Fixed}. *)
 
 (** Direct-style I/O issued through the ring. Buffers are {!Cstruct.t} (the
-    kernel reads from / writes to them directly). Must be called inside
-    {!run}. *)
+    kernel reads from / writes to them directly, with no userspace copy, but
+    pins the pages on each call). Must be called inside {!run}. *)
 module Io : sig
   val read : Unix.file_descr -> Cstruct.t -> int
   (** Submit a [read] and return the number of bytes read. *)
 
   val write : Unix.file_descr -> Cstruct.t -> int
   (** Submit a [write] and return the number of bytes written. *)
+end
+
+(** Zero-copy I/O through the ring's registered fixed buffer: the kernel keeps
+    the buffer pinned, so [read_fixed]/[write_fixed] avoid mapping user pages on
+    each call. Data lives in {!chunk}s allocated from the fixed buffer. Must be
+    called inside {!run}. *)
+module Fixed : sig
+  type chunk
+  (** A slice of the registered fixed buffer. *)
+
+  val alloc : unit -> chunk
+  (** Allocate a chunk from the fixed buffer (raises if exhausted). *)
+
+  val free : chunk -> unit
+  (** Return a chunk to the fixed buffer. *)
+
+  val length : chunk -> int
+  (** The chunk's block size in bytes. *)
+
+  val to_cstruct : ?len:int -> chunk -> Cstruct.t
+  (** Zero-copy view of the chunk. *)
+
+  val to_string : ?len:int -> chunk -> string
+  (** Copy the chunk's contents (first [len] bytes) to a string. *)
+
+  val blit_string : string -> chunk -> unit
+  (** Copy a string into the start of the chunk. *)
+
+  val read : ?len:int -> Unix.file_descr -> chunk -> int
+  (** Read into the chunk; returns the number of bytes read. *)
+
+  val write : ?len:int -> Unix.file_descr -> chunk -> int
+  (** Write the chunk (first [len] bytes); returns the number of bytes written. *)
 end

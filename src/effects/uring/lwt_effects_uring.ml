@@ -17,10 +17,19 @@ module P = Lwt_effects.Private
    the suspended promise with the syscall result. *)
 let ring : (int -> unit) U.t option ref = ref None
 
+(* Region carved out of the ring's registered fixed buffer (for zero-copy
+   [read_fixed]/[write_fixed], which avoid per-I/O page pinning). *)
+let region : U.Region.t option ref = ref None
+
 let current_ring () =
   match !ring with
   | Some r -> r
   | None -> failwith "Lwt_effects_uring: I/O attempted outside Lwt_effects_uring.run"
+
+let current_region () =
+  match !region with
+  | Some r -> r
+  | None -> failwith "Lwt_effects_uring: no fixed buffer (call inside run)"
 
 (* Queue an I/O request, suspend the fiber, and return the syscall result (or
    raise the corresponding Unix error). [submit] performs the actual
@@ -59,24 +68,56 @@ let idle r () =
   end
   else false
 
-let run ?(queue_depth = 256) main =
+let run ?(queue_depth = 256) ?(buffer_blocks = 256) ?(block_size = 4096) main =
   let r = U.create ~queue_depth () in
   ring := Some r;
+  (* Register a fixed buffer and carve it into a region of equal-sized chunks. *)
+  let buf =
+    Bigarray.Array1.create Bigarray.char Bigarray.c_layout
+      (block_size * buffer_blocks)
+  in
+  (match U.set_fixed_buffer r buf with
+  | Ok () -> region := Some (U.Region.init ~block_size buf buffer_blocks)
+  | Error `ENOMEM -> failwith "Lwt_effects_uring: could not register fixed buffer");
   P.set_idle (idle r);
   Fun.protect
     ~finally:(fun () ->
       P.set_idle P.default_idle;
       ring := None;
+      region := None;
       U.exit r)
     (fun () -> Lwt_effects.run main)
 
-module Io = struct
-  (* Sockets must use a file offset of zero (see {!Uring.read}). *)
-  let socket_offset = Optint.Int63.zero
+(* Sockets must use a file offset of zero (see {!Uring.read}). *)
+let socket_offset = Optint.Int63.zero
 
+module Io = struct
   let read fd (buf : Cstruct.t) =
     perform (fun r h -> U.read r ~file_offset:socket_offset fd buf h)
 
   let write fd (buf : Cstruct.t) =
     perform (fun r h -> U.write r ~file_offset:socket_offset fd buf h)
+end
+
+(* Zero-copy I/O through the registered fixed buffer. Data lives in chunks
+   allocated from the region; [read]/[write] avoid per-I/O page pinning. *)
+module Fixed = struct
+  type chunk = U.Region.chunk
+
+  let alloc () = U.Region.alloc (current_region ())
+  let free = U.Region.free
+  let length = U.Region.length
+  let to_cstruct = U.Region.to_cstruct
+  let to_string = U.Region.to_string
+
+  let blit_string src chunk =
+    Cstruct.blit_from_string src 0 (U.Region.to_cstruct chunk) 0
+      (String.length src)
+
+  let read ?len fd chunk =
+    perform (fun r h -> U.read_chunk ?len r ~file_offset:socket_offset fd chunk h)
+
+  let write ?len fd chunk =
+    perform (fun r h ->
+      U.write_chunk ?len r ~file_offset:socket_offset fd chunk h)
 end
