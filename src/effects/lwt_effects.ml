@@ -46,12 +46,10 @@ exception Canceled
      promise in a way that would let a [<:b] value be observed at a wrong type:
      a resolved promise is only ever {e read}, and resolvers ([wakeup]) take the
      value at its own type. This mirrors Lwt's long-standing design. *)
-module Public_handle : sig
-  type +'a t
-
-  val inj : 'a promise -> 'a t
-  val prj : 'a t -> 'a promise
-end = struct
+(* No signature ascription here (exactly like Lwt's [Public_types]): [+'a t] is
+   abstract because it is declared without a definition, yet [inj]/[prj] keep
+   visible bodies so flambda can inline these identity coercions away. *)
+module Public_handle = struct
   type +'a t
 
   let inj : 'a promise -> 'a t = Obj.magic
