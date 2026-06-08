@@ -2,4 +2,4 @@
  (name test_effects)
  (package lwt_effects)
  (build_if (>= %{ocaml_version} "5.0"))
- (libraries lwt_effects))
+ (libraries lwt_effects unix))

@@ -132,6 +132,49 @@ let () =
     b);
   check "sleep ordering" (List.rev !log = [ "early"; "late" ])
 
+(* [cancel] rejects a pending promise with [Canceled]. *)
+let () =
+  let r =
+    run (fun () ->
+      let s = sleep 1.0 in
+      cancel s;
+      try
+        await s;
+        return "not-canceled"
+      with Canceled -> return "canceled")
+  in
+  check "cancel rejects with Canceled" (r = "canceled")
+
+(* [pick] cancels the losers: the 0.5s timer must be stopped when the 0.01s one
+   resolves, so the whole run returns quickly rather than after 0.5s. *)
+let () =
+  let t0 = Unix.gettimeofday () in
+  run (fun () -> pick [ sleep 0.5; sleep 0.01 ]);
+  let dt = Unix.gettimeofday () -. t0 in
+  check "pick cancels the slow loser" (dt < 0.25)
+
+(* Real non-blocking I/O over a socketpair: a writer and a reader fiber. *)
+let () =
+  let r =
+    run (fun () ->
+      let a, b = Unix.socketpair Unix.PF_UNIX Unix.SOCK_STREAM 0 in
+      Unix.set_nonblock a;
+      Unix.set_nonblock b;
+      let msg = Bytes.of_string "hello" in
+      let reader =
+        async (fun () ->
+          let buf = Bytes.create 16 in
+          let n = Io.read b buf 0 (Bytes.length buf) in
+          return (Bytes.sub_string buf 0 n))
+      in
+      let writer = async (fun () -> return (Io.write a msg 0 (Bytes.length msg))) in
+      let* s, _ = both reader writer in
+      Unix.close a;
+      Unix.close b;
+      return s)
+  in
+  check "socketpair read/write" (r = "hello")
+
 let () =
   if !failures = 0 then print_endline "\nAll tests passed."
   else begin
