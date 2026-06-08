@@ -229,6 +229,20 @@ let sleep (d : float) : unit t =
 (* The scheduler loop                                                 *)
 (* ------------------------------------------------------------------ *)
 
+(* Idle-wait hook: called when the run queue is empty, to block until external
+   work arrives. Returns [true] if it may have produced new work (the loop
+   continues), [false] if there is nothing left to wait for (scheduler is done).
+   A backend (the default Lwt_engine one, or io_uring) installs its own. *)
+let default_idle () : bool =
+  if !outstanding > 0 then begin
+    Lwt_engine.iter true;
+    true
+  end
+  else false
+
+let idle_hook : (unit -> bool) ref = ref default_idle
+let set_idle (f : unit -> bool) : unit = idle_hook := f
+
 let rec run_scheduler () : unit =
   match Queue.take_opt run_queue with
   | Some (Thunk f) ->
@@ -237,12 +251,7 @@ let rec run_scheduler () : unit =
   | Some (Resume (v, k)) ->
     Effect.Deep.continue k v;
     run_scheduler ()
-  | None ->
-    if !outstanding > 0 then begin
-      Lwt_engine.iter true;
-      run_scheduler ()
-    end
-(* else: nothing ready and no events outstanding: the scheduler is idle/done. *)
+  | None -> if !idle_hook () then run_scheduler ()
 
 let run (type a) (main : unit -> a t) : a =
   let outcome = ref None in
@@ -313,4 +322,14 @@ module Io = struct
       match Unix.getsockopt_error fd with
       | None -> ()
       | Some err -> raise (Unix.Unix_error (err, "connect", "")))
+end
+
+module Private = struct
+  let enqueue = enqueue
+  let outstanding = outstanding
+  let set_idle = set_idle
+  let default_idle = default_idle
+  let new_pending = new_pending
+  let fill = fill
+  let set_on_cancel = set_on_cancel
 end

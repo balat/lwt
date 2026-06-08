@@ -162,3 +162,18 @@ module Io : sig
   val connect : Unix.file_descr -> Unix.sockaddr -> unit
   (** Like [Unix.connect], waiting for an in-progress connection to complete. *)
 end
+
+(**/**)
+
+(** Internal primitives, exposed so that alternative back ends (e.g. io_uring)
+    can drive the scheduler and build their own I/O operations. Not part of the
+    stable API. *)
+module Private : sig
+  val enqueue : (unit -> unit) -> unit
+  val outstanding : int ref
+  val set_idle : (unit -> bool) -> unit
+  val default_idle : unit -> bool
+  val new_pending : unit -> 'a t
+  val fill : 'a t -> ('a, exn) result -> unit
+  val set_on_cancel : 'a t -> (unit -> unit) -> unit
+end
