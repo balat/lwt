@@ -97,6 +97,32 @@ module Io = struct
 
   let write fd (buf : Cstruct.t) =
     perform (fun r h -> U.write r ~file_offset:socket_offset fd buf h)
+
+  (* Readiness via io_uring's poll, used to build accept/connect on top of the
+     plain Unix syscalls (the descriptors must be non-blocking). *)
+  let wait_readable fd =
+    ignore (perform (fun r h -> U.poll_add r fd U.Poll_mask.pollin h))
+
+  let wait_writable fd =
+    ignore (perform (fun r h -> U.poll_add r fd U.Poll_mask.pollout h))
+
+  let rec accept fd =
+    match Unix.accept fd with
+    | res -> res
+    | exception
+        Unix.Unix_error ((Unix.EAGAIN | Unix.EWOULDBLOCK | Unix.EINTR), _, _) ->
+      wait_readable fd;
+      accept fd
+
+  let connect fd addr =
+    match Unix.connect fd addr with
+    | () -> ()
+    | exception
+        Unix.Unix_error ((Unix.EINPROGRESS | Unix.EWOULDBLOCK), _, _) -> (
+      wait_writable fd;
+      match Unix.getsockopt_error fd with
+      | None -> ()
+      | Some err -> raise (Unix.Unix_error (err, "connect", "")))
 end
 
 (* Zero-copy I/O through the registered fixed buffer. Data lives in chunks

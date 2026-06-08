@@ -27,6 +27,18 @@ module Io : sig
 
   val write : Unix.file_descr -> Cstruct.t -> int
   (** Submit a [write] and return the number of bytes written. *)
+
+  val wait_readable : Unix.file_descr -> unit
+  (** Wait (via io_uring poll) until [fd] is readable. *)
+
+  val wait_writable : Unix.file_descr -> unit
+  (** Wait (via io_uring poll) until [fd] is writable. *)
+
+  val accept : Unix.file_descr -> Unix.file_descr * Unix.sockaddr
+  (** Accept a connection on the (non-blocking) listening socket [fd]. *)
+
+  val connect : Unix.file_descr -> Unix.sockaddr -> unit
+  (** Connect the (non-blocking) socket [fd], waiting for completion. *)
 end
 
 (** Zero-copy I/O through the ring's registered fixed buffer: the kernel keeps

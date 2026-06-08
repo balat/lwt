@@ -67,6 +67,45 @@ let () =
   in
   check "io_uring fixed-buffer read/write" (r = "fixed buffer")
 
+(* accept/connect over a loopback TCP socket, driven by io_uring poll. *)
+let () =
+  let r =
+    Lwt_effects_uring.run (fun () ->
+      let ls = Unix.socket Unix.PF_INET Unix.SOCK_STREAM 0 in
+      Unix.setsockopt ls Unix.SO_REUSEADDR true;
+      Unix.bind ls (Unix.ADDR_INET (Unix.inet_addr_loopback, 0));
+      Unix.listen ls 1;
+      Unix.set_nonblock ls;
+      let port =
+        match Unix.getsockname ls with
+        | Unix.ADDR_INET (_, p) -> p
+        | Unix.ADDR_UNIX _ -> failwith "expected inet"
+      in
+      let server =
+        async (fun () ->
+          let c, _ = Lwt_effects_uring.Io.accept ls in
+          let buf = Cstruct.create 16 in
+          let n = Lwt_effects_uring.Io.read c buf in
+          Unix.close c;
+          return (Cstruct.to_string (Cstruct.sub buf 0 n)))
+      in
+      let client =
+        async (fun () ->
+          let s = Unix.socket Unix.PF_INET Unix.SOCK_STREAM 0 in
+          Unix.set_nonblock s;
+          Lwt_effects_uring.Io.connect s
+            (Unix.ADDR_INET (Unix.inet_addr_loopback, port));
+          let n = Lwt_effects_uring.Io.write s (Cstruct.of_string "tcp ok") in
+          Unix.close s;
+          return n)
+      in
+      let* msg = server in
+      let* _ = client in
+      Unix.close ls;
+      return msg)
+  in
+  check "io_uring accept/connect (loopback TCP)" (r = "tcp ok")
+
 let () =
   if !failures = 0 then print_endline "\nAll io_uring tests passed."
   else begin
