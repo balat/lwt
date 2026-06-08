@@ -31,12 +31,12 @@ let current_region () =
   | Some r -> r
   | None -> failwith "Lwt_effects_uring: no fixed buffer (call inside run)"
 
-(* Queue an I/O request, suspend the fiber, and return the syscall result (or
-   raise the corresponding Unix error). [submit] performs the actual
+(* Queue an I/O request and return a promise resolved (non-blocking) with the
+   syscall result when the ring completes it. [submit] performs the actual
    [Uring.<op>] call with the completion handler. *)
-let perform submit =
+let submit_p submit : int Lwt_effects.t =
   let r = current_ring () in
-  let p = P.new_pending () in
+  let p = Lwt_effects.Private.new_pending () in
   incr P.outstanding;
   let handler result =
     decr P.outstanding;
@@ -48,7 +48,11 @@ let perform submit =
   (match submit r handler with
   | Some _job -> ()
   | None -> failwith "Lwt_effects_uring: submission queue full");
-  Lwt_effects.await p
+  p
+
+(* Direct-style: suspend the fiber until completion, return the result (or
+   raise). [submit] performs the actual [Uring.<op>] call. *)
+let perform submit = Lwt_effects.await (submit_p submit)
 
 (* The scheduler's idle hook: block on the ring for one completion, then drain
    any further ready completions without blocking. [Uring.wait] submits queued
@@ -123,6 +127,39 @@ module Io = struct
       match Unix.getsockopt_error fd with
       | None -> ()
       | Some err -> raise (Unix.Unix_error (err, "connect", "")))
+
+  (* Monadic, non-blocking variants: every interruptible call returns a promise
+     ([_ Lwt_effects.t]), so the async type is kept. Compose with the Compat
+     bind to write Lwt-style code that runs on io_uring. *)
+  let read_m fd (buf : Cstruct.t) : int Lwt_effects.t =
+    submit_p (fun r h -> U.read r ~file_offset:socket_offset fd buf h)
+
+  let write_m fd (buf : Cstruct.t) : int Lwt_effects.t =
+    submit_p (fun r h -> U.write r ~file_offset:socket_offset fd buf h)
+
+  let poll_readable fd =
+    submit_p (fun r h -> U.poll_add r fd U.Poll_mask.pollin h)
+
+  let poll_writable fd =
+    submit_p (fun r h -> U.poll_add r fd U.Poll_mask.pollout h)
+
+  let rec accept_m fd : (Unix.file_descr * Unix.sockaddr) Lwt_effects.t =
+    match Unix.accept fd with
+    | res -> Lwt_effects.return res
+    | exception
+        Unix.Unix_error ((Unix.EAGAIN | Unix.EWOULDBLOCK | Unix.EINTR), _, _) ->
+      Lwt_effects.Compat.bind (poll_readable fd) (fun _ -> accept_m fd)
+    | exception e -> Lwt_effects.fail e
+
+  let connect_m fd addr : unit Lwt_effects.t =
+    match Unix.connect fd addr with
+    | () -> Lwt_effects.return_unit
+    | exception Unix.Unix_error ((Unix.EINPROGRESS | Unix.EWOULDBLOCK), _, _) ->
+      Lwt_effects.Compat.bind (poll_writable fd) (fun _ ->
+        match Unix.getsockopt_error fd with
+        | None -> Lwt_effects.return_unit
+        | Some err -> Lwt_effects.fail (Unix.Unix_error (err, "connect", "")))
+    | exception e -> Lwt_effects.fail e
 end
 
 (* Zero-copy I/O through the registered fixed buffer. Data lives in chunks

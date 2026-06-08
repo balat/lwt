@@ -39,6 +39,17 @@ module Io : sig
 
   val connect : Unix.file_descr -> Unix.sockaddr -> unit
   (** Connect the (non-blocking) socket [fd], waiting for completion. *)
+
+  (** {2 Monadic, non-blocking I/O}
+
+      Return a promise ([_ Lwt_effects.t]) resolved when the ring completes the
+      request — so the async type is preserved. Compose with
+      {!Lwt_effects.Compat} to write Lwt-style code running on io_uring. *)
+
+  val read_m : Unix.file_descr -> Cstruct.t -> int Lwt_effects.t
+  val write_m : Unix.file_descr -> Cstruct.t -> int Lwt_effects.t
+  val accept_m : Unix.file_descr -> (Unix.file_descr * Unix.sockaddr) Lwt_effects.t
+  val connect_m : Unix.file_descr -> Unix.sockaddr -> unit Lwt_effects.t
 end
 
 (** Zero-copy I/O through the ring's registered fixed buffer: the kernel keeps

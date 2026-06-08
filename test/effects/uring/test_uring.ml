@@ -106,6 +106,30 @@ let () =
   in
   check "io_uring accept/connect (loopback TCP)" (r = "tcp ok")
 
+(* Monadic (non-blocking, async-typed) io_uring I/O + Compat bind. *)
+let () =
+  let r =
+    Lwt_effects_uring.run (fun () ->
+      let open Lwt_effects.Compat in
+      let a, b = Unix.socketpair Unix.PF_UNIX Unix.SOCK_STREAM 0 in
+      let wbuf = Cstruct.of_string "monadic uring" in
+      let rbuf = Cstruct.create 32 in
+      let writer =
+        async (fun () ->
+          Lwt_effects_uring.Io.write_m a wbuf >>= fun _ -> Lwt_effects.return_unit)
+      in
+      let reader =
+        async (fun () ->
+          Lwt_effects_uring.Io.read_m b rbuf >>= fun n ->
+          Lwt_effects.return (Cstruct.to_string (Cstruct.sub rbuf 0 n)))
+      in
+      both reader writer >>= fun (s, _) ->
+      Unix.close a;
+      Unix.close b;
+      Lwt_effects.return s)
+  in
+  check "io_uring monadic read_m/write_m" (r = "monadic uring")
+
 let () =
   if !failures = 0 then print_endline "\nAll io_uring tests passed."
   else begin
