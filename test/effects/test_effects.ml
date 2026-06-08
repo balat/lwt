@@ -120,7 +120,7 @@ let () =
         let* () = pause () in
         fail (Failure "boom")
       in
-      return (try await p; "no" with Failure msg -> "caught:" ^ msg))
+      return (try ignore (await p); "no" with Failure msg -> "caught:" ^ msg))
   in
   check "direct-style try/await catches rejection" (r = "caught:boom")
 
@@ -295,6 +295,12 @@ let () =
   in
   check "effect bind serialises (~0.10s)" (effect_dt > 0.085);
   check "Compat bind keeps concurrency (~0.05s)" (compat_dt < 0.085)
+
+(* Covariance of [t]: a subtyping coercion only type-checks if [+'a t]. *)
+let () =
+  let p : [ `A ] t = return `A in
+  let _wider : [ `A | `B ] t = (p :> [ `A | `B ] t) in
+  check "t is covariant (subtyping coercion type-checks)" true
 
 let () =
   if !failures = 0 then print_endline "\nAll tests passed."

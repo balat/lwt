@@ -38,8 +38,10 @@
     suspension-based implementation; {!Compat} preserves Lwt semantics at Lwt's
     allocation cost (minus the proxy machinery). See {!section:compat}. *)
 
-type 'a t
-(** A promise for a value of type ['a]. *)
+type +'a t
+(** A promise for a value of type ['a]. Covariant, like {!Lwt.t} — so e.g.
+    [[ `A ] t] can be used where [[> `A ] t] is expected, and cohttp's
+    [Cohttp.S.IO] functor (which requires [type +'a t]) can be instantiated. *)
 
 exception Canceled
 (** Raised in a fiber whose awaited promise is {!cancel}led, and used to reject
@@ -188,6 +190,8 @@ val of_result : ('a, exn) result -> 'a t
 
 val fail_with : string -> 'a t
 val fail_invalid_arg : string -> 'a t
+val return_none : 'a option t
+val return_nil : 'a list t
 val return_some : 'a -> 'a option t
 val return_ok : 'a -> ('a, 'b) result t
 val return_error : 'b -> ('a, 'b) result t

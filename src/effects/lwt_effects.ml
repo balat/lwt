@@ -13,7 +13,11 @@
      and re-fill the queue. A waiter never resumes a continuation directly: it
      only enqueues it, keeping resolution flat (no deep recursion). *)
 
-type 'a t = { mutable st : 'a promise_state }
+(* The concrete promise is a mutable cell, so its type parameter is necessarily
+   {e invariant}. But the public type [+'a t] (below) must be {e covariant} to be
+   a drop-in for [Lwt.t] (e.g. so that [int t :> [> ] t] and so that cohttp's
+   [Cohttp.S.IO] functor, which requires [type +'a t], can be instantiated). *)
+type 'a promise = { mutable st : 'a promise_state }
 
 and 'a promise_state =
   | Fulfilled of 'a
@@ -30,13 +34,43 @@ and 'a pending = {
 
 exception Canceled
 
+(* Covariant public handle over the invariant concrete [promise].
+
+   OCaml cannot express a covariant type with a mutable field, so — exactly like
+   Lwt's [Public_types] ([to_public_promise]/[to_internal_promise]) — we declare
+   [+'a t] as an abstract type and bridge it to [promise] with identity
+   coercions. This is SOUND:
+   - [t] and [promise] have the {e same runtime representation} ([Obj.magic] is a
+     no-op cast here, not a reinterpretation);
+   - covariance is safe because the public API never writes through a coerced
+     promise in a way that would let a [<:b] value be observed at a wrong type:
+     a resolved promise is only ever {e read}, and resolvers ([wakeup]) take the
+     value at its own type. This mirrors Lwt's long-standing design. *)
+module Public_handle : sig
+  type +'a t
+
+  val inj : 'a promise -> 'a t
+  val prj : 'a t -> 'a promise
+end = struct
+  type +'a t
+
+  let inj : 'a promise -> 'a t = Obj.magic
+  let prj : 'a t -> 'a promise = Obj.magic
+end
+
+type +'a t = 'a Public_handle.t
+
+let inj = Public_handle.inj
+let prj = Public_handle.prj
+
 (* ------------------------------------------------------------------ *)
 (* Promise primitives                                                 *)
 (* ------------------------------------------------------------------ *)
 
-let new_pending () = { st = Pending { waiters = []; on_cancel = ignore } }
+let new_pending () : 'a t = inj { st = Pending { waiters = []; on_cancel = ignore } }
 
 let fill (type a) (p : a t) (r : (a, exn) result) : unit =
+  let p = prj p in
   match p.st with
   | Pending pe ->
     p.st <- (match r with Ok v -> Fulfilled v | Error e -> Rejected e);
@@ -44,16 +78,16 @@ let fill (type a) (p : a t) (r : (a, exn) result) : unit =
   | Fulfilled _ | Rejected _ -> ()
 
 let add_waiter (type a) (p : a t) (w : (a, exn) result -> unit) : unit =
-  match p.st with
+  match (prj p).st with
   | Pending pe -> pe.waiters <- w :: pe.waiters
   | Fulfilled v -> w (Ok v)
   | Rejected e -> w (Error e)
 
 let set_on_cancel (type a) (p : a t) (f : unit -> unit) : unit =
-  match p.st with Pending pe -> pe.on_cancel <- f | Fulfilled _ | Rejected _ -> ()
+  match (prj p).st with Pending pe -> pe.on_cancel <- f | Fulfilled _ | Rejected _ -> ()
 
 let cancel (type a) (p : a t) : unit =
-  match p.st with
+  match (prj p).st with
   | Pending pe ->
     pe.on_cancel ();
     fill p (Error Canceled)
@@ -179,7 +213,7 @@ let setup_event (p : unit t)
     (register : (Lwt_engine.event -> unit) -> Lwt_engine.event) : unit =
   incr outstanding;
   let fire ev =
-    match p.st with
+    match (prj p).st with
     | Pending _ ->
       decr outstanding;
       Lwt_engine.stop_event ev;
@@ -206,7 +240,7 @@ let yield () : unit = Effect.perform Yield
 (* Perform [Await] only when actually pending: resolved cases stay
    allocation-free and never touch the scheduler. *)
 let await_result (type a) (p : a t) : (a, exn) result =
-  match p.st with
+  match (prj p).st with
   | Fulfilled v -> Ok v
   | Rejected e -> Error e
   | Pending _ -> Effect.perform (Await p)
@@ -218,24 +252,24 @@ let await (type a) (p : a t) : a =
 (* Constructors and combinators                                       *)
 (* ------------------------------------------------------------------ *)
 
-let return v = { st = Fulfilled v }
-let fail e = { st = Rejected e }
+let return v = inj { st = Fulfilled v }
+let fail e = inj { st = Rejected e }
 let return_unit = return ()
 
 (* Apply the continuation of a bind, turning a synchronous exception into a
    rejected promise. This catch-all mirrors Lwt's monadic semantics: a [bind]
    never lets [f] raise into the scheduler. *)
 let apply (f : 'a -> 'b t) (v : 'a) : 'b t =
-  try f v with e -> { st = Rejected e }
+  try f v with e -> inj { st = Rejected e }
 
 let bind (type a) (p : a t) (f : a -> 'b t) : 'b t =
-  match p.st with
+  match (prj p).st with
   | Fulfilled v -> apply f v
-  | Rejected e -> { st = Rejected e }
+  | Rejected e -> inj { st = Rejected e }
   | Pending _ -> (
     match Effect.perform (Await p) with
     | Ok v -> apply f v
-    | Error e -> { st = Rejected e })
+    | Error e -> inj { st = Rejected e })
 
 let map f p = bind p (fun v -> return (f v))
 let ( >>= ) = bind
@@ -299,7 +333,7 @@ let pick (ps : 'a t list) : 'a t =
   List.iter
     (fun p ->
       add_waiter p (fun r ->
-        match result.st with
+        match (prj result).st with
         | Pending _ ->
           fill result r;
           List.iter (fun q -> if q != p then cancel q) ps
@@ -400,13 +434,13 @@ end
 
 let of_lwt (type a) (lwt : a Lwt.t) : a t =
   match Lwt.state lwt with
-  | Lwt.Return v -> { st = Fulfilled v }
-  | Lwt.Fail e -> { st = Rejected e }
+  | Lwt.Return v -> inj { st = Fulfilled v }
+  | Lwt.Fail e -> inj { st = Rejected e }
   | Lwt.Sleep ->
     let p = new_pending () in
     incr outstanding;
     let finish r =
-      match p.st with
+      match (prj p).st with
       | Pending _ ->
         decr outstanding;
         fill p r
@@ -421,7 +455,7 @@ let of_lwt (type a) (lwt : a Lwt.t) : a t =
 let await_lwt lwt = await (of_lwt lwt)
 
 let to_lwt (type a) (p : a t) : a Lwt.t =
-  match p.st with
+  match (prj p).st with
   | Fulfilled v -> Lwt.return v
   | Rejected e -> Lwt.fail e
   | Pending _ ->
@@ -454,18 +488,25 @@ let wakeup_later = wakeup
 let wakeup_later_exn = wakeup_exn
 
 let state (type a) (p : a t) : a state =
-  match p.st with
+  match (prj p).st with
   | Fulfilled v -> Return v
   | Rejected e -> Fail e
   | Pending _ -> Sleep
 
-let is_sleeping p = match p.st with Pending _ -> true | Fulfilled _ | Rejected _ -> false
+let is_sleeping p =
+  match (prj p).st with Pending _ -> true | Fulfilled _ | Rejected _ -> false
 let poll p =
-  match p.st with Fulfilled v -> Some v | Rejected e -> raise e | Pending _ -> None
+  match (prj p).st with
+  | Fulfilled v -> Some v
+  | Rejected e -> raise e
+  | Pending _ -> None
 let of_result = function Ok v -> return v | Error e -> fail e
 
 let fail_with msg = fail (Failure msg)
 let fail_invalid_arg msg = fail (Invalid_argument msg)
+(* Now generalisable thanks to [t] being covariant (relaxed value restriction). *)
+let return_none = return None
+let return_nil = return []
 let return_some x = return (Some x)
 let return_ok x = return (Ok x)
 let return_error e = return (Error e)
@@ -495,7 +536,8 @@ let all (ps : 'a t list) : 'a list t = async (fun () -> return (List.map await p
 
 let ready_values ps =
   List.filter_map
-    (fun p -> match p.st with Fulfilled v -> Some v | Rejected _ | Pending _ -> None)
+    (fun p ->
+      match (prj p).st with Fulfilled v -> Some v | Rejected _ | Pending _ -> None)
     ps
 
 let nchoose (ps : 'a t list) : 'a list t =
@@ -516,7 +558,7 @@ let on_failure p f = add_waiter p (function Ok _ -> () | Error e -> f e)
 let on_termination p f = add_waiter p (fun _ -> f ())
 
 let on_cancel p f =
-  match p.st with
+  match (prj p).st with
   | Pending pe ->
     let prev = pe.on_cancel in
     pe.on_cancel <- (fun () -> prev (); (try f () with _ -> ()))
@@ -562,9 +604,9 @@ end
    trade-off, but without Lwt's proxy machinery. The storage in effect at the
    bind is restored around the callback, as in Lwt. *)
 let mbind (type a b) (p : a t) (f : a -> b t) : b t =
-  match p.st with
+  match (prj p).st with
   | Fulfilled v -> apply f v
-  | Rejected e -> { st = Rejected e }
+  | Rejected e -> inj { st = Rejected e }
   | Pending _ ->
     let result = new_pending () in
     let saved = !current_storage in
@@ -574,7 +616,7 @@ let mbind (type a b) (p : a t) (f : a -> b t) : b t =
       (match r with
       | Ok v -> (
         let p' = apply f v in
-        match p'.st with
+        match (prj p').st with
         | Fulfilled v' -> fill result (Ok v')
         | Rejected e -> fill result (Error e)
         | Pending _ -> add_waiter p' (fun r' -> fill result r'))
@@ -660,14 +702,14 @@ module Io = struct
       ws.waiters <- [];
       List.iter
         (fun p ->
-          match p.st with
+          match (prj p).st with
           | Pending _ ->
             decr outstanding;
             fill p ok_unit
           | Fulfilled _ | Rejected _ -> ())
         waiters
 
-  let wait_on ws =
+  let wait_on ws : unit =
     let p = new_pending () in
     incr outstanding;
     ws.waiters <- p :: ws.waiters;
