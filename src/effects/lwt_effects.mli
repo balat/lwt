@@ -28,9 +28,15 @@
     {!bind} suspends the {e whole} current fiber until the awaited promise
     resolves, a linear chain [p >>= f >>= g] behaves exactly as in Lwt, but code
     written {e after} a pending [bind] in the same fiber is sequenced after it,
-    not run concurrently. Concurrency is obtained explicitly through {!async},
-    {!both} and {!choose} — as in Eio. This is a deliberate POC simplification;
-    see the session report for the drop-in story. *)
+    not run concurrently. Concurrency is then obtained explicitly through
+    {!async}, {!both} and {!choose} — as in Eio.
+
+    {b Two flavours of bind.} If you need Lwt's {e implicit} concurrency (where
+    [both (a >>= f) (b >>= g)] runs both branches without an explicit [async]),
+    use {!mbind} / the {!Compat} module instead: that bind does not suspend the
+    caller. The top-level {!bind} trades implicit concurrency for a cheaper,
+    suspension-based implementation; {!Compat} preserves Lwt semantics at Lwt's
+    allocation cost (minus the proxy machinery). See {!section:compat}. *)
 
 type 'a t
 (** A promise for a value of type ['a]. *)
@@ -151,7 +157,7 @@ val await_lwt : 'a Lwt.t -> 'a
 val to_lwt : 'a t -> 'a Lwt.t
 (** [to_lwt p] exposes the effect promise [p] as an ordinary [Lwt.t]. *)
 
-(** {1 Lwt-compatibility layer}
+(** {1:compat Lwt-compatibility layer}
 
     Enough of {!Lwt}'s public API to compile code written against Lwt by aliasing
     [module Lwt = Lwt_effects].

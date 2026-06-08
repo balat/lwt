@@ -82,6 +82,11 @@ let rec pauses_eff n =
   if n = 0 then Lwt_effects.return_unit
   else Lwt_effects.bind (Lwt_effects.pause ()) (fun () -> pauses_eff (n - 1))
 
+(* Semantics-preserving (non-blocking) bind — comparable to Lwt's. *)
+let rec pauses_compat n =
+  if n = 0 then Lwt_effects.return_unit
+  else Lwt_effects.Compat.bind (Lwt_effects.pause ()) (fun () -> pauses_compat (n - 1))
+
 let bench_suspension () =
   Printf.printf "\nWorkload 2: suspension chain (%d pauses x %d repeats)\n"
     pause_len pause_repeats;
@@ -89,9 +94,13 @@ let bench_suspension () =
     for _ = 1 to pause_repeats do
       Lwt_main.run (pauses_lwt pause_len)
     done);
-  measure "Lwt_effects" ~ops:ops2 (fun () ->
+  measure "Lwt_effects (effect bind)" ~ops:ops2 (fun () ->
     for _ = 1 to pause_repeats do
       Lwt_effects.run (fun () -> pauses_eff pause_len)
+    done);
+  measure "Lwt_effects (Compat mbind)" ~ops:ops2 (fun () ->
+    for _ = 1 to pause_repeats do
+      Lwt_effects.run (fun () -> pauses_compat pause_len)
     done)
 
 let () =
