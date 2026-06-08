@@ -3,8 +3,13 @@
     This is a proof-of-concept reimplementation of Lwt's monadic core on top of
     OCaml 5 {{:https://ocaml.org/manual/5.3/effects.html} effects}. It keeps the
     familiar monadic interface ([return], [bind], [>>=], ...) so that the
-    asynchronicity of a function stays visible in its type, while making the
-    common case of {!bind} a plain function application with no heap allocation.
+    asynchronicity of a function stays visible in its type. On an already
+    resolved promise {!bind} is a plain application ([bind] itself allocates
+    nothing — no callback, no proxy), and a lean array-based scheduler replaces
+    Lwt's machinery, so scheduling- and bind-heavy code runs markedly faster than
+    Lwt. (It is not allocation-free overall: [return] and the user's continuation
+    closure still allocate, and flambda does not remove them — see the
+    benchmarks.)
 
     {b Benchmarks & write-up.} A comparative study (this scheduler vs classic
     Lwt, Eio and Miou — scheduling, bind, ping-pong, echo TCP, and cohttp, with
@@ -67,8 +72,9 @@ val return_unit : unit t
 
 val bind : 'a t -> ('a -> 'b t) -> 'b t
 (** [bind p f] is [f v] once [p] is fulfilled with [v]. If [p] is already
-    fulfilled, this is a direct application with no allocation. If [f] raises or
-    [p] is rejected, the result is a rejected promise. *)
+    fulfilled, this is a direct application ([bind] itself allocates nothing on
+    this path; [f] of course may). If [f] raises or [p] is rejected, the result
+    is a rejected promise. See {!mbind} for the semantics-preserving variant. *)
 
 val map : ('a -> 'b) -> 'a t -> 'b t
 (** [map f p] applies [f] to the value of [p]. *)
