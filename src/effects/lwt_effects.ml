@@ -240,6 +240,10 @@ let default_idle () : bool =
   end
   else false
 
+(* Run at the start of [run] to reset back-end state (e.g. the I/O readiness
+   table) that must not leak across independent scheduler runs. *)
+let on_reset : (unit -> unit) ref = ref ignore
+
 let idle_hook : (unit -> bool) ref = ref default_idle
 let set_idle (f : unit -> bool) : unit = idle_hook := f
 
@@ -254,6 +258,7 @@ let rec run_scheduler () : unit =
   | None -> if !idle_hook () then run_scheduler ()
 
 let run (type a) (main : unit -> a t) : a =
+  !on_reset ();
   let outcome = ref None in
   spawn (fun () ->
     let r = try await_result (main ()) with e -> Error e in
@@ -276,16 +281,88 @@ end
 (* ------------------------------------------------------------------ *)
 
 module Io = struct
-  (* Suspend the current fiber until [fd] is readable / writable, using the
-     engine. The promise's cancel action stops the engine event so a cancelled
-     wait leaks nothing. *)
-  let wait register fd =
+  (* Readiness watchers are kept registered per (fd, direction) across calls,
+     rather than created one-shot per blocking syscall. Re-registering a libev
+     watcher on every read costs an [epoll_ctl] ADD+DEL each time; keeping it
+     alive (as Lwt_unix does) reduces that to one registration per fd.
+
+     A [waitset] holds the live engine event (if any) and the promises of the
+     fibers waiting for that readiness. When the fd becomes ready, all current
+     waiters are resolved; they retry their syscall and, on [EAGAIN], re-arm the
+     same still-registered watcher. A watcher is stopped only when it fires with
+     no waiters left — using the event the engine hands to the callback, so
+     there is no stop/re-register race. In a tight loop the waiter is always
+     re-armed before the fd is ready again, so the watcher persists and no
+     [epoll_ctl] is issued after the first registration. *)
+  type waitset = {
+    mutable event : Lwt_engine.event option;
+    mutable waiters : unit t list;
+    register : (Lwt_engine.event -> unit) -> Lwt_engine.event;
+  }
+
+  type entry = { rd : waitset; wr : waitset }
+
+  let table : (Unix.file_descr, entry) Hashtbl.t = Hashtbl.create 64
+
+  let entry_of fd =
+    match Hashtbl.find_opt table fd with
+    | Some e -> e
+    | None ->
+      let e =
+        {
+          rd = { event = None; waiters = []; register = Lwt_engine.on_readable fd };
+          wr = { event = None; waiters = []; register = Lwt_engine.on_writable fd };
+        }
+      in
+      Hashtbl.add table fd e;
+      e
+
+  let fire ws ev =
+    match ws.waiters with
+    | [] ->
+      (* The fd is ready but nobody is waiting: stop the (level-triggered)
+         watcher to avoid spinning. A later wait re-registers it. *)
+      ws.event <- None;
+      Lwt_engine.stop_event ev
+    | waiters ->
+      ws.waiters <- [];
+      List.iter
+        (fun p ->
+          match p.st with
+          | Pending _ ->
+            decr outstanding;
+            fill p ok_unit
+          | Return _ | Fail _ -> ())
+        waiters
+
+  let wait_on ws =
     let p = new_pending () in
-    setup_event p (register fd);
+    incr outstanding;
+    ws.waiters <- p :: ws.waiters;
+    (match ws.event with
+    | Some _ -> ()
+    | None -> ws.event <- Some (ws.register (fire ws)));
+    (* A cancelled waiter is left in the list and skipped on the next fire. *)
+    set_on_cancel p (fun () -> decr outstanding);
     await p
 
-  let wait_readable fd = wait Lwt_engine.on_readable fd
-  let wait_writable fd = wait Lwt_engine.on_writable fd
+  let wait_readable fd = wait_on (entry_of fd).rd
+  let wait_writable fd = wait_on (entry_of fd).wr
+
+  (* Drop all readiness watchers (e.g. between independent [run]s, since
+     descriptor numbers may be reused). Installed as the scheduler reset hook. *)
+  let reset () =
+    let stop ws =
+      match ws.event with
+      | Some ev ->
+        ws.event <- None;
+        (try Lwt_engine.stop_event ev with _ -> ())
+      | None -> ()
+    in
+    Hashtbl.iter (fun _ e -> stop e.rd; stop e.wr) table;
+    Hashtbl.clear table
+
+  let () = on_reset := reset
 
   (* Specialised retry loops (rather than a generic [retry_eagain op]) so the
      hot path allocates no per-call operation closure. *)
