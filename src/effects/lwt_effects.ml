@@ -681,6 +681,72 @@ module Io = struct
   let wait_readable fd = wait_on (entry_of fd).rd
   let wait_writable fd = wait_on (entry_of fd).wr
 
+  (* Register [k] to run (once) when the fd is ready, without suspending the
+     caller — used by the monadic I/O below. *)
+  let when_ready ws k =
+    let p = new_pending () in
+    incr outstanding;
+    ws.waiters <- p :: ws.waiters;
+    (match ws.event with
+    | Some _ -> ()
+    | None -> ws.event <- Some (ws.register (fire ws)));
+    set_on_cancel p (fun () -> decr outstanding);
+    add_waiter p (fun _ -> k ())
+
+  (* Monadic, non-blocking I/O (returns a promise, resolved by a callback when
+     the fd is ready — like Lwt_unix, no fiber). Composes with the Compat bind
+     to express Lwt-style code. *)
+  let read_m fd buf off len : int t =
+    let result = new_pending () in
+    let rec attempt () =
+      match Unix.read fd buf off len with
+      | n -> fill result (Ok n)
+      | exception
+          Unix.Unix_error ((Unix.EAGAIN | Unix.EWOULDBLOCK | Unix.EINTR), _, _) ->
+        when_ready (entry_of fd).rd attempt
+      | exception e -> fill result (Error e)
+    in
+    attempt ();
+    result
+
+  let write_m fd buf off len : int t =
+    let result = new_pending () in
+    let rec attempt () =
+      match Unix.write fd buf off len with
+      | n -> fill result (Ok n)
+      | exception
+          Unix.Unix_error ((Unix.EAGAIN | Unix.EWOULDBLOCK | Unix.EINTR), _, _) ->
+        when_ready (entry_of fd).wr attempt
+      | exception e -> fill result (Error e)
+    in
+    attempt ();
+    result
+
+  let accept_m fd : (Unix.file_descr * Unix.sockaddr) t =
+    let result = new_pending () in
+    let rec attempt () =
+      match Unix.accept fd with
+      | res -> fill result (Ok res)
+      | exception
+          Unix.Unix_error ((Unix.EAGAIN | Unix.EWOULDBLOCK | Unix.EINTR), _, _) ->
+        when_ready (entry_of fd).rd attempt
+      | exception e -> fill result (Error e)
+    in
+    attempt ();
+    result
+
+  let connect_m fd addr : unit t =
+    match Unix.connect fd addr with
+    | () -> return_unit
+    | exception Unix.Unix_error ((Unix.EINPROGRESS | Unix.EWOULDBLOCK), _, _) ->
+      let result = new_pending () in
+      when_ready (entry_of fd).wr (fun () ->
+        match Unix.getsockopt_error fd with
+        | None -> fill result ok_unit
+        | Some e -> fill result (Error (Unix.Unix_error (e, "connect", ""))));
+      result
+    | exception e -> fail e
+
   (* Drop all readiness watchers (e.g. between independent [run]s, since
      descriptor numbers may be reused). Installed as the scheduler reset hook. *)
   let reset () =

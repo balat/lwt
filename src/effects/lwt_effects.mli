@@ -301,6 +301,20 @@ module Io : sig
 
   val connect : Unix.file_descr -> Unix.sockaddr -> unit
   (** Like [Unix.connect], waiting for an in-progress connection to complete. *)
+
+  val read_m : Unix.file_descr -> bytes -> int -> int -> int t
+  (** Monadic, non-blocking read: returns a promise resolved by a callback when
+      the descriptor is ready (like [Lwt_unix.read], no fiber). Composes with
+      {!mbind} / {!Compat} to express Lwt-style monadic I/O. *)
+
+  val write_m : Unix.file_descr -> bytes -> int -> int -> int t
+  (** Monadic, non-blocking write (see {!read_m}). *)
+
+  val accept_m : Unix.file_descr -> (Unix.file_descr * Unix.sockaddr) t
+  (** Monadic, non-blocking accept (see {!read_m}). *)
+
+  val connect_m : Unix.file_descr -> Unix.sockaddr -> unit t
+  (** Monadic, non-blocking connect (see {!read_m}). *)
 end
 
 (**/**)
