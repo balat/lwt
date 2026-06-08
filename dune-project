@@ -79,6 +79,17 @@
   (lwt (>= 6))))
 
 (package
+ (name lwt_effects_uring)
+ (version 6.0.0)
+ (synopsis "io_uring back end for the Lwt_effects scheduler (POC, Linux only)")
+ (depends
+  (ocaml (>= 5.0))
+  (lwt_effects (= :version))
+  (uring (>= "0.9"))
+  cstruct
+  optint))
+
+(package
  (name lwt_runtime_events)
  (version 6.0.0)
  (synopsis "Emit runtime events to trace the execution of Lwt programs")
