@@ -187,6 +187,39 @@ let () =
   in
   check "socketpair read/write" (r = "hello")
 
+(* Lwt-compatibility layer: wait/wakeup resolver, state, join, finalize. *)
+let () =
+  let r =
+    run (fun () ->
+      let p, u = wait () in
+      let waiter = async (fun () -> let* x = p in return (x * 2)) in
+      wakeup u 21;
+      waiter)
+  in
+  check "wait/wakeup resolver" (r = 42)
+
+let () =
+  let r = run (fun () -> return (state (return 7))) in
+  check "state of resolved" (match r with Return 7 -> true | _ -> false)
+
+let () =
+  let order = ref [] in
+  run (fun () ->
+    let a = async (fun () -> let* () = pause () in order := 1 :: !order; return ()) in
+    let b = async (fun () -> order := 2 :: !order; return ()) in
+    join [ a; b ]);
+  check "join waits all" (List.sort compare !order = [ 1; 2 ])
+
+let () =
+  let steps = ref [] in
+  let r =
+    run (fun () ->
+      finalize
+        (fun () -> steps := "body" :: !steps; return 99)
+        (fun () -> steps := "final" :: !steps; return ()))
+  in
+  check "finalize runs cleanup" (r = 99 && List.rev !steps = [ "body"; "final" ])
+
 let () =
   if !failures = 0 then print_endline "\nAll tests passed."
   else begin

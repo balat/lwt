@@ -151,6 +151,75 @@ val await_lwt : 'a Lwt.t -> 'a
 val to_lwt : 'a t -> 'a Lwt.t
 (** [to_lwt p] exposes the effect promise [p] as an ordinary [Lwt.t]. *)
 
+(** {1 Lwt-compatibility layer}
+
+    Enough of {!Lwt}'s public API to compile code written against Lwt by aliasing
+    [module Lwt = Lwt_effects].
+
+    {b Important semantic caveat}: {!bind} here suspends the current fiber, so
+    Lwt's {e implicit concurrency} is not preserved — e.g.
+    [both (a >>= f) (b >>= g)] runs sequentially, not concurrently. Use {!async}
+    explicitly for concurrency. This layer maps the API {e shape}, not Lwt's
+    bind semantics. Notable shape differences that remain: {!async} returns a
+    promise (Lwt's returns [unit]); infix operators live in {!Infix}. *)
+
+(** State of a promise, as in {!Lwt.state}. *)
+type 'a state = Return of 'a | Fail of exn | Sleep
+
+type 'a u
+(** A resolver for a pending promise (as {!Lwt.u}). *)
+
+val wait : unit -> 'a t * 'a u
+val task : unit -> 'a t * 'a u
+val wakeup : 'a u -> 'a -> unit
+val wakeup_exn : 'a u -> exn -> unit
+val wakeup_later : 'a u -> 'a -> unit
+val wakeup_later_exn : 'a u -> exn -> unit
+val state : 'a t -> 'a state
+val is_sleeping : 'a t -> bool
+val poll : 'a t -> 'a option
+val of_result : ('a, exn) result -> 'a t
+
+val fail_with : string -> 'a t
+val fail_invalid_arg : string -> 'a t
+val return_some : 'a -> 'a option t
+val return_ok : 'a -> ('a, 'b) result t
+val return_error : 'b -> ('a, 'b) result t
+val return_true : bool t
+val return_false : bool t
+
+val wrap : (unit -> 'a) -> 'a t
+val finalize : (unit -> 'a t) -> (unit -> unit t) -> 'a t
+
+val join : unit t list -> unit t
+val all : 'a t list -> 'a list t
+val nchoose : 'a t list -> 'a list t
+val npick : 'a t list -> 'a list t
+
+val on_any : 'a t -> ('a -> unit) -> (exn -> unit) -> unit
+val on_success : 'a t -> ('a -> unit) -> unit
+val on_failure : 'a t -> (exn -> unit) -> unit
+val on_termination : 'a t -> (unit -> unit) -> unit
+val on_cancel : 'a t -> (unit -> unit) -> unit
+
+val async_exception_hook : (exn -> unit) ref
+val dont_wait : (unit -> unit t) -> (exn -> unit) -> unit
+val ignore_result : 'a t -> unit
+
+val no_cancel : 'a t -> 'a t
+(** Approximation (cancellation isolation is not modelled). *)
+
+val protected : 'a t -> 'a t
+(** Approximation (cancellation isolation is not modelled). *)
+
+(** Infix operators, as in {!Lwt.Infix}. *)
+module Infix : sig
+  val ( >>= ) : 'a t -> ('a -> 'b t) -> 'b t
+  val ( =<< ) : ('a -> 'b t) -> 'a t -> 'b t
+  val ( >|= ) : 'a t -> ('a -> 'b) -> 'b t
+  val ( =|< ) : ('a -> 'b) -> 'a t -> 'b t
+end
+
 (** {1 Running} *)
 
 val run : (unit -> 'a t) -> 'a
