@@ -125,6 +125,11 @@ val pause : unit -> unit t
 (** [pause ()] resolves on the next scheduler tick, giving other fibers a chance
     to run. *)
 
+val yield : unit -> unit
+(** [yield ()] reschedules the current fiber behind the others, like
+    [await (pause ())] but without allocating a promise. Must be called inside a
+    fiber ({!run}/{!async}). *)
+
 val sleep : float -> unit t
 (** [sleep d] resolves after [d] seconds. *)
 

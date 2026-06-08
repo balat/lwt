@@ -107,7 +107,13 @@ let setup_event (p : unit t)
 (* Effects                                                            *)
 (* ------------------------------------------------------------------ *)
 
-type _ Effect.t += Await : 'a t -> ('a, exn) result Effect.t
+type _ Effect.t +=
+  | Await : 'a t -> ('a, exn) result Effect.t
+  | Yield : unit Effect.t
+
+(* Reschedule the current fiber behind the others, without allocating a
+   promise (unlike [await (pause ())]). *)
+let yield () : unit = Effect.perform Yield
 
 (* Perform [Await] only when actually pending: resolved cases stay
    allocation-free and never touch the scheduler. *)
@@ -173,6 +179,7 @@ let handler : (unit, unit) Effect.Deep.handler =
     function
     | Await p ->
       Some (fun k -> add_waiter p (fun r -> Queue.push (Resume (r, k)) run_queue))
+    | Yield -> Some (fun k -> Queue.push (Resume ((), k)) run_queue)
     | _ -> None
   in
   { retc; exnc; effc }

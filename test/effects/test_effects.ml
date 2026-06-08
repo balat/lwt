@@ -59,6 +59,18 @@ let () =
     return ());
   check "async interleaving" (List.rev !log = [ "a1"; "b1"; "a2"; "b2" ])
 
+(* [yield] interleaves fibers without allocating a promise. *)
+let () =
+  let log = ref [] in
+  let push x = log := x :: !log in
+  run (fun () ->
+    let a = async (fun () -> push "a1"; yield (); push "a2"; return ()) in
+    let b = async (fun () -> push "b1"; yield (); push "b2"; return ()) in
+    let* () = a in
+    let* () = b in
+    return ());
+  check "yield interleaving" (List.rev !log = [ "a1"; "b1"; "a2"; "b2" ])
+
 (* [both] collects two concurrently-running promises. *)
 let () =
   let r =
