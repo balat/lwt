@@ -75,7 +75,8 @@
  (synopsis "Effect-based scheduler for Lwt-style promises (POC)")
  (depends
   (ocaml (>= 5.0))
-  base-unix))
+  base-unix
+  (lwt (>= 6))))
 
 (package
  (name lwt_runtime_events)

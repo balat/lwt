@@ -35,6 +35,10 @@
 type 'a t
 (** A promise for a value of type ['a]. *)
 
+exception Canceled
+(** Raised in a fiber whose awaited promise is {!cancel}led, and used to reject
+    a cancelled promise. *)
+
 (** {1 Constructors} *)
 
 val return : 'a -> 'a t
@@ -98,8 +102,22 @@ val both : 'a t -> 'b t -> ('a * 'b) t
 
 val choose : 'a t list -> 'a t
 (** [choose ps] resolves as soon as one of [ps] resolves (with its value or
-    exception). The other promises are {e not} cancelled (cancellation is not
-    implemented in this POC). *)
+    exception). The other promises are left running. *)
+
+val pick : 'a t list -> 'a t
+(** [pick ps] is like {!choose}, but {!cancel}s the other promises once one of
+    them resolves. *)
+
+(** {1 Cancellation} *)
+
+val cancel : 'a t -> unit
+(** [cancel p] rejects the pending promise [p] with {!Canceled} and runs its
+    cancel action (e.g. stopping a pending I/O or timer event). Resolved
+    promises are unaffected.
+
+    Note: cancelling the promise returned by {!async} marks that promise as
+    cancelled but does not stop the already-running fiber (as in
+    {!Lwt_direct.spawn}). *)
 
 (** {1 Yielding and timers} *)
 
@@ -114,4 +132,33 @@ val sleep : float -> unit t
 
 val run : (unit -> 'a t) -> 'a
 (** [run main] runs the scheduler until the promise returned by [main ()]
-    resolves, then returns its value (or raises its exception). *)
+    resolves, then returns its value (or raises its exception). While the run
+    queue is empty and the underlying {!Lwt_engine} still has registered events,
+    [run] blocks in the event loop. *)
+
+(** {1 Non-blocking I/O}
+
+    Direct-style I/O on raw {!Unix.file_descr}s. Each call suspends the current
+    fiber on the {!Lwt_engine} until the descriptor is ready, then performs the
+    syscall. The descriptors must be in non-blocking mode
+    ([Unix.set_nonblock]). These functions must be called inside a fiber
+    ({!run}/{!async}). *)
+module Io : sig
+  val wait_readable : Unix.file_descr -> unit
+  (** Suspend until the descriptor is readable. *)
+
+  val wait_writable : Unix.file_descr -> unit
+  (** Suspend until the descriptor is writable. *)
+
+  val read : Unix.file_descr -> bytes -> int -> int -> int
+  (** Like [Unix.read], retrying on [EAGAIN]/[EWOULDBLOCK]/[EINTR]. *)
+
+  val write : Unix.file_descr -> bytes -> int -> int -> int
+  (** Like [Unix.write], retrying on [EAGAIN]/[EWOULDBLOCK]/[EINTR]. *)
+
+  val accept : Unix.file_descr -> Unix.file_descr * Unix.sockaddr
+  (** Like [Unix.accept], waiting for an incoming connection. *)
+
+  val connect : Unix.file_descr -> Unix.sockaddr -> unit
+  (** Like [Unix.connect], waiting for an in-progress connection to complete. *)
+end
