@@ -233,9 +233,18 @@ let sleep (d : float) : unit t =
    work arrives. Returns [true] if it may have produced new work (the loop
    continues), [false] if there is nothing left to wait for (scheduler is done).
    A backend (the default Lwt_engine one, or io_uring) installs its own. *)
+(* Block in the Lwt event loop while cooperating with Lwt itself: fulfil Lwt's
+   paused promises and, when some are pending, poll without blocking (as
+   Lwt_main does). This lets fibers [await] real [Lwt.t] promises — including
+   Lwt_unix I/O — through {!of_lwt}. *)
 let default_idle () : bool =
   if !outstanding > 0 then begin
-    Lwt_engine.iter true;
+    Lwt.wakeup_paused ();
+    (* Servicing Lwt's paused promises may have produced ready work (a fiber
+       resumed via [of_lwt]); only block in the loop if nothing is ready, and
+       then only if no Lwt pause is still pending. *)
+    if Queue.is_empty run_queue then
+      Lwt_engine.iter (Lwt.paused_count () = 0);
     true
   end
   else false
@@ -275,6 +284,47 @@ module Syntax = struct
   let ( and* ) = both
   let ( and+ ) = both
 end
+
+(* ------------------------------------------------------------------ *)
+(* Interoperability with Lwt                                          *)
+(* ------------------------------------------------------------------ *)
+
+(* Both Lwt and this scheduler use the same {!Lwt_engine}, and [run]'s default
+   idle hook drives Lwt's paused queue and event loop, so a real [Lwt.t] makes
+   progress while a fiber waits on it. *)
+
+let of_lwt (type a) (lwt : a Lwt.t) : a t =
+  match Lwt.state lwt with
+  | Lwt.Return v -> { st = Return v }
+  | Lwt.Fail e -> { st = Fail e }
+  | Lwt.Sleep ->
+    let p = new_pending () in
+    incr outstanding;
+    let finish r =
+      match p.st with
+      | Pending _ ->
+        decr outstanding;
+        fill p r
+      | Return _ | Fail _ -> ()
+    in
+    Lwt.on_any lwt (fun v -> finish (Ok v)) (fun e -> finish (Error e));
+    set_on_cancel p (fun () ->
+      decr outstanding;
+      Lwt.cancel lwt);
+    p
+
+let await_lwt lwt = await (of_lwt lwt)
+
+let to_lwt (type a) (p : a t) : a Lwt.t =
+  match p.st with
+  | Return v -> Lwt.return v
+  | Fail e -> Lwt.fail e
+  | Pending _ ->
+    let lwt, u = Lwt.wait () in
+    add_waiter p (function
+      | Ok v -> Lwt.wakeup u v
+      | Error e -> Lwt.wakeup_exn u e);
+    lwt
 
 (* ------------------------------------------------------------------ *)
 (* Non-blocking I/O on raw file descriptors                           *)

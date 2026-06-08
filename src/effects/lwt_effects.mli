@@ -128,6 +128,24 @@ val pause : unit -> unit t
 val sleep : float -> unit t
 (** [sleep d] resolves after [d] seconds. *)
 
+(** {1 Interoperability with Lwt}
+
+    These bridges let effect fibers cooperate with ordinary [Lwt] code (and
+    libraries such as [Lwt_unix]). Under {!run}, Lwt's paused queue and event
+    loop are driven automatically, so a real [Lwt.t] resolves while a fiber
+    waits on it. *)
+
+val of_lwt : 'a Lwt.t -> 'a t
+(** [of_lwt p] is an effect promise that resolves when the Lwt promise [p]
+    does. Cancelling it cancels [p]. *)
+
+val await_lwt : 'a Lwt.t -> 'a
+(** [await_lwt p] is [await (of_lwt p)]: block the current fiber on a real Lwt
+    promise. *)
+
+val to_lwt : 'a t -> 'a Lwt.t
+(** [to_lwt p] exposes the effect promise [p] as an ordinary [Lwt.t]. *)
+
 (** {1 Running} *)
 
 val run : (unit -> 'a t) -> 'a
