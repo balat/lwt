@@ -548,6 +548,67 @@ module Infix = struct
 end
 
 (* ------------------------------------------------------------------ *)
+(* Semantics-preserving (non-blocking) monadic bind                   *)
+(* ------------------------------------------------------------------ *)
+
+(* The default [bind] above suspends the current fiber (cheap, but it loses
+   Lwt's implicit concurrency: [both (a >>= f) (b >>= g)] would serialise).
+
+   [mbind] is the Lwt-compatible bind: it does NOT block the caller. On a
+   pending [p] it allocates a result promise and registers a callback that runs
+   [f] when [p] resolves, forwarding [f]'s promise to the result. This preserves
+   implicit concurrency (the caller keeps running, so both branches start) at
+   the cost of one promise + one callback per pending bind — exactly Lwt's
+   trade-off, but without Lwt's proxy machinery. The storage in effect at the
+   bind is restored around the callback, as in Lwt. *)
+let mbind (type a b) (p : a t) (f : a -> b t) : b t =
+  match p.st with
+  | Fulfilled v -> apply f v
+  | Rejected e -> { st = Rejected e }
+  | Pending _ ->
+    let result = new_pending () in
+    let saved = !current_storage in
+    add_waiter p (fun r ->
+      let outer = !current_storage in
+      current_storage := saved;
+      (match r with
+      | Ok v -> (
+        let p' = apply f v in
+        match p'.st with
+        | Fulfilled v' -> fill result (Ok v')
+        | Rejected e -> fill result (Error e)
+        | Pending _ -> add_waiter p' (fun r' -> fill result r'))
+      | Error e -> fill result (Error e));
+      current_storage := outer);
+    result
+
+(* A Lwt-semantics facade: same API shape as the top level, but [bind]/[>>=]/
+   [map]/[both]/[join] are non-blocking (implicit concurrency preserved). Use
+   [module Lwt = Lwt_effects.Compat] for a closer drop-in. *)
+module Compat = struct
+  let bind = mbind
+  let ( >>= ) = mbind
+  let map f p = mbind p (fun v -> return (f v))
+  let ( >|= ) p f = map f p
+  let both a b = mbind a (fun x -> mbind b (fun y -> return (x, y)))
+  let join ps = List.fold_right (fun p acc -> mbind p (fun () -> acc)) ps return_unit
+
+  module Infix = struct
+    let ( >>= ) = mbind
+    let ( =<< ) f p = mbind p f
+    let ( >|= ) p f = map f p
+    let ( =|< ) f p = map f p
+  end
+
+  module Syntax = struct
+    let ( let* ) = mbind
+    let ( let+ ) p f = map f p
+    let ( and* ) = both
+    let ( and+ ) = both
+  end
+end
+
+(* ------------------------------------------------------------------ *)
 (* Non-blocking I/O on raw file descriptors                           *)
 (* ------------------------------------------------------------------ *)
 

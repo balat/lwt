@@ -229,6 +229,39 @@ module Infix : sig
   val ( =|< ) : ('a -> 'b) -> 'a t -> 'b t
 end
 
+val mbind : 'a t -> ('a -> 'b t) -> 'b t
+(** The {e semantics-preserving} bind: unlike {!bind} (which suspends the
+    current fiber), [mbind] does not block the caller — it allocates a result
+    promise and a callback — so Lwt's {b implicit concurrency} is preserved
+    ([both (a >>= f) (b >>= g)] runs both branches). This is Lwt's trade-off:
+    one promise + one callback per pending bind, but no proxy machinery. *)
+
+(** A Lwt-semantics facade: same shape as the top-level API, but [bind]/[>>=]/
+    [map]/[both]/[join] are the non-blocking {!mbind} (implicit concurrency
+    preserved). Closer to a drop-in [Lwt]: [module Lwt = Lwt_effects.Compat]. *)
+module Compat : sig
+  val bind : 'a t -> ('a -> 'b t) -> 'b t
+  val ( >>= ) : 'a t -> ('a -> 'b t) -> 'b t
+  val map : ('a -> 'b) -> 'a t -> 'b t
+  val ( >|= ) : 'a t -> ('a -> 'b) -> 'b t
+  val both : 'a t -> 'b t -> ('a * 'b) t
+  val join : unit t list -> unit t
+
+  module Infix : sig
+    val ( >>= ) : 'a t -> ('a -> 'b t) -> 'b t
+    val ( =<< ) : ('a -> 'b t) -> 'a t -> 'b t
+    val ( >|= ) : 'a t -> ('a -> 'b) -> 'b t
+    val ( =|< ) : ('a -> 'b) -> 'a t -> 'b t
+  end
+
+  module Syntax : sig
+    val ( let* ) : 'a t -> ('a -> 'b t) -> 'b t
+    val ( let+ ) : 'a t -> ('a -> 'b) -> 'b t
+    val ( and* ) : 'a t -> 'b t -> ('a * 'b) t
+    val ( and+ ) : 'a t -> 'b t -> ('a * 'b) t
+  end
+end
+
 (** {1 Running} *)
 
 val run : (unit -> 'a t) -> 'a

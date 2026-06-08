@@ -268,6 +268,34 @@ let () =
   check "storage per-fiber isolation"
     (List.sort compare !results = [ ("a", Some "a"); ("b", Some "b") ])
 
+(* The default (effect) bind serialises [both (a>>=) (b>>=)]; the Compat
+   (non-blocking) bind preserves Lwt's implicit concurrency. *)
+let () =
+  let timed f =
+    let t0 = Unix.gettimeofday () in
+    f ();
+    Unix.gettimeofday () -. t0
+  in
+  let effect_dt =
+    timed (fun () ->
+      run (fun () ->
+        both
+          (let* () = sleep 0.05 in return 1)
+          (let* () = sleep 0.05 in return 2)
+        >>= fun _ -> return ()))
+  in
+  let compat_dt =
+    timed (fun () ->
+      let open Compat in
+      run (fun () ->
+        both
+          (sleep 0.05 >>= fun () -> return 1)
+          (sleep 0.05 >>= fun () -> return 2)
+        >>= fun _ -> return_unit))
+  in
+  check "effect bind serialises (~0.10s)" (effect_dt > 0.085);
+  check "Compat bind keeps concurrency (~0.05s)" (compat_dt < 0.085)
+
 let () =
   if !failures = 0 then print_endline "\nAll tests passed."
   else begin
