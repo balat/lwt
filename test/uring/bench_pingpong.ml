@@ -59,6 +59,50 @@ let pingpong () =
   Lwt_unix.close a >>= fun () ->
   Lwt_unix.close b
 
+(* Same workload, but using completion-based io_uring I/O (Lwt_uring.Io) on raw
+   descriptors instead of the readiness-based Lwt_unix.read/write. *)
+let pingpong_io () =
+  let a, b = Unix.socketpair Unix.PF_UNIX Unix.SOCK_STREAM 0 in
+  let buf_a = Bytes.create payload in
+  let buf_b = Bytes.create payload in
+  let rec write_all io fd buf off len =
+    if len = 0 then Lwt.return_unit
+    else io fd buf off len >>= fun n -> write_all io fd buf (off + n) (len - n)
+  in
+  let server =
+    let rec loop n =
+      if n = 0 then Lwt.return_unit
+      else
+        write_all Lwt_uring.Io.read b buf_b 0 payload >>= fun () ->
+        write_all Lwt_uring.Io.write b buf_b 0 payload >>= fun () ->
+        loop (n - 1)
+    in
+    loop round_trips
+  in
+  let client =
+    let rec loop n =
+      if n = 0 then Lwt.return_unit
+      else
+        write_all Lwt_uring.Io.write a buf_a 0 payload >>= fun () ->
+        write_all Lwt_uring.Io.read a buf_a 0 payload >>= fun () ->
+        loop (n - 1)
+    in
+    loop round_trips
+  in
+  Lwt.join [server; client] >>= fun () ->
+  Unix.close a;
+  Unix.close b;
+  Lwt.return_unit
+
+let measure_with workload name =
+  Lwt_main.run (workload ());
+  let t0 = Unix.gettimeofday () in
+  Lwt_main.run (workload ());
+  let dt = Unix.gettimeofday () -. t0 in
+  Printf.printf "%-26s %8.2f us/round-trip  (%.0f round-trips/s)\n%!"
+    name (dt /. float_of_int round_trips *. 1e6)
+    (float_of_int round_trips /. dt)
+
 let measure name =
   (* Warm up, then measure. *)
   Lwt_main.run (pingpong ());
@@ -72,6 +116,7 @@ let measure name =
 let () =
   Printf.printf "ping-pong: %d round-trips, %d-byte payload\n%!"
     round_trips payload;
-  measure "default engine";
+  measure "default engine (readiness)";
   Lwt_uring.set ();
-  measure "io_uring engine";
+  measure "io_uring engine (readiness)";
+  measure_with pingpong_io "io_uring Io (completion)";
