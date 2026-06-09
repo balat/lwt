@@ -20,3 +20,11 @@
  ; The suites listen on fixed loopback ports: see the lock in test/unix/dune.
  (locks /tcp-port/lwt-unix-suites)
  (libraries lwttester tester lwt_uring))
+
+; Micro-benchmark: socketpair ping-pong under the default vs io_uring engine.
+(executable
+ (name bench_pingpong)
+ (modules bench_pingpong)
+ (enabled_if
+  (= %{system} linux))
+ (libraries lwt.unix lwt_uring unix))
