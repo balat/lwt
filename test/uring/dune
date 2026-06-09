@@ -18,3 +18,11 @@
   (= %{system} linux))
  (deps bytes_io_data)
  (libraries lwttester tester lwt_uring))
+
+; Micro-benchmark: socketpair ping-pong under the default vs io_uring engine.
+(executable
+ (name bench_pingpong)
+ (modules bench_pingpong)
+ (enabled_if
+  (= %{system} linux))
+ (libraries lwt.unix lwt_uring unix))
