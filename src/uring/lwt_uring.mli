@@ -55,3 +55,37 @@ type Lwt_engine.engine_id += Engine_id__uring
 class uring : ?queue_depth:int -> unit -> object
   inherit Lwt_engine.t
 end
+
+(** {2 Completion-based I/O}
+
+    {b This is stage 2.} Unlike {!Lwt_unix}'s default operations — which wait for
+    a descriptor to become ready and then perform the syscall — these submit the
+    actual [read]/[write] to io_uring and resolve their promise on completion.
+    The kernel performs the transfer, so there is no separate readiness syscall,
+    and this works on regular files too (where readiness polling does not).
+
+    They require a {!uring} engine to be installed (via {!set}); otherwise they
+    raise [Failure]. The descriptor is the raw {!Unix.file_descr} (use
+    {!Lwt_unix.unix_file_descr} to obtain it). For now this is an explicit API;
+    a later step will route {!Lwt_unix}'s own operations through it transparently
+    when the io_uring engine is active. *)
+module Io : sig
+  type bigarray =
+    (char, Bigarray.int8_unsigned_elt, Bigarray.c_layout) Bigarray.Array1.t
+
+  val read : Unix.file_descr -> bytes -> int -> int -> int Lwt.t
+  (** [read fd buf pos len] reads at most [len] bytes into [buf] at [pos]
+      through io_uring, resolving with the number of bytes read (a [bytes]
+      buffer requires one copy from the ring's [Cstruct]; see {!read_bigarray}
+      for the copy-free variant). *)
+
+  val write : Unix.file_descr -> bytes -> int -> int -> int Lwt.t
+  (** [write fd buf pos len] writes up to [len] bytes of [buf] from [pos]
+      through io_uring, resolving with the number of bytes written. *)
+
+  val read_bigarray : Unix.file_descr -> bigarray -> int -> int -> int Lwt.t
+  (** Like {!read}, into a bigarray with no intermediate copy. *)
+
+  val write_bigarray : Unix.file_descr -> bigarray -> int -> int -> int Lwt.t
+  (** Like {!write}, from a bigarray with no intermediate copy. *)
+end
