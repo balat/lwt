@@ -116,7 +116,9 @@ let measure name =
 let () =
   Printf.printf "ping-pong: %d round-trips, %d-byte payload\n%!"
     round_trips payload;
-  measure "default engine (readiness)";
+  measure "default engine (libev)";
   Lwt_uring.set ();
-  measure "io_uring engine (readiness)";
-  measure_with pingpong_io "io_uring Io (completion)";
+  (* With the io_uring engine installed, Lwt_unix.read/write are transparently
+     routed to completion-based io_uring (no source change in the workload). *)
+  measure "io_uring (Lwt_unix API)";
+  measure_with pingpong_io "io_uring (explicit Io)";
