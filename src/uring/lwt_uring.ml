@@ -172,64 +172,135 @@ let get_ring () =
   | None ->
     failwith "Lwt_uring.Io: no io_uring engine installed (use Lwt_uring.set)"
 
-(* File offset [-1] tells io_uring to use the descriptor's current offset, like
-   [read(2)]/[write(2)] — correct for both regular files and sockets/pipes. *)
+(* Offset [-1] tells io_uring to use the descriptor's current position, like
+   [read(2)]/[write(2)] — used for seekable files. *)
 let current_offset = Optint.Int63.minus_one
+
+(* Submit a completion-based operation built by [make] and return a promise
+   resolved with the syscall result, or rejected with the corresponding
+   [Unix.Unix_error]. Cancelling the promise cancels the in-flight submission. *)
+let submit_io op_name make =
+  let ring = get_ring () in
+  let waiter, wakener = Lwt.task () in
+  let job = ref None in
+  let handler result =
+    job := None;
+    if result < 0 then
+      Lwt.wakeup_exn wakener
+        (Unix.Unix_error (U.error_of_errno result, op_name, ""))
+    else Lwt.wakeup wakener result
+  in
+  (match make ring (Io handler) with
+   | Some j -> job := Some j
+   | None ->
+     ignore (U.submit ring);
+     (match make ring (Io handler) with
+      | Some j -> job := Some j
+      | None -> failwith "Lwt_uring.Io: submission queue full"));
+  Lwt.on_cancel waiter (fun () ->
+    match !job with
+    | Some j -> (try ignore (U.cancel ring j Cancel) with Invalid_argument _ -> ())
+    | None -> ());
+  waiter
+
+(* Pick the io_uring operation to read into / write from a [Cstruct.t], by
+   descriptor kind:
+   - sockets use [recv]/[send] (offsetless — the correct op, and reading/writing
+     a socket through positioned [read]/[write] with offset -1 can stall);
+   - regular files use positioned [read]/[write] at the current offset (-1);
+   - other (pipes, ttys, …) are non-seekable, so [read]/[write] with offset 0
+     (the kernel ignores it). *)
+let read_op kind fd cs =
+  match (kind : Unix.file_kind) with
+  | Unix.S_SOCK -> fun ring data -> U.recv_msg ring fd (U.Msghdr.create [ cs ]) data
+  | Unix.S_REG | Unix.S_BLK ->
+    fun ring data -> U.read ring ~file_offset:current_offset fd cs data
+  | _ -> fun ring data -> U.read ring ~file_offset:Optint.Int63.zero fd cs data
+
+let write_op kind fd cs =
+  match (kind : Unix.file_kind) with
+  | Unix.S_SOCK -> fun ring data -> U.send_msg ring fd [ cs ] data
+  | Unix.S_REG | Unix.S_BLK ->
+    fun ring data -> U.write ring ~file_offset:current_offset fd cs data
+  | _ -> fun ring data -> U.write ring ~file_offset:Optint.Int63.zero fd cs data
 
 module Io = struct
   type bigarray =
     (char, Bigarray.int8_unsigned_elt, Bigarray.c_layout) Bigarray.Array1.t
 
-  (* Submit a completion-based operation and return a promise resolved with the
-     syscall result, or rejected with the corresponding [Unix.Unix_error].
-     Cancelling the promise cancels the in-flight submission. *)
-  let perform op_name make =
-    let ring = get_ring () in
-    let waiter, wakener = Lwt.task () in
-    let job = ref None in
-    let handler result =
-      job := None;
-      if result < 0 then
-        Lwt.wakeup_exn wakener
-          (Unix.Unix_error (U.error_of_errno result, op_name, ""))
-      else Lwt.wakeup wakener result
-    in
-    (match make ring (Io handler) with
-     | Some j -> job := Some j
-     | None ->
-       ignore (U.submit ring);
-       (match make ring (Io handler) with
-        | Some j -> job := Some j
-        | None -> failwith "Lwt_uring.Io: submission queue full"));
-    Lwt.on_cancel waiter (fun () ->
-      match !job with
-      | Some j -> (try ignore (U.cancel ring j Cancel) with Invalid_argument _ -> ())
-      | None -> ());
-    waiter
-
+  (* Positioned read/write at the descriptor's current offset, suited to regular
+     files and general use. For sockets, prefer the transparent {!Lwt_unix} path
+     (which uses [recv]/[send]). *)
   let read fd buf pos len =
     let cs = Cstruct.create len in
     Lwt.map
       (fun n -> Cstruct.blit_to_bytes cs 0 buf pos n; n)
-      (perform "read" (fun ring data ->
+      (submit_io "read" (fun ring data ->
          U.read ring ~file_offset:current_offset fd cs data))
 
   let write fd buf pos len =
     let cs = Cstruct.create len in
     Cstruct.blit_from_bytes buf pos cs 0 len;
-    perform "write" (fun ring data ->
+    submit_io "write" (fun ring data ->
       U.write ring ~file_offset:current_offset fd cs data)
 
   let read_bigarray fd buf pos len =
     let cs = Cstruct.of_bigarray ~off:pos ~len buf in
-    perform "read" (fun ring data ->
+    submit_io "read" (fun ring data ->
       U.read ring ~file_offset:current_offset fd cs data)
 
   let write_bigarray fd buf pos len =
     let cs = Cstruct.of_bigarray ~off:pos ~len buf in
-    perform "write" (fun ring data ->
+    submit_io "write" (fun ring data ->
       U.write ring ~file_offset:current_offset fd cs data)
 end
+
+(* Transparent routing of Lwt_unix.{read,write,…} through io_uring. The backend
+   self-gates on [the_ring]: it takes over only while a uring engine is
+   installed, and declines (so Lwt_unix uses its default path) otherwise. It is
+   installed once, when this module is linked; with no uring engine current it
+   has no effect. The operation is chosen per descriptor kind (see {!read_op}),
+   so sockets, files and pipes are each handled correctly. *)
+let completion_backend : Lwt_unix.completion_io =
+  let read ch buf pos len =
+    match !the_ring with
+    | None -> None
+    | Some _ ->
+      let fd = Lwt_unix.unix_file_descr ch and kind = Lwt_unix.fd_kind ch in
+      let cs = Cstruct.create len in
+      Some
+        (Lwt.map
+           (fun n -> Cstruct.blit_to_bytes cs 0 buf pos n; n)
+           (submit_io "read" (read_op kind fd cs)))
+  in
+  let write ch buf pos len =
+    match !the_ring with
+    | None -> None
+    | Some _ ->
+      let fd = Lwt_unix.unix_file_descr ch and kind = Lwt_unix.fd_kind ch in
+      let cs = Cstruct.create len in
+      Cstruct.blit_from_bytes buf pos cs 0 len;
+      Some (submit_io "write" (write_op kind fd cs))
+  in
+  let read_bigarray ch buf pos len =
+    match !the_ring with
+    | None -> None
+    | Some _ ->
+      let fd = Lwt_unix.unix_file_descr ch and kind = Lwt_unix.fd_kind ch in
+      let cs = Cstruct.of_bigarray ~off:pos ~len buf in
+      Some (submit_io "read" (read_op kind fd cs))
+  in
+  let write_bigarray ch buf pos len =
+    match !the_ring with
+    | None -> None
+    | Some _ ->
+      let fd = Lwt_unix.unix_file_descr ch and kind = Lwt_unix.fd_kind ch in
+      let cs = Cstruct.of_bigarray ~off:pos ~len buf in
+      Some (submit_io "write" (write_op kind fd cs))
+  in
+  { Lwt_unix.read; write; read_bigarray; write_bigarray }
+
+let () = Lwt_unix.set_completion_io (Some completion_backend)
 
 let available () =
   match U.create ~queue_depth:1 () with
