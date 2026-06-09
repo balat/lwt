@@ -19,11 +19,16 @@
  (modules dummy)
  (libraries unix))
 
+; The Lwt_io and Lwt_unix suites listen on fixed loopback ports. test/uring/main_uring
+; runs the same suites under io_uring, so both executables hold this lock and
+; dune never runs them at the same time.
+
 (test
  (name main)
  (package lwt)
  (libraries lwttester tester)
  (modules main)
+ (locks /tcp-port/lwt-unix-suites)
  (deps bytes_io_data %{exe:dummy.exe}))
 
 (test
