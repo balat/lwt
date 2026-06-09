@@ -85,6 +85,63 @@ let test_pause_and_timer () =
   end;
   check "pause and timers interleave correctly" (!steps = 3)
 
+(* Completion-based I/O (Lwt_uring.Io): the kernel performs the transfer; no
+   readiness wait. *)
+let test_io_socketpair () =
+  let a, b = Unix.socketpair Unix.PF_UNIX Unix.SOCK_STREAM 0 in
+  let msg = Bytes.of_string "completion!" in
+  let n = Bytes.length msg in
+  let got = Bytes.create n in
+  let written, read =
+    Lwt_main.run begin
+      Lwt_uring.Io.write a msg 0 n >>= fun written ->
+      Lwt_uring.Io.read b got 0 n >>= fun read ->
+      Lwt.return (written, read)
+    end
+  in
+  check "Io completion-based socketpair round-trip"
+    (written = n && read = n && Bytes.equal got msg);
+  Unix.close a;
+  Unix.close b
+
+(* io_uring can read a regular file asynchronously — readiness engines cannot
+   poll regular files at all. *)
+let test_io_regular_file () =
+  let path = Filename.temp_file "lwt_uring_test" ".dat" in
+  let contents = "the quick brown fox" in
+  let oc = open_out_bin path in
+  output_string oc contents;
+  close_out oc;
+  let n = String.length contents in
+  let fd = Unix.openfile path [ Unix.O_RDONLY ] 0 in
+  let buf = Bytes.create n in
+  let read = Lwt_main.run (Lwt_uring.Io.read fd buf 0 n) in
+  Unix.close fd;
+  Sys.remove path;
+  check "Io reads a regular file asynchronously"
+    (read = n && Bytes.equal buf (Bytes.of_string contents))
+
+let test_io_bigarray () =
+  let a, b = Unix.socketpair Unix.PF_UNIX Unix.SOCK_STREAM 0 in
+  let n = 8 in
+  let src = Bigarray.Array1.create Bigarray.char Bigarray.c_layout n in
+  for i = 0 to n - 1 do Bigarray.Array1.set src i (Char.chr (65 + i)) done;
+  let dst = Bigarray.Array1.create Bigarray.char Bigarray.c_layout n in
+  let ok =
+    Lwt_main.run begin
+      Lwt_uring.Io.write_bigarray a src 0 n >>= fun _ ->
+      Lwt_uring.Io.read_bigarray b dst 0 n >>= fun r ->
+      Lwt.return (r = n)
+    end
+  in
+  let same = ref ok in
+  for i = 0 to n - 1 do
+    if Bigarray.Array1.get src i <> Bigarray.Array1.get dst i then same := false
+  done;
+  check "Io zero-copy bigarray round-trip" !same;
+  Unix.close a;
+  Unix.close b
+
 let () =
   check "io_uring is available" (Lwt_uring.available ());
   Lwt_uring.set ();
@@ -96,6 +153,9 @@ let () =
   test_socketpair ();
   test_cancel ();
   test_pause_and_timer ();
+  test_io_socketpair ();
+  test_io_regular_file ();
+  test_io_bigarray ();
   if !failures = 0 then Printf.printf "\nAll tests passed.\n%!"
   else begin
     Printf.printf "\n%d test(s) failed.\n%!" !failures;
