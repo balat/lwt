@@ -1497,6 +1497,40 @@ val set_affinity : ?pid : int -> int list -> unit
   (** [set_affinity ?pid cpus] sets the list of CPUs the given process
       is allowed to run on. *)
 
+(** {2 Completion-based I/O backend} *)
+
+type completion_io = {
+  read : file_descr -> bytes -> int -> int -> int Lwt.t option;
+  write : file_descr -> bytes -> int -> int -> int Lwt.t option;
+  read_bigarray :
+    file_descr ->
+    (char, Bigarray.int8_unsigned_elt, Bigarray.c_layout) Bigarray.Array1.t ->
+    int -> int -> int Lwt.t option;
+  write_bigarray :
+    file_descr ->
+    (char, Bigarray.int8_unsigned_elt, Bigarray.c_layout) Bigarray.Array1.t ->
+    int -> int -> int Lwt.t option;
+}
+(** A completion-based I/O backend (e.g. io_uring), installed by a library such
+    as [lwt_uring]. Each function may return [Some promise] to perform the
+    operation through the backend, or [None] to decline, in which case Lwt's
+    default readiness/job path is used. The bigarray variants cover the path
+    taken by {!Lwt_io} (and hence most higher-level libraries). *)
+
+val fd_kind : file_descr -> Unix.file_kind
+(** [fd_kind fd] is the [Unix.fstat] kind of [fd] (whether it is a socket, a
+    regular file, a pipe, …), computed once and cached. A completion-based I/O
+    backend uses it to pick the right operation per descriptor type (e.g.
+    [send]/[recv] for sockets vs positioned [read]/[write] for files). Defaults
+    to [Unix.S_CHR] if [fstat] fails. *)
+
+val set_completion_io : completion_io option -> unit
+(** [set_completion_io backend] installs (or, with [None], removes) a
+    completion-based I/O backend. When one is installed, {!read} and {!write}
+    consult it first and fall back to the default path when it declines. This is
+    intended for engine providers (such as [lwt_uring]); ordinary applications
+    do not need to call it. *)
+
 (** {2 Versioned interfaces} *)
 
 (** Versioned variants of APIs undergoing breaking changes. *)

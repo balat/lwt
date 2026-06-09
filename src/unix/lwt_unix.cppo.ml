@@ -272,6 +272,12 @@ type file_descr = {
 
   hooks_writable : (unit -> unit) Lwt_sequence.t;
   (* Hooks to call when the file descriptor becomes writable. *)
+
+  mutable io_kind : Unix.file_kind option;
+  (* Cached [Unix.fstat] kind of the descriptor, computed lazily by {!fd_kind}.
+     Used by a completion-based I/O backend (e.g. io_uring) to pick the right
+     operation per descriptor type. Cached here because the record is stable for
+     the lifetime of the descriptor, unlike the (reusable) raw fd number. *)
 }
 
 external is_socket : Unix.file_descr -> bool = "lwt_unix_is_socket" "noalloc"
@@ -336,6 +342,7 @@ let mk_ch ?blocking ?(set_flags=true) fd = {
   event_writable = None;
   hooks_readable = Lwt_sequence.create ();
   hooks_writable = Lwt_sequence.create ();
+  io_kind = None;
 }
 
 let check_descriptor ch =
@@ -417,6 +424,16 @@ let abort ch e =
   end
 
 let unix_file_descr ch = ch.fd
+
+let fd_kind ch =
+  match ch.io_kind with
+  | Some k -> k
+  | None ->
+    (* Default to [S_CHR] (a non-seekable, non-socket kind) if [fstat] fails, so
+       a backend falls back to the safe offset-0 read/write path. *)
+    let k = try (Unix.fstat ch.fd).Unix.st_kind with _ -> Unix.S_CHR in
+    ch.io_kind <- Some k;
+    k
 
 let of_unix_file_descr = mk_ch
 
@@ -598,6 +615,28 @@ let close ch =
 type bigarray =
   (char, Bigarray.int8_unsigned_elt, Bigarray.c_layout) Bigarray.Array1.t
 
+(* +-----------------------------------------------------------------+
+   | Completion-based I/O backend (e.g. io_uring)                    |
+   +-----------------------------------------------------------------+ *)
+
+(* An optional completion-based I/O backend, installed by a library such as
+   [lwt_uring]. When present, the basic read/write operations (including the
+   bigarray ones used by [Lwt_io]) consult it before falling back to the default
+   readiness/job path. Each function returns [Some promise] to take over the
+   operation, or [None] to decline (e.g. when its engine is not currently
+   installed), in which case the default path runs. This lets completion-based
+   engines transparently speed up existing code. *)
+type completion_io = {
+  read : file_descr -> bytes -> int -> int -> int Lwt.t option;
+  write : file_descr -> bytes -> int -> int -> int Lwt.t option;
+  read_bigarray : file_descr -> bigarray -> int -> int -> int Lwt.t option;
+  write_bigarray : file_descr -> bigarray -> int -> int -> int Lwt.t option;
+}
+
+let completion_io : completion_io option ref = ref None
+
+let set_completion_io backend = completion_io := backend
+
 let wait_read ch =
   Lwt.catch
     (fun () ->
@@ -620,12 +659,20 @@ let read ch buf pos len =
   if pos < 0 || len < 0 || pos > Bytes.length buf - len then
     invalid_arg "Lwt_unix.read"
   else
-    Lazy.force ch.blocking >>= function
-    | true ->
-      wait_read ch >>= fun () ->
-      run_job (read_job ch.fd buf pos len)
-    | false ->
-      wrap_syscall Read ch (fun () -> stub_read ch.fd buf pos len)
+    let default () =
+      Lazy.force ch.blocking >>= function
+      | true ->
+        wait_read ch >>= fun () ->
+        run_job (read_job ch.fd buf pos len)
+      | false ->
+        wrap_syscall Read ch (fun () -> stub_read ch.fd buf pos len)
+    in
+    (* Only route an open descriptor to the completion backend; for a closed or
+       aborted one the default path raises the expected exception. *)
+    match ch.state, !completion_io with
+    | Opened, Some io ->
+      (match io.read ch buf pos len with Some p -> p | None -> default ())
+    | _ -> default ()
 
 let pread ch buf ~file_offset pos len =
   if pos < 0 || len < 0 || pos > Bytes.length buf - len then
@@ -648,13 +695,19 @@ let read_bigarray function_name fd buf pos len =
   if pos < 0 || len < 0 || pos > Bigarray.Array1.dim buf - len then
     invalid_arg function_name
   else
-    blocking fd >>= function
-    | true ->
-      wait_read fd >>= fun () ->
-      run_job (read_bigarray_job (unix_file_descr fd) buf pos len)
-    | false ->
-      wrap_syscall Read fd (fun () ->
-        stub_read_bigarray (unix_file_descr fd) buf pos len)
+    let default () =
+      blocking fd >>= function
+      | true ->
+        wait_read fd >>= fun () ->
+        run_job (read_bigarray_job (unix_file_descr fd) buf pos len)
+      | false ->
+        wrap_syscall Read fd (fun () ->
+          stub_read_bigarray (unix_file_descr fd) buf pos len)
+    in
+    match fd.state, !completion_io with
+    | Opened, Some io ->
+      (match io.read_bigarray fd buf pos len with Some p -> p | None -> default ())
+    | _ -> default ()
 
 let wait_write ch =
   Lwt.catch
@@ -678,12 +731,20 @@ let write ch buf pos len =
   if pos < 0 || len < 0 || pos > Bytes.length buf - len then
     invalid_arg "Lwt_unix.write"
   else
-    Lazy.force ch.blocking >>= function
-    | true ->
-      wait_write ch >>= fun () ->
-      run_job (write_job ch.fd buf pos len)
-    | false ->
-      wrap_syscall Write ch (fun () -> stub_write ch.fd buf pos len)
+    let default () =
+      Lazy.force ch.blocking >>= function
+      | true ->
+        wait_write ch >>= fun () ->
+        run_job (write_job ch.fd buf pos len)
+      | false ->
+        wrap_syscall Write ch (fun () -> stub_write ch.fd buf pos len)
+    in
+    (* Only route an open descriptor to the completion backend; for a closed or
+       aborted one the default path raises the expected exception. *)
+    match ch.state, !completion_io with
+    | Opened, Some io ->
+      (match io.write ch buf pos len with Some p -> p | None -> default ())
+    | _ -> default ()
 
 let pwrite ch buf ~file_offset pos len =
   if pos < 0 || len < 0 || pos > Bytes.length buf - len then
@@ -714,13 +775,21 @@ let write_bigarray function_name fd buf pos len =
   if pos < 0 || len < 0 || pos > Bigarray.Array1.dim buf - len then
     invalid_arg function_name
   else
-    blocking fd >>= function
-    | true ->
-      wait_write fd >>= fun () ->
-      run_job (write_bigarray_job (unix_file_descr fd) buf pos len)
-    | false ->
-      wrap_syscall Write fd (fun () ->
-        stub_write_bigarray (unix_file_descr fd) buf pos len)
+    let default () =
+      blocking fd >>= function
+      | true ->
+        wait_write fd >>= fun () ->
+        run_job (write_bigarray_job (unix_file_descr fd) buf pos len)
+      | false ->
+        wrap_syscall Write fd (fun () ->
+          stub_write_bigarray (unix_file_descr fd) buf pos len)
+    in
+    match fd.state, !completion_io with
+    | Opened, Some io ->
+      (match io.write_bigarray fd buf pos len with
+       | Some p -> p
+       | None -> default ())
+    | _ -> default ()
 
 module IO_vectors =
 struct
@@ -1217,6 +1286,7 @@ let dup ?cloexec ch =
     event_writable = None;
     hooks_readable = Lwt_sequence.create ();
     hooks_writable = Lwt_sequence.create ();
+    io_kind = None;
   }
 
 let dup2 ?cloexec ch1 ch2 =
