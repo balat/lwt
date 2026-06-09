@@ -28,3 +28,12 @@
  (enabled_if
   (= %{system} linux))
  (libraries lwt.unix lwt_uring unix))
+
+; Request/response server benchmark over Lwt_io (the cohttp I/O path).
+
+(executable
+ (name bench_server)
+ (modules bench_server)
+ (enabled_if
+  (= %{system} linux))
+ (libraries lwt.unix lwt_uring unix))
