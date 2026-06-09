@@ -70,6 +70,16 @@
   (lwt (>= 6))))
 
 (package
+ (name lwt_uring)
+ (version 6.0.0)
+ (synopsis "io_uring-based engine for Lwt (Linux only)")
+ (depends
+  (ocaml (>= 4.14))
+  base-unix
+  (lwt (>= 6))
+  (uring (>= 0.9))))
+
+(package
  (name lwt_runtime_events)
  (version 6.0.0)
  (synopsis "Emit runtime events to trace the execution of Lwt programs")

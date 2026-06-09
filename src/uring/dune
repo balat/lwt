@@ -1,0 +1,10 @@
+; Optional, Linux-only io_uring engine for Lwt. It is a separate opam package
+; (like lwt_direct) so that its `uring` dependency stays out of the core `lwt`
+; package; it is only built on Linux.
+(library
+ (name lwt_uring)
+ (public_name lwt_uring)
+ (synopsis "io_uring-based engine for Lwt (Linux only)")
+ (enabled_if
+  (= %{system} linux))
+ (libraries lwt.unix uring unix))
