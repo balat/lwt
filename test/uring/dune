@@ -1,0 +1,20 @@
+(test
+ (name test_lwt_uring)
+ (package lwt_uring)
+ (modules test_lwt_uring)
+ (enabled_if
+  (= %{system} linux))
+ (libraries lwt.unix lwt_uring unix))
+
+; Run Lwt's existing test/unix suites with the io_uring engine installed.
+(copy_files
+ (files %{project_root}/test/unix/bytes_io_data))
+
+(test
+ (name main_uring)
+ (package lwt_uring)
+ (modules main_uring)
+ (enabled_if
+  (= %{system} linux))
+ (deps bytes_io_data)
+ (libraries lwttester tester lwt_uring))
