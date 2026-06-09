@@ -26,6 +26,9 @@ module U = Uring
 type req =
   | Poll of poll_req
   | Timer of timer_req
+  | Io of (int -> unit)
+      (* A completion-based I/O submission (read/write/...). The handler is
+         called with the syscall result (negative for an errno). *)
   | Cancel
       (* Completion of an [Uring.cancel] submission; nothing to do. *)
 
@@ -81,9 +84,10 @@ let cancel ring job =
   with Invalid_argument _ -> ()
   (* The job was already collected — nothing to cancel. *)
 
-let dispatch ring data =
+let dispatch ring result data =
   match data with
   | Cancel -> ()
+  | Io handler -> handler result
   | Poll pr ->
     pr.job <- None;
     if pr.active then begin
@@ -98,14 +102,25 @@ let dispatch ring data =
       if tr.repeat && tr.t_active then submit_timer ring tr
     end
 
+(* The ring of the currently-installed io_uring engine, if any. It is used by
+   the completion-based I/O of {!Io}, which must submit to the same ring that the
+   engine's [iter] reaps. Set when an engine is created, cleared when it is
+   destroyed (using physical equality so that replacing one uring engine with
+   another keeps the pointer on the live ring). *)
+let the_ring : req U.t option ref = ref None
+
 class uring ?(queue_depth = 256) () = object
   inherit Lwt_engine.abstract
 
   val ring : req U.t = U.create ~queue_depth ()
 
+  initializer the_ring := Some ring
+
   method id = Engine_id__uring
 
-  method private cleanup = U.exit ring
+  method private cleanup =
+    (match !the_ring with Some r when r == ring -> the_ring := None | _ -> ());
+    U.exit ring
 
   method private register_readable fd f =
     let pr =
@@ -140,15 +155,80 @@ class uring ?(queue_depth = 256) () = object
        nothing outstanding there is nothing to wait for, so we never block. *)
     if block && U.active_ops ring > 0 then begin
       match U.wait ring with
-      | U.Some { result = _; data } -> dispatch ring data
+      | U.Some { result; data } -> dispatch ring result data
       | U.None -> ()
     end;
     let rec drain () =
       match U.get_cqe_nonblocking ring with
-      | U.Some { result = _; data } -> dispatch ring data; drain ()
+      | U.Some { result; data } -> dispatch ring result data; drain ()
       | U.None -> ()
     in
     drain ()
+end
+
+let get_ring () =
+  match !the_ring with
+  | Some r -> r
+  | None ->
+    failwith "Lwt_uring.Io: no io_uring engine installed (use Lwt_uring.set)"
+
+(* File offset [-1] tells io_uring to use the descriptor's current offset, like
+   [read(2)]/[write(2)] — correct for both regular files and sockets/pipes. *)
+let current_offset = Optint.Int63.minus_one
+
+module Io = struct
+  type bigarray =
+    (char, Bigarray.int8_unsigned_elt, Bigarray.c_layout) Bigarray.Array1.t
+
+  (* Submit a completion-based operation and return a promise resolved with the
+     syscall result, or rejected with the corresponding [Unix.Unix_error].
+     Cancelling the promise cancels the in-flight submission. *)
+  let perform op_name make =
+    let ring = get_ring () in
+    let waiter, wakener = Lwt.task () in
+    let job = ref None in
+    let handler result =
+      job := None;
+      if result < 0 then
+        Lwt.wakeup_exn wakener
+          (Unix.Unix_error (U.error_of_errno result, op_name, ""))
+      else Lwt.wakeup wakener result
+    in
+    (match make ring (Io handler) with
+     | Some j -> job := Some j
+     | None ->
+       ignore (U.submit ring);
+       (match make ring (Io handler) with
+        | Some j -> job := Some j
+        | None -> failwith "Lwt_uring.Io: submission queue full"));
+    Lwt.on_cancel waiter (fun () ->
+      match !job with
+      | Some j -> (try ignore (U.cancel ring j Cancel) with Invalid_argument _ -> ())
+      | None -> ());
+    waiter
+
+  let read fd buf pos len =
+    let cs = Cstruct.create len in
+    Lwt.map
+      (fun n -> Cstruct.blit_to_bytes cs 0 buf pos n; n)
+      (perform "read" (fun ring data ->
+         U.read ring ~file_offset:current_offset fd cs data))
+
+  let write fd buf pos len =
+    let cs = Cstruct.create len in
+    Cstruct.blit_from_bytes buf pos cs 0 len;
+    perform "write" (fun ring data ->
+      U.write ring ~file_offset:current_offset fd cs data)
+
+  let read_bigarray fd buf pos len =
+    let cs = Cstruct.of_bigarray ~off:pos ~len buf in
+    perform "read" (fun ring data ->
+      U.read ring ~file_offset:current_offset fd cs data)
+
+  let write_bigarray fd buf pos len =
+    let cs = Cstruct.of_bigarray ~off:pos ~len buf in
+    perform "write" (fun ring data ->
+      U.write ring ~file_offset:current_offset fd cs data)
 end
 
 let available () =
