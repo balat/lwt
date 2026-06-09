@@ -1,0 +1,6 @@
+(library
+ (name lwt_effects)
+ (public_name lwt_effects)
+ (synopsis "Effect-based scheduler for Lwt-style promises (POC)")
+ (enabled_if (>= %{ocaml_version} "5.0"))
+ (libraries lwt.unix unix))
