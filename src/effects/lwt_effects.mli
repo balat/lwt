@@ -147,7 +147,12 @@ val sleep : float -> unit t
     Like {!Lwt_direct}: turn a promise into a plain value, yield, and do
     plain-value I/O. These suspend the current fiber and give up the [_ t] async
     typing, so they must run {e inside} a fiber ({!run}/{!async}) and {e not} in a
-    {!bind} continuation. The default monadic API above is the recommended one. *)
+    {!bind} continuation. The default monadic API above is the recommended one.
+
+    Possible improvement: these primitives do not break implicit concurrency (they
+    are explicit, like {!Lwt_direct}), but if a {e strictly} monadic package is
+    wanted, {!Direct} could be dropped entirely and direct style left to
+    {!Lwt_direct} over the real Lwt core. *)
 module Direct : sig
   val await : 'a t -> 'a
   (** [await p] returns the value of [p], suspending the current fiber until [p]

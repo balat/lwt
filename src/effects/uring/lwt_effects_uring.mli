@@ -5,6 +5,12 @@
     their completion, allowing batched submission and removing the explicit
     readiness syscall. *)
 
+(* Possible improvement (B2 harmonisation): like {!Lwt_effects}, make the
+   top-level [Io]/[Fixed] the monadic ([_ Lwt_effects.t]) API and move the
+   direct, plain-value variants under a [Direct] submodule, so the whole
+   semantics-preserving package exposes the monadic form by default and the
+   direct style is a clearly-marked escape hatch. *)
+
 val run :
   ?queue_depth:int ->
   ?buffer_blocks:int ->
