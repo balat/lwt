@@ -6,11 +6,12 @@
     Lwt_engine and completion-based I/O. Installing it ([Lwt_uring.set ()])
     transparently routes Lwt_unix read/write — including the bigarray path used
     by Lwt_io, and therefore libraries built on it — through io_uring (recv/send
-    for sockets, positioned read/write for files), accelerating existing code
-    with no source change.
+    for sockets, positioned read/write for files), as well as connect, so
+    existing code is accelerated with no source change.
 
   * Lwt_unix.set_completion_io and Lwt_unix.fd_kind: hooks allowing a
-    completion-based I/O backend (such as lwt_uring) to take over read/write.
+    completion-based I/O backend (such as lwt_uring) to take over read/write and
+    connect.
 
 ===== 6.1.2 =====
 

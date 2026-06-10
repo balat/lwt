@@ -298,7 +298,25 @@ let completion_backend : Lwt_unix.completion_io =
       let cs = Cstruct.of_bigarray ~off:pos ~len buf in
       Some (submit_io "write" (write_op kind fd cs))
   in
-  { Lwt_unix.read; write; read_bigarray; write_bigarray }
+  (* Completion-based [connect]: submit IORING_OP_CONNECT and resolve when the
+     connection completes (result 0) or fails (negative errno, mapped by
+     [submit_io]). The descriptor is the user's own socket — no fd is created, so
+     no flag policy is involved. *)
+  let connect ch addr =
+    match !the_ring with
+    | None -> None
+    | Some _ ->
+      let fd = Lwt_unix.unix_file_descr ch in
+      Some
+        (Lwt.map
+           (fun (_ : int) -> ())
+           (submit_io "connect" (fun ring data -> U.connect ring fd addr data)))
+  in
+  (* [accept] is deliberately left on Lwt's default path: under the io_uring
+     engine its readiness already runs on the ring (poll), and routing single-shot
+     IORING_OP_ACCEPT measured slower (the op forces SOCK_CLOEXEC, needing a
+     compensating fcntl, and sequential accepts do not batch). *)
+  { Lwt_unix.read; write; read_bigarray; write_bigarray; connect }
 
 let () = Lwt_unix.set_completion_io (Some completion_backend)
 
