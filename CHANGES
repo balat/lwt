@@ -13,6 +13,16 @@
     completion-based I/O backend (such as lwt_uring) to take over read/write and
     connect.
 
+  * lwt_effects: a new optional package (OCaml 5 only) — an effect-based
+    scheduler for Lwt-style promises. Its monadic API is semantics-preserving
+    (bind is non-blocking, so Lwt's implicit concurrency is kept), and a leaner
+    array-based scheduler makes scheduling- and bind-heavy code markedly faster
+    than Lwt. Direct-style primitives (await/yield/plain-value I/O) live under
+    Lwt_effects.Direct. Lwt interop via of_lwt/to_lwt.
+
+  * lwt_effects_uring: a new optional, Linux-only package — an io_uring back end
+    for the lwt_effects scheduler (completion-based I/O, zero-copy fixed buffers).
+
 ===== 6.1.2 =====
 
 ====== Fixes ======
