@@ -261,6 +261,14 @@ end
    installed once, when this module is linked; with no uring engine current it
    has no effect. The operation is chosen per descriptor kind (see {!read_op}),
    so sockets, files and pipes are each handled correctly. *)
+
+(* Possible improvement: the [bytes] read/write below allocate a fresh off-heap
+   [Cstruct] and memcpy per call (bytes live on the movable GC heap, so io_uring
+   needs a stable buffer). At large payloads this copy dominates and makes the
+   bytes path slower than libev (the bigarray path used by Lwt_io/cohttp is
+   copy-free and faster — see the benchmark matrix). Mitigations, if ever needed:
+   a reusable per-fd bounce buffer or registered fixed buffers for the bytes
+   path; [Cstruct.create_unsafe] (drop the zero-fill) helps only marginally. *)
 let completion_backend : Lwt_unix.completion_io =
   let read ch buf pos len =
     match !the_ring with
@@ -315,7 +323,9 @@ let completion_backend : Lwt_unix.completion_io =
   (* [accept] is deliberately left on Lwt's default path: under the io_uring
      engine its readiness already runs on the ring (poll), and routing single-shot
      IORING_OP_ACCEPT measured slower (the op forces SOCK_CLOEXEC, needing a
-     compensating fcntl, and sequential accepts do not batch). *)
+     compensating fcntl, and sequential accepts do not batch).
+     Possible improvement: a multishot accept (IORING_OP_ACCEPT_MULTI, not in the
+     [uring] API surface used here) would batch and might flip that verdict. *)
   { Lwt_unix.read; write; read_bigarray; write_bigarray; connect }
 
 let () = Lwt_unix.set_completion_io (Some completion_backend)
