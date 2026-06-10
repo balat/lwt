@@ -1510,12 +1510,18 @@ type completion_io = {
     file_descr ->
     (char, Bigarray.int8_unsigned_elt, Bigarray.c_layout) Bigarray.Array1.t ->
     int -> int -> int Lwt.t option;
+  connect : file_descr -> Unix.sockaddr -> unit Lwt.t option;
 }
 (** A completion-based I/O backend (e.g. io_uring), installed by a library such
     as [lwt_uring]. Each function may return [Some promise] to perform the
     operation through the backend, or [None] to decline, in which case Lwt's
     default readiness/job path is used. The bigarray variants cover the path
-    taken by {!Lwt_io} (and hence most higher-level libraries). *)
+    taken by {!Lwt_io} (and hence most higher-level libraries).
+
+    [connect] resolves once the connection completes (or fails); it is only
+    consulted for sockets. ([accept] is intentionally not part of this hook:
+    routing single-shot [accept] through completion measured slower than the
+    readiness path, which already runs on the io_uring engine.) *)
 
 val fd_kind : file_descr -> Unix.file_kind
 (** [fd_kind fd] is the [Unix.fstat] kind of [fd] (whether it is a socket, a

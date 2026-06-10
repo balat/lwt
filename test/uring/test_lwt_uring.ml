@@ -142,6 +142,37 @@ let test_io_bigarray () =
   Unix.close a;
   Unix.close b
 
+(* Lwt_unix.connect routed through io_uring (IORING_OP_CONNECT): a loopback TCP
+   connection is established through the ring (the accept side uses the default
+   path, whose readiness already runs on the engine), then exchanges data. *)
+let test_connect () =
+  let lsock = Lwt_unix.socket Unix.PF_INET Unix.SOCK_STREAM 0 in
+  Lwt_unix.setsockopt lsock Unix.SO_REUSEADDR true;
+  let msg = Bytes.of_string "uring-connect" in
+  let n = Bytes.length msg in
+  let got = Bytes.create n in
+  let read =
+    Lwt_main.run begin
+      Lwt_unix.bind lsock (Unix.ADDR_INET (Unix.inet_addr_loopback, 0))
+      >>= fun () ->
+      Lwt_unix.listen lsock 1;
+      let addr = Lwt_unix.getsockname lsock in
+      let server =
+        Lwt_unix.accept lsock >>= fun (fd, _) ->
+        Lwt_unix.read fd got 0 n >>= fun r ->
+        Lwt_unix.close fd >>= fun () -> Lwt.return r
+      in
+      let client =
+        let fd = Lwt_unix.socket Unix.PF_INET Unix.SOCK_STREAM 0 in
+        Lwt_unix.connect fd addr >>= fun () ->
+        Lwt_unix.write fd msg 0 n >>= fun _ -> Lwt_unix.close fd
+      in
+      Lwt.both server client >>= fun (r, ()) -> Lwt.return r
+    end
+  in
+  check "connect routed through io_uring" (read = n && Bytes.equal got msg);
+  Lwt_main.run (Lwt_unix.close lsock)
+
 let () =
   check "io_uring is available" (Lwt_uring.available ());
   Lwt_uring.set ();
@@ -156,6 +187,7 @@ let () =
   test_io_socketpair ();
   test_io_regular_file ();
   test_io_bigarray ();
+  test_connect ();
   if !failures = 0 then Printf.printf "\nAll tests passed.\n%!"
   else begin
     Printf.printf "\n%d test(s) failed.\n%!" !failures;
