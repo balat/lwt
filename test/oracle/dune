@@ -1,0 +1,13 @@
+; B2b conformance oracle: does the effect core satisfy the real lwt.mli?
+;
+; [candidate_lwt.mli] is an UNCHANGED copy of [src/core/lwt.mli]; [candidate_lwt.ml]
+; backs it with the effect core. Building this library therefore reports the exact
+; conformance gap (missing names, then type/shape mismatches) that the in-place
+; core swap (B2b) must close — and, once green, that the candidate IS a drop-in.
+;
+; Disabled by default so the branch stays buildable: flip [enabled_if] to [true]
+; (or `dune build @test/oracle/all`) to re-measure while doing conformance work.
+(library
+ (name candidate_lwt)
+ (enabled_if false)
+ (libraries lwt_effects))
