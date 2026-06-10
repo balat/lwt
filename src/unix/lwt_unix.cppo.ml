@@ -631,6 +631,7 @@ type completion_io = {
   write : file_descr -> bytes -> int -> int -> int Lwt.t option;
   read_bigarray : file_descr -> bigarray -> int -> int -> int Lwt.t option;
   write_bigarray : file_descr -> bigarray -> int -> int -> int Lwt.t option;
+  connect : file_descr -> Unix.sockaddr -> unit Lwt.t option;
 }
 
 let completion_io : completion_io option ref = ref None
@@ -1768,56 +1769,62 @@ let accept_n ?cloexec ch n =
     (fun exn -> Lwt.return (List.rev !l, Some exn))
 
 let connect ch addr =
-  if Sys.win32 then
-    (* [in_progress] tell whether connection has started but not
-       terminated: *)
-    let in_progress = ref false in
-    wrap_syscall Write ch begin fun () ->
-      if !in_progress then
-        (* Nothing works without this test and i have no idea why... *)
-        if writable ch then
+  let default () =
+    if Sys.win32 then
+      (* [in_progress] tell whether connection has started but not
+         terminated: *)
+      let in_progress = ref false in
+      wrap_syscall Write ch begin fun () ->
+        if !in_progress then
+          (* Nothing works without this test and i have no idea why... *)
+          if writable ch then
+            try
+              Unix.connect ch.fd addr
+            with
+            | Unix.Unix_error (Unix.EISCONN, _, _) ->
+              (* This is the windows way of telling that the connection
+                 has completed. *)
+              ()
+          else
+            raise Retry
+        else
           try
             Unix.connect ch.fd addr
           with
-          | Unix.Unix_error (Unix.EISCONN, _, _) ->
-            (* This is the windows way of telling that the connection
-               has completed. *)
+          | Unix.Unix_error (Unix.EWOULDBLOCK, _, _) ->
+            in_progress := true;
+            raise Retry
+      end
+    else
+      (* [in_progress] tell whether connection has started but not
+         terminated: *)
+      let in_progress = ref false in
+      wrap_syscall Write ch begin fun () ->
+        if !in_progress then
+          (* If the connection is in progress, [getsockopt_error] tells
+             whether it succceed: *)
+          match Unix.getsockopt_error ch.fd with
+          | None ->
+            (* The socket is connected *)
             ()
+          | Some err ->
+            (* An error happened: *)
+            raise (Unix.Unix_error(err, "connect", ""))
         else
-          raise Retry
-      else
-        try
-          Unix.connect ch.fd addr
-        with
-        | Unix.Unix_error (Unix.EWOULDBLOCK, _, _) ->
-          in_progress := true;
-          raise Retry
-    end
-  else
-    (* [in_progress] tell whether connection has started but not
-       terminated: *)
-    let in_progress = ref false in
-    wrap_syscall Write ch begin fun () ->
-      if !in_progress then
-        (* If the connection is in progress, [getsockopt_error] tells
-           whether it succceed: *)
-        match Unix.getsockopt_error ch.fd with
-        | None ->
-          (* The socket is connected *)
-          ()
-        | Some err ->
-          (* An error happened: *)
-          raise (Unix.Unix_error(err, "connect", ""))
-      else
-        try
-          (* We should pass only one time here, unless the system call
-             is interrupted by a signal: *)
-          Unix.connect ch.fd addr
-        with
-        | Unix.Unix_error (Unix.EINPROGRESS, _, _) ->
-          in_progress := true;
-          raise Retry
-    end
+          try
+            (* We should pass only one time here, unless the system call
+               is interrupted by a signal: *)
+            Unix.connect ch.fd addr
+          with
+          | Unix.Unix_error (Unix.EINPROGRESS, _, _) ->
+            in_progress := true;
+            raise Retry
+      end
+  in
+  match ch.state, !completion_io with
+  | Opened, Some io ->
+    (match io.connect ch addr with Some p -> p | None -> default ())
+  | _ -> default ()
 
 external bind_job : Unix.file_descr -> Unix.sockaddr -> unit job =
   "lwt_unix_bind_job"
