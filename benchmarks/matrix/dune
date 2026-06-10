@@ -1,0 +1,21 @@
+; Unified comparative benchmark harness: runs the same workloads under each
+; configuration (Lwt+libev, Lwt+io_uring, lwt_effects, lwt_effects+io_uring,
+; lwt_direct+libev, lwt_direct+io_uring) and prints a single matrix isolating the
+; respective contributions of io_uring and of effects. Linux only (it links the
+; io_uring back ends).
+
+(executable
+ (name bench_matrix)
+ (enabled_if
+  (and
+   (>= %{ocaml_version} "5.0")
+   (= %{system} linux)))
+ (libraries
+  lwt
+  lwt.unix
+  lwt_effects
+  lwt_effects_uring
+  lwt_uring
+  lwt_direct
+  cstruct
+  unix))
