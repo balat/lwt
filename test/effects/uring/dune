@@ -1,0 +1,7 @@
+(test
+ (name test_uring)
+ (enabled_if
+  (and
+   (>= %{ocaml_version} "5.0")
+   (= %{system} linux)))
+ (libraries lwt_effects lwt_effects_uring cstruct unix))
