@@ -37,3 +37,12 @@
  (enabled_if
   (= %{system} linux))
  (libraries lwt.unix lwt_uring unix))
+
+; New-connection benchmark: isolates routing accept/connect through io_uring.
+
+(executable
+ (name bench_connect)
+ (modules bench_connect)
+ (enabled_if
+  (= %{system} linux))
+ (libraries lwt.unix lwt_uring unix))
