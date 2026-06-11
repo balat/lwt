@@ -51,9 +51,18 @@ exception Canceled
    visible bodies so flambda can inline these identity coercions away. *)
 module Public_handle = struct
   type +'a t
+  type -'a u
 
   let inj : 'a promise -> 'a t = Obj.magic
   let prj : 'a t -> 'a promise = Obj.magic
+
+  (* The resolver handle [-'a u] uses the same identity-coercion scheme, in the
+     other direction: a resolver only ever {e consumes} values of type ['a]
+     ([wakeup] writes a value into the cell), so contravariance is safe — using
+     an ['a u] at a subtype ['b u] only ever feeds it ['b] values, which are
+     also ['a]s. This mirrors Lwt's [type -'a u] in [Public_types]. *)
+  let inj_u : 'a promise -> 'a u = Obj.magic
+  let prj_u : 'a u -> 'a promise = Obj.magic
 end
 
 type +'a t = 'a Public_handle.t
@@ -495,21 +504,27 @@ let to_lwt (type a) (p : a t) : a Lwt.t =
 (* Lwt-compatibility layer                                            *)
 (* ------------------------------------------------------------------ *)
 
-(* Enough of Lwt's public API to compile code written against Lwt (modulo the
-   implicit-concurrency semantics of [bind], which is fundamentally different —
-   see the .mli). Combinators that Lwt makes non-blocking are implemented with
-   [async] so they also return immediately. *)
+(* Enough of Lwt's public API to compile code written against Lwt. [bind] being
+   non-blocking, the implicit-concurrency semantics is Lwt's — see the .mli.
+   Combinators that Lwt makes non-blocking are implemented with [async] so they
+   also return immediately. *)
 
 type 'a state = Return of 'a | Fail of exn | Sleep
-type 'a u = 'a t
+
+(* Contravariant resolver handle (same identity coercions as [t]; see
+   [Public_handle]). [wait]/[task] return the same cell under both handles. *)
+type -'a u = 'a Public_handle.u
+
+let t_of_u (u : 'a u) : 'a t = inj (Public_handle.prj_u u)
+let u_of_t (p : 'a t) : 'a u = Public_handle.inj_u (prj p)
 
 let wait () =
   let p = new_pending () in
-  (p, p)
+  (p, u_of_t p)
 
 let task () = wait ()
-let wakeup (u : 'a u) v = fill u (Ok v)
-let wakeup_exn (u : 'a u) e = fill u (Error e)
+let wakeup (u : 'a u) v = fill (t_of_u u) (Ok v)
+let wakeup_exn (u : 'a u) e = fill (t_of_u u) (Error e)
 let wakeup_later = wakeup
 let wakeup_later_exn = wakeup_exn
 
@@ -842,4 +857,14 @@ module Private = struct
   let new_pending = new_pending
   let fill = fill
   let set_on_cancel = set_on_cancel
+
+  (* Fiber-local storage internals, in the exact shape of
+     [Lwt.Private.Sequence_associated_storage] (needed by the core-swap
+     candidate, and by [Lwt_direct]-style integrations). *)
+  type nonrec storage = storage
+
+  let get_from_storage = get_from_storage
+  let modify_storage = modify_storage
+  let empty_storage = empty_storage
+  let current_storage = current_storage
 end
