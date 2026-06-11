@@ -1,0 +1,31 @@
+; Behavioral oracle for B2b: run Lwt's own core test suite (test/core/test_lwt.ml,
+; unchanged) against the effect-backed candidate Lwt.
+;
+; The tester (test/test.ml) and the suite are vendored TEXTUALLY by prepending a
+; [module Lwt = Candidate_lwt] alias (see test_prelude.in: plus a minimal
+; [Lwt_main.run] driving the effect scheduler and the two Lwt_list functions the
+; tester uses), so the very same test source exercises the candidate. The
+; pass/fail score is the behavioural-conformance score of the core swap.
+
+(rule
+ (with-stdout-to
+  test.ml
+  (progn
+   (cat %{dep:test_prelude.in})
+   (cat %{dep:../../test.ml}))))
+
+(rule
+ (with-stdout-to
+  test_lwt.ml
+  (progn
+   (echo "module Lwt = Candidate_lwt\n")
+   (cat %{dep:../../core/test_lwt.ml}))))
+
+(executable
+ (name oracle_main)
+ (modules oracle_main test test_lwt)
+ (enabled_if
+  (>= %{ocaml_version} "5.0"))
+ (flags
+  (:standard -alert -all))
+ (libraries candidate_lwt lwt_effects lwt unix))
