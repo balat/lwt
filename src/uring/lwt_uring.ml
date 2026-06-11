@@ -177,9 +177,12 @@ let get_ring () =
 let current_offset = Optint.Int63.minus_one
 
 (* Submit a completion-based operation built by [make] and return a promise
-   resolved with the syscall result, or rejected with the corresponding
-   [Unix.Unix_error]. Cancelling the promise cancels the in-flight submission. *)
-let submit_io op_name make =
+   resolved with [post result], or rejected with the corresponding
+   [Unix.Unix_error]. [post] runs in the completion handler (e.g. the
+   bounce-buffer blit of the bytes read path) so no extra promise is allocated
+   on the per-operation hot path. Cancelling the promise cancels the in-flight
+   submission. *)
+let submit_io op_name post make =
   let ring = get_ring () in
   let waiter, wakener = Lwt.task () in
   let job = ref None in
@@ -188,7 +191,7 @@ let submit_io op_name make =
     if result < 0 then
       Lwt.wakeup_exn wakener
         (Unix.Unix_error (U.error_of_errno result, op_name, ""))
-    else Lwt.wakeup wakener result
+    else Lwt.wakeup wakener (post result)
   in
   (match make ring (Io handler) with
    | Some j -> job := Some j
@@ -202,6 +205,11 @@ let submit_io op_name make =
     | Some j -> (try ignore (U.cancel ring j Cancel) with Invalid_argument _ -> ())
     | None -> ());
   waiter
+
+(* Result adapters for [submit_io]'s [post] (defined once: the common cases
+   allocate no per-operation closure). *)
+let int_result : int -> int = fun n -> n
+let unit_result : int -> unit = fun _ -> ()
 
 (* Pick the io_uring operation to read into / write from a [Cstruct.t], by
    descriptor kind:
@@ -232,26 +240,25 @@ module Io = struct
      files and general use. For sockets, prefer the transparent {!Lwt_unix} path
      (which uses [recv]/[send]). *)
   let read fd buf pos len =
-    let cs = Cstruct.create len in
-    Lwt.map
+    let cs = Cstruct.create_unsafe len in
+    submit_io "read"
       (fun n -> Cstruct.blit_to_bytes cs 0 buf pos n; n)
-      (submit_io "read" (fun ring data ->
-         U.read ring ~file_offset:current_offset fd cs data))
+      (fun ring data -> U.read ring ~file_offset:current_offset fd cs data)
 
   let write fd buf pos len =
-    let cs = Cstruct.create len in
+    let cs = Cstruct.create_unsafe len in
     Cstruct.blit_from_bytes buf pos cs 0 len;
-    submit_io "write" (fun ring data ->
+    submit_io "write" int_result (fun ring data ->
       U.write ring ~file_offset:current_offset fd cs data)
 
   let read_bigarray fd buf pos len =
     let cs = Cstruct.of_bigarray ~off:pos ~len buf in
-    submit_io "read" (fun ring data ->
+    submit_io "read" int_result (fun ring data ->
       U.read ring ~file_offset:current_offset fd cs data)
 
   let write_bigarray fd buf pos len =
     let cs = Cstruct.of_bigarray ~off:pos ~len buf in
-    submit_io "write" (fun ring data ->
+    submit_io "write" int_result (fun ring data ->
       U.write ring ~file_offset:current_offset fd cs data)
 end
 
@@ -268,27 +275,30 @@ end
    bytes path slower than libev (the bigarray path used by Lwt_io/cohttp is
    copy-free and faster — see the benchmark matrix). Mitigations, if ever needed:
    a reusable per-fd bounce buffer or registered fixed buffers for the bytes
-   path; [Cstruct.create_unsafe] (drop the zero-fill) helps only marginally. *)
+   path. The bounce buffers use [Cstruct.create_unsafe] (no zero-fill: writes
+   fully overwrite [0,len) and reads only expose the [n] bytes the kernel
+   wrote), and the result post-processing runs inside the completion handler
+   ([submit_io]'s [post]), so a read costs one promise, not two. *)
 let completion_backend : Lwt_unix.completion_io =
   let read ch buf pos len =
     match !the_ring with
     | None -> None
     | Some _ ->
       let fd = Lwt_unix.unix_file_descr ch and kind = Lwt_unix.fd_kind ch in
-      let cs = Cstruct.create len in
+      let cs = Cstruct.create_unsafe len in
       Some
-        (Lwt.map
+        (submit_io "read"
            (fun n -> Cstruct.blit_to_bytes cs 0 buf pos n; n)
-           (submit_io "read" (read_op kind fd cs)))
+           (read_op kind fd cs))
   in
   let write ch buf pos len =
     match !the_ring with
     | None -> None
     | Some _ ->
       let fd = Lwt_unix.unix_file_descr ch and kind = Lwt_unix.fd_kind ch in
-      let cs = Cstruct.create len in
+      let cs = Cstruct.create_unsafe len in
       Cstruct.blit_from_bytes buf pos cs 0 len;
-      Some (submit_io "write" (write_op kind fd cs))
+      Some (submit_io "write" int_result (write_op kind fd cs))
   in
   let read_bigarray ch buf pos len =
     match !the_ring with
@@ -296,7 +306,7 @@ let completion_backend : Lwt_unix.completion_io =
     | Some _ ->
       let fd = Lwt_unix.unix_file_descr ch and kind = Lwt_unix.fd_kind ch in
       let cs = Cstruct.of_bigarray ~off:pos ~len buf in
-      Some (submit_io "read" (read_op kind fd cs))
+      Some (submit_io "read" int_result (read_op kind fd cs))
   in
   let write_bigarray ch buf pos len =
     match !the_ring with
@@ -304,7 +314,7 @@ let completion_backend : Lwt_unix.completion_io =
     | Some _ ->
       let fd = Lwt_unix.unix_file_descr ch and kind = Lwt_unix.fd_kind ch in
       let cs = Cstruct.of_bigarray ~off:pos ~len buf in
-      Some (submit_io "write" (write_op kind fd cs))
+      Some (submit_io "write" int_result (write_op kind fd cs))
   in
   (* Completion-based [connect]: submit IORING_OP_CONNECT and resolve when the
      connection completes (result 0) or fails (negative errno, mapped by
@@ -316,9 +326,8 @@ let completion_backend : Lwt_unix.completion_io =
     | Some _ ->
       let fd = Lwt_unix.unix_file_descr ch in
       Some
-        (Lwt.map
-           (fun (_ : int) -> ())
-           (submit_io "connect" (fun ring data -> U.connect ring fd addr data)))
+        (submit_io "connect" unit_result (fun ring data ->
+           U.connect ring fd addr data))
   in
   (* [accept] is deliberately left on Lwt's default path: under the io_uring
      engine its readiness already runs on the ring (poll), and routing single-shot
