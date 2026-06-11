@@ -2090,5 +2090,11 @@ module Private : sig
   val scheduler_run : (unit -> 'a t) -> 'a
   val scheduler_set_idle : (unit -> bool) -> unit
   val scheduler_queue_is_empty : unit -> bool
+
+  val scheduler_enqueue : (unit -> unit) -> unit
+  (** Push a ready thunk on the core run queue (run under the fiber-local
+      storage current at the call). Used by direct-style layers
+      ([Lwt_direct]) to schedule their continuations without an
+      intermediate task queue. *)
 end [@@alert trespassing "for internal use only, keep away"]
 

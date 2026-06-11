@@ -1188,5 +1188,6 @@ module Private = struct
   let scheduler_run = run
   let scheduler_set_idle = set_idle
   let scheduler_queue_is_empty () = Run_queue.is_empty run_queue
+  let scheduler_enqueue = enqueue
 end
 
