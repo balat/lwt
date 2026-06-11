@@ -10,6 +10,11 @@
    module without triggering any more warnings. *)
 module Lwt_sequence = Lwt_sequence
 
+(* This module is the legitimate user of the core's scheduler hooks
+   ([Lwt.Private]): it installs the engine-blocking idle hook and drives the
+   run queue. *)
+[@@@alert "-trespassing"]
+
 open Lwt.Infix
 
 let enter_iter_hooks = Lwt_sequence.create ()
@@ -20,15 +25,20 @@ let yield = Lwt.pause
 let abandon_yielded_and_paused () =
   Lwt.abandon_paused ()
 
-let run p =
-  let rec run_loop () =
+(* The effect-based core runs its own scheduler (the run queue, serving fibers
+   and paused promises); [run] drives it through the [Lwt.Private] hooks and
+   installs the engine-blocking idle hook. The hook is called when the run
+   queue is empty and no pause is pending: it performs one historical Lwt_main
+   loop lap (enter hooks, one engine iteration, fulfil paused promises, leave
+   hooks) and reports whether to keep going — [false] exactly when [p] is
+   resolved, which makes the scheduler return [p]'s outcome. *)
+let run (type a) (p : a Lwt.t) : a =
+  let idle () =
     Lwt_rte.emit_sch_lap ();
     Lwt_unix.write_job_count_runtimte_event ();
-    Lwt_rte.emit_paused_count (Lwt.paused_count ()) ;
-    match Lwt.poll p with
-    | Some x ->
-      x
-    | None ->
+    Lwt_rte.emit_paused_count (Lwt.paused_count ());
+    if not (Lwt.is_sleeping p) then false
+    else begin
       (* Call enter hooks. *)
       Lwt_sequence.iter_l (fun f -> f ()) enter_iter_hooks;
 
@@ -42,14 +52,16 @@ let run p =
       (* Call leave hooks. *)
       Lwt_sequence.iter_l (fun f -> f ()) leave_iter_hooks;
 
-      (* Repeat. *)
-      run_loop ()
+      true
+    end
   in
 
   Lwt_rte.emit_sch_call_begin ();
   Fun.protect
     ~finally:(fun () -> Lwt_rte.emit_sch_call_end ())
-    (fun () -> run_loop ())
+    (fun () ->
+      Lwt.Private.scheduler_set_idle idle;
+      Lwt.Private.scheduler_run (fun () -> p))
 
 let run_already_called = ref `No
 let run_already_called_mutex = Mutex.create ()

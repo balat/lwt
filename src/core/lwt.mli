@@ -2079,5 +2079,16 @@ module Private : sig
   end
 
   val tracing_context : string key
+
+  (** Effect-scheduler hooks (the core is engine-free). [Lwt_main.run] drives
+      the run queue with [scheduler_run] and installs the engine-blocking
+      idle hook with [scheduler_set_idle]: the hook is called when the run
+      queue is empty and no pause is pending; it blocks until external work
+      may have arrived and returns [true] to continue, or [false] when there
+      is nothing left to wait for. *)
+
+  val scheduler_run : (unit -> 'a t) -> 'a
+  val scheduler_set_idle : (unit -> bool) -> unit
+  val scheduler_queue_is_empty : unit -> bool
 end [@@alert trespassing "for internal use only, keep away"]
 
