@@ -27,10 +27,24 @@ and 'a promise_state =
 and 'a pending = {
   mutable waiters : (('a, exn) result -> unit) list;
     (* Most-recently-added first; each waiter runs once and only enqueues. *)
-  mutable on_cancel : unit -> unit;
-    (* Run when the promise is cancelled while pending (e.g. to stop an engine
-       event). Defaults to doing nothing. *)
+  mutable cancel_waiters : (unit -> unit) list;
+    (* [on_cancel] callbacks; run BEFORE [waiters] when rejected with
+       [Canceled] (Lwt's ordering guarantee). *)
+  mutable cancel : cancel_mode;
+    (* How this promise reacts to [cancel] while pending (Lwt's model). *)
 }
+
+(* Lwt's cancellation model:
+   - [Cancel_self hook]: directly cancelable ([task], timers, I/O) — [cancel]
+     runs the hook (e.g. stopping an engine event) then rejects with [Canceled];
+   - [Cancel_forward fwd]: a derived promise (e.g. a [bind] result) — [cancel]
+     forwards to its current source; the rejection then flows back through the
+     ordinary waiter chain (the promise is not rejected directly);
+   - [Not_cancelable]: [wait]-created (and [no_cancel]) promises ignore [cancel]. *)
+and cancel_mode =
+  | Cancel_self of (unit -> unit)
+  | Cancel_forward of (unit -> unit)
+  | Not_cancelable
 
 exception Canceled
 
@@ -74,13 +88,18 @@ let prj = Public_handle.prj
 (* Promise primitives                                                 *)
 (* ------------------------------------------------------------------ *)
 
-let new_pending () : 'a t = inj { st = Pending { waiters = []; on_cancel = ignore } }
+let new_pending () : 'a t =
+  inj
+    { st = Pending { waiters = []; cancel_waiters = []; cancel = Cancel_self ignore } }
 
 let fill (type a) (p : a t) (r : (a, exn) result) : unit =
   let p = prj p in
   match p.st with
   | Pending pe ->
     p.st <- (match r with Ok v -> Fulfilled v | Error e -> Rejected e);
+    (match r with
+    | Error Canceled -> List.iter (fun f -> f ()) (List.rev pe.cancel_waiters)
+    | Ok _ | Error _ -> ());
     List.iter (fun w -> w r) (List.rev pe.waiters)
   | Fulfilled _ | Rejected _ -> ()
 
@@ -91,13 +110,33 @@ let add_waiter (type a) (p : a t) (w : (a, exn) result -> unit) : unit =
   | Rejected e -> w (Error e)
 
 let set_on_cancel (type a) (p : a t) (f : unit -> unit) : unit =
-  match (prj p).st with Pending pe -> pe.on_cancel <- f | Fulfilled _ | Rejected _ -> ()
+  match (prj p).st with
+  | Pending pe -> pe.cancel <- Cancel_self f
+  | Fulfilled _ | Rejected _ -> ()
 
 let cancel (type a) (p : a t) : unit =
   match (prj p).st with
-  | Pending pe ->
-    pe.on_cancel ();
-    fill p (Error Canceled)
+  | Pending pe -> (
+    match pe.cancel with
+    | Not_cancelable -> ()
+    | Cancel_self hook ->
+      hook ();
+      fill p (Error Canceled)
+    | Cancel_forward fwd -> fwd ())
+  | Fulfilled _ | Rejected _ -> ()
+
+(* Mark [result] as forwarding cancellation to its current source [src] (no-op
+   if [result] is no longer pending). Used by the derived combinators. *)
+let set_cancel_forward (type a b) (result : a t) (src : b t) : unit =
+  match (prj result).st with
+  | Pending pe -> pe.cancel <- Cancel_forward (fun () -> cancel src)
+  | Fulfilled _ | Rejected _ -> ()
+
+(* Forward cancellation to a whole list of sources (Lwt's
+   [propagate_cancel_to_several], used by choose/pick/join/all/both/nchoose). *)
+let set_cancel_forward_list (type a b) (result : a t) (ps : b t list) : unit =
+  match (prj result).st with
+  | Pending pe -> pe.cancel <- Cancel_forward (fun () -> List.iter cancel ps)
   | Fulfilled _ | Rejected _ -> ()
 
 (* ------------------------------------------------------------------ *)
@@ -263,18 +302,38 @@ let return v = inj { st = Fulfilled v }
 let fail e = inj { st = Rejected e }
 let return_unit = return ()
 
-(* Apply the continuation of a bind, turning a synchronous exception into a
-   rejected promise. This catch-all mirrors Lwt's monadic semantics: a [bind]
-   never lets [f] raise into the scheduler. *)
-let apply (f : 'a -> 'b t) (v : 'a) : 'b t =
-  try f v with e -> inj { st = Rejected e }
+(* Which exceptions Lwt machinery may catch (and turn into rejections), vs let
+   bubble out of the scheduler. Same definition and default as Lwt's. *)
+module Exception_filter = struct
+  type t = exn -> bool
 
-(* Forward the eventual result of [p'] into the pending promise [result]. *)
+  let handle_all = fun _ -> true
+
+  let handle_all_except_runtime = function
+    | Out_of_memory | Stack_overflow -> false
+    | _ -> true
+
+  let v = ref handle_all_except_runtime
+  let set f = v := f
+  let run e = !v e
+end
+
+(* Apply the continuation of a bind, turning a synchronous exception into a
+   rejected promise (when the exception filter allows catching it). Used on the
+   deferred (pending) paths: fast paths apply [f] plainly, as Lwt does. *)
+let apply (f : 'a -> 'b t) (v : 'a) : 'b t =
+  try f v with e when Exception_filter.run e -> inj { st = Rejected e }
+
+(* Forward the eventual result of [p'] into the pending promise [result], and
+   make [result]'s cancellation follow [p'] (Lwt: cancelling a derived promise
+   cancels its current source; the rejection then flows back through waiters). *)
 let forward (type a) (result : a t) (p' : a t) : unit =
   match (prj p').st with
   | Fulfilled v' -> fill result (Ok v')
   | Rejected e -> fill result (Error e)
-  | Pending _ -> add_waiter p' (fun r' -> fill result r')
+  | Pending _ ->
+    set_cancel_forward result p';
+    add_waiter p' (fun r' -> fill result r')
 
 (* [bind] is non-blocking (like Lwt's): it does not suspend the caller, so a
    pending bind preserves Lwt's implicit concurrency — e.g.
@@ -285,10 +344,15 @@ let forward (type a) (result : a t) (p' : a t) : unit =
    on the experimental branch. *)
 let bind (type a b) (p : a t) (f : a -> b t) : b t =
   match (prj p).st with
-  | Fulfilled v -> apply f v
+  (* Fast path: a plain application, as in Lwt — a synchronous exception raised
+     by [f] escapes to the caller here (only the deferred, pending-path callback
+     turns it into a rejection). This matches Lwt's documented behaviour and
+     keeps the fast path free of any try/with. *)
+  | Fulfilled v -> f v
   | Rejected e -> inj { st = Rejected e }
   | Pending _ ->
     let result = new_pending () in
+    set_cancel_forward result p;
     let saved = !current_storage in
     add_waiter p (fun r ->
       let outer = !current_storage in
@@ -297,20 +361,45 @@ let bind (type a b) (p : a t) (f : a -> b t) : b t =
       current_storage := outer);
     result
 
-let map f p = bind p (fun v -> return (f v))
+(* Unlike {!bind}, [map] captures a synchronous exception of [f] into a rejected
+   promise even on the fulfilled fast path (Lwt's deliberate asymmetry: map's [f]
+   is a plain value function). Defined directly — no intermediate promise. *)
+let map (type a b) (f : a -> b) (p : a t) : b t =
+  match (prj p).st with
+  | Fulfilled v -> (
+    try return (f v) with e when Exception_filter.run e -> inj { st = Rejected e })
+  | Rejected e -> inj { st = Rejected e }
+  | Pending _ ->
+    let result = new_pending () in
+    set_cancel_forward result p;
+    let saved = !current_storage in
+    add_waiter p (fun r ->
+      let outer = !current_storage in
+      current_storage := saved;
+      (match r with
+      | Ok v -> (
+        try fill result (Ok (f v))
+        with e when Exception_filter.run e -> fill result (Error e))
+      | Error e -> fill result (Error e));
+      current_storage := outer);
+    result
+
 let ( >>= ) = bind
 let ( >|= ) p f = map f p
 
 (* [catch]/[try_bind] are non-blocking (they do not suspend the caller): a
-   synchronous exception raised by [f] itself is routed to the handler, as is a
-   rejection of [f ()]'s promise, mirroring Lwt. *)
+   synchronous exception raised by [f] itself is routed to the handler (when the
+   exception filter allows), as is a rejection of [f ()]'s promise, mirroring
+   Lwt. On the already-resolved fast paths [g]/[h] are applied plainly, so their
+   own synchronous exceptions escape to the caller — as in Lwt. *)
 let try_bind (f : unit -> 'a t) (g : 'a -> 'b t) (h : exn -> 'b t) : 'b t =
-  let p = try f () with e -> inj { st = Rejected e } in
+  let p = try f () with e when Exception_filter.run e -> inj { st = Rejected e } in
   match (prj p).st with
-  | Fulfilled v -> apply g v
-  | Rejected e -> apply h e
+  | Fulfilled v -> g v
+  | Rejected e -> h e
   | Pending _ ->
     let result = new_pending () in
+    set_cancel_forward result p;
     let saved = !current_storage in
     add_waiter p (fun r ->
       let outer = !current_storage in
@@ -352,38 +441,138 @@ let spawn (body : unit -> unit) : unit =
 let async (f : unit -> 'a t) : 'a t =
   let p = new_pending () in
   spawn (fun () ->
-    let r = try await_result (f ()) with e -> Error e in
+    let r = try await_result (f ()) with e when Exception_filter.run e -> Error e in
     fill p r);
   p
 
-let both a b = bind a (fun x -> bind b (fun y -> return (x, y)))
+(* Lwt's [both] waits for {e both} promises even when one is already rejected
+   (the result stays pending until the other resolves), then rejects with the
+   first rejection encountered. Callback-counting, like [join] below. *)
+let both (a : 'a t) (b : 'b t) : ('a * 'b) t =
+  let result = new_pending () in
+  (match (prj result).st with
+  | Pending pe ->
+    pe.cancel <-
+      Cancel_forward
+        (fun () ->
+          cancel a;
+          cancel b)
+  | Fulfilled _ | Rejected _ -> ());
+  let va = ref None
+  and vb = ref None
+  and failure = ref None
+  and remaining = ref 2 in
+  let settle () =
+    decr remaining;
+    if !remaining = 0 then
+      match (!failure, !va, !vb) with
+      | Some e, _, _ -> fill result (Error e)
+      | None, Some x, Some y -> fill result (Ok (x, y))
+      | None, _, _ -> ()
+  in
+  add_waiter a (fun r ->
+    (match r with
+    | Ok x -> va := Some x
+    | Error e -> if !failure = None then failure := Some e);
+    settle ());
+  add_waiter b (fun r ->
+    (match r with
+    | Ok y -> vb := Some y
+    | Error e -> if !failure = None then failure := Some e);
+    settle ());
+  result
+
+(* Among already-resolved promises, Lwt's [choose]/[pick] prefer a {e rejection};
+   with several fulfilled and none rejected, one is chosen at random (fairness,
+   as Lwt). The [Invalid_argument] messages use Lwt's wording: this core is meant
+   to BE the Lwt core (B2b), where these are the right names. *)
+let select_resolved (ps : 'a t list) : 'a t option =
+  match
+    List.filter (fun p -> match (prj p).st with Rejected _ -> true | _ -> false) ps
+  with
+  | p :: _ -> Some p
+  | [] -> (
+    match
+      List.filter
+        (fun p -> match (prj p).st with Fulfilled _ -> true | _ -> false)
+        ps
+    with
+    | [] -> None
+    | [ p ] -> Some p
+    | l -> Some (List.nth l (Random.int (List.length l))))
 
 let choose (ps : 'a t list) : 'a t =
-  let result = new_pending () in
-  List.iter (fun p -> add_waiter p (fun r -> fill result r)) ps;
-  result
+  if ps = [] then
+    invalid_arg "Lwt.choose [] would return a promise that is pending forever";
+  match select_resolved ps with
+  | Some p -> p
+  | None ->
+    let result = new_pending () in
+    set_cancel_forward_list result ps;
+    (* [fill] is a no-op on an already-filled promise: first resolution wins. *)
+    List.iter (fun p -> add_waiter p (fun r -> fill result r)) ps;
+    result
 
 let pick (ps : 'a t list) : 'a t =
-  let result = new_pending () in
-  List.iter
-    (fun p ->
-      add_waiter p (fun r ->
-        match (prj result).st with
-        | Pending _ ->
-          fill result r;
-          List.iter (fun q -> if q != p then cancel q) ps
-        | Fulfilled _ | Rejected _ -> ()))
-    ps;
-  result
+  if ps = [] then
+    invalid_arg "Lwt.pick [] would return a promise that is pending forever";
+  match select_resolved ps with
+  | Some p ->
+    List.iter (fun q -> if q != p then cancel q) ps;
+    p
+  | None ->
+    let result = new_pending () in
+    set_cancel_forward_list result ps;
+    (* [settling] keeps the losers' own waiters (fired by the cancellations
+       below) from resolving [result] before the winner's value does. *)
+    let settling = ref false in
+    List.iter
+      (fun p ->
+        add_waiter p (fun r ->
+          if not !settling then
+            match (prj result).st with
+            | Pending _ ->
+              settling := true;
+              (* Cancel the losers BEFORE resolving the result, so their
+                 cancellation callbacks run first (Lwt's ordering). *)
+              List.iter (fun q -> if q != p then cancel q) ps;
+              fill result r
+            | Fulfilled _ | Rejected _ -> ()))
+      ps;
+    result
 
 (* ------------------------------------------------------------------ *)
 (* Yielding and timers                                                *)
 (* ------------------------------------------------------------------ *)
 
+(* Lwt's pause protocol: paused promises gather in a queue served on the next
+   scheduler tick (or by an explicit [wakeup_paused], as Lwt_main does), with a
+   count and an optional notifier — conformant with Lwt.{pause,paused_count,
+   wakeup_paused,register_pause_notifier,abandon_paused}. *)
+let paused : unit t list ref = ref []
+let paused_n = ref 0
+let pause_notifier : (int -> unit) option ref = ref None
+
 let pause () : unit t =
   let p = new_pending () in
-  enqueue (fun () -> fill p ok_unit);
+  paused := p :: !paused;
+  incr paused_n;
+  (match !pause_notifier with Some f -> f !paused_n | None -> ());
   p
+
+let paused_count () = !paused_n
+
+let wakeup_paused () =
+  (* Snapshot first: a [pause] performed while waking lands in the next batch. *)
+  let ps = List.rev !paused in
+  paused := [];
+  paused_n := 0;
+  List.iter (fun p -> fill p ok_unit) ps
+
+let register_pause_notifier f = pause_notifier := Some f
+let abandon_paused () =
+  paused := [];
+  paused_n := 0
 
 let sleep (d : float) : unit t =
   if d <= 0. then pause ()
@@ -426,7 +615,13 @@ let set_idle (f : unit -> bool) : unit = idle_hook := f
 
 let rec run_scheduler () : unit =
   if Run_queue.is_empty run_queue then begin
-    if !idle_hook () then run_scheduler ()
+    (* Serve the paused promises first: a [pause] resolves on the next tick,
+       before the scheduler blocks in the engine (whatever the idle backend). *)
+    if !paused_n > 0 then begin
+      wakeup_paused ();
+      run_scheduler ()
+    end
+    else if !idle_hook () then run_scheduler ()
   end
   else begin
     (match Run_queue.pop run_queue with
@@ -444,7 +639,7 @@ let run (type a) (main : unit -> a t) : a =
   current_storage := empty_storage;
   let outcome = ref None in
   spawn (fun () ->
-    let r = try await_result (main ()) with e -> Error e in
+    let r = try await_result (main ()) with e when Exception_filter.run e -> Error e in
     outcome := Some r);
   run_scheduler ();
   match !outcome with
@@ -518,13 +713,33 @@ type -'a u = 'a Public_handle.u
 let t_of_u (u : 'a u) : 'a t = inj (Public_handle.prj_u u)
 let u_of_t (p : 'a t) : 'a u = Public_handle.inj_u (prj p)
 
+(* [wait] promises are not cancelable; [task] promises are (Lwt's model). *)
 let wait () =
+  let p = new_pending () in
+  (match (prj p).st with
+  | Pending pe -> pe.cancel <- Not_cancelable
+  | Fulfilled _ | Rejected _ -> ());
+  (p, u_of_t p)
+
+let task () =
   let p = new_pending () in
   (p, u_of_t p)
 
-let task () = wait ()
-let wakeup (u : 'a u) v = fill (t_of_u u) (Ok v)
-let wakeup_exn (u : 'a u) e = fill (t_of_u u) (Error e)
+(* Lwt's resolver semantics: resolving an already-resolved promise raises
+   [Invalid_argument fname] — except when it was resolved by cancellation, in
+   which case it is a no-op (so a resolver raced by [cancel] stays safe).
+   [fname] parameterises the message so a core-swap candidate can report
+   "Lwt.wakeup" etc. (Internal [fill] keeps its silent no-op: backend completion
+   handlers may legitimately fire after a cancel.) *)
+let wakeup_named (fname : string) (u : 'a u) (r : ('a, exn) result) : unit =
+  let p = t_of_u u in
+  match (prj p).st with
+  | Pending _ -> fill p r
+  | Rejected Canceled -> ()
+  | Fulfilled _ | Rejected _ -> invalid_arg fname
+
+let wakeup (u : 'a u) v = wakeup_named "Lwt_effects.wakeup" u (Ok v)
+let wakeup_exn (u : 'a u) e = wakeup_named "Lwt_effects.wakeup_exn" u (Error e)
 let wakeup_later = wakeup
 let wakeup_later_exn = wakeup_exn
 
@@ -554,7 +769,7 @@ let return_error e = return (Error e)
 let return_true = return true
 let return_false = return false
 
-let wrap f = try return (f ()) with e -> fail e
+let wrap f = try return (f ()) with e when Exception_filter.run e -> fail e
 
 let finalize f g =
   try_bind f
@@ -562,48 +777,157 @@ let finalize f g =
     (fun e -> bind (g ()) (fun () -> fail e))
 
 (* Non-blocking like Lwt's: the awaiting happens in a spawned fiber. *)
+(* [join]/[all] are callback-counting (no fiber): they resolve {e immediately}
+   when every promise is already resolved — Lwt code observes the state right
+   after the call — and otherwise settle when the last pending one does. On
+   rejection they still wait for all, then reject with the {e first} rejection
+   encountered (already-rejected ones in list order first), as Lwt. *)
 let join (ps : unit t list) : unit t =
-  async (fun () ->
-    let err = ref None in
+  match ps with
+  | [] -> return_unit
+  | _ ->
+    let result = new_pending () in
+    set_cancel_forward_list result ps;
+    let remaining = ref (List.length ps) in
+    let failure = ref None in
     List.iter
       (fun p ->
-        match await_result p with
-        | Ok () -> ()
-        | Error e -> if !err = None then err := Some e)
+        add_waiter p (fun r ->
+          (match r with
+          | Error e -> if !failure = None then failure := Some e
+          | Ok () -> ());
+          decr remaining;
+          if !remaining = 0 then
+            match !failure with
+            | None -> fill result (Ok ())
+            | Some e -> fill result (Error e)))
       ps;
-    match !err with None -> return_unit | Some e -> fail e)
+    result
 
-let all (ps : 'a t list) : 'a list t = async (fun () -> return (List.map await ps))
+let all (ps : 'a t list) : 'a list t =
+  match ps with
+  | [] -> return []
+  | _ ->
+    let result = new_pending () in
+    set_cancel_forward_list result ps;
+    let n = List.length ps in
+    let values = Array.make n None in
+    let remaining = ref n in
+    let failure = ref None in
+    List.iteri
+      (fun i p ->
+        add_waiter p (fun r ->
+          (match r with
+          | Ok v -> values.(i) <- Some v
+          | Error e -> if !failure = None then failure := Some e);
+          decr remaining;
+          if !remaining = 0 then
+            match !failure with
+            | None ->
+              (* Every slot is [Some] once [remaining] is 0 with no failure. *)
+              fill result (Ok (Array.to_list values |> List.filter_map Fun.id))
+            | Some e -> fill result (Error e)))
+      ps;
+    result
 
-let ready_values ps =
-  List.filter_map
-    (fun p ->
-      match (prj p).st with Fulfilled v -> Some v | Rejected _ | Pending _ -> None)
+(* The result of an [nchoose]-family snapshot: values of the currently-fulfilled
+   promises in list order, or the first rejection in list order. *)
+let nchoose_result (ps : 'a t list) : ('a list, exn) result =
+  let rec collect acc = function
+    | [] -> Ok (List.rev acc)
+    | p :: rest -> (
+      match (prj p).st with
+      | Fulfilled v -> collect (v :: acc) rest
+      | Rejected e -> Error e
+      | Pending _ -> collect acc rest)
+  in
+  collect [] ps
+
+let any_resolved ps =
+  List.exists
+    (fun p -> match (prj p).st with Pending _ -> false | _ -> true)
     ps
 
 let nchoose (ps : 'a t list) : 'a list t =
-  async (fun () ->
-    ignore (await (choose ps));
-    return (ready_values ps))
+  if ps = [] then
+    invalid_arg "Lwt.nchoose [] would return a promise that is pending forever";
+  if any_resolved ps then (
+    match nchoose_result ps with Ok vs -> return vs | Error e -> fail e)
+  else begin
+    let result = new_pending () in
+    set_cancel_forward_list result ps;
+    List.iter
+      (fun p ->
+        add_waiter p (fun _ ->
+          match (prj result).st with
+          | Pending _ -> fill result (nchoose_result ps)
+          | Fulfilled _ | Rejected _ -> ()))
+      ps;
+    result
+  end
+
+(* Like [nchoose], but also returns the promises still pending at that point. *)
+let nchoose_split (type a) (ps : a t list) : (a list * a t list) t =
+  if ps = [] then
+    invalid_arg
+      "Lwt.nchoose_split [] would return a promise that is pending forever";
+  let snapshot () =
+    let rec collect vs pend = function
+      | [] -> Ok (List.rev vs, List.rev pend)
+      | p :: rest -> (
+        match (prj p).st with
+        | Fulfilled v -> collect (v :: vs) pend rest
+        | Rejected e -> Error e
+        | Pending _ -> collect vs (p :: pend) rest)
+    in
+    collect [] [] ps
+  in
+  if any_resolved ps then (
+    match snapshot () with Ok x -> return x | Error e -> fail e)
+  else begin
+    let result = new_pending () in
+    set_cancel_forward_list result ps;
+    List.iter
+      (fun p ->
+        add_waiter p (fun _ ->
+          match (prj result).st with
+          | Pending _ -> fill result (snapshot ())
+          | Fulfilled _ | Rejected _ -> ()))
+      ps;
+    result
+  end
 
 let npick (ps : 'a t list) : 'a list t =
-  async (fun () ->
-    ignore (await (choose ps));
-    let res = ready_values ps in
-    List.iter (fun p -> if is_sleeping p then cancel p) ps;
-    return res)
-
-let on_any p f g = add_waiter p (function Ok v -> f v | Error e -> g e)
-let on_success p f = add_waiter p (function Ok v -> f v | Error _ -> ())
-let on_failure p f = add_waiter p (function Ok _ -> () | Error e -> f e)
-let on_termination p f = add_waiter p (fun _ -> f ())
-
-let on_cancel p f =
-  match (prj p).st with
-  | Pending pe ->
-    let prev = pe.on_cancel in
-    pe.on_cancel <- (fun () -> prev (); (try f () with _ -> ()))
-  | Fulfilled _ | Rejected _ -> ()
+  if ps = [] then
+    invalid_arg "Lwt.npick [] would return a promise that is pending forever";
+  let cancel_pending () =
+    List.iter (fun p -> if is_sleeping p then cancel p) ps
+  in
+  if any_resolved ps then begin
+    (* Snapshot before cancelling: the cancellations must not become the
+       result. *)
+    let r = nchoose_result ps in
+    cancel_pending ();
+    match r with Ok vs -> return vs | Error e -> fail e
+  end
+  else begin
+    let result = new_pending () in
+    set_cancel_forward_list result ps;
+    let settling = ref false in
+    List.iter
+      (fun p ->
+        add_waiter p (fun _ ->
+          if not !settling then
+            match (prj result).st with
+            | Pending _ ->
+              settling := true;
+              let r = nchoose_result ps in
+              cancel_pending ();
+              fill result r
+            | Fulfilled _ | Rejected _ -> ()))
+      ps;
+    result
+  end
 
 let async_exception_hook =
   ref (fun exn ->
@@ -612,16 +936,94 @@ let async_exception_hook =
     prerr_newline ();
     exit 2)
 
+(* Lwt's [on_*] semantics: an exception raised by the callback goes to
+   [async_exception_hook] (when the exception filter allows catching it), and
+   the callback runs with the fiber-local storage that was current at
+   registration time (as Lwt does for all its callbacks). *)
+let hooked f x =
+  try f x with e when Exception_filter.run e -> !async_exception_hook e
+
+(* Wrap a one-argument callback so it restores the registration-time storage. *)
+let with_registration_storage f =
+  let saved = !current_storage in
+  fun x ->
+    let outer = !current_storage in
+    current_storage := saved;
+    hooked f x;
+    current_storage := outer
+
+let on_any p f g =
+  let f = with_registration_storage f and g = with_registration_storage g in
+  add_waiter p (function Ok v -> f v | Error e -> g e)
+
+let on_success p f =
+  let f = with_registration_storage f in
+  add_waiter p (function Ok v -> f v | Error _ -> ())
+
+let on_failure p f =
+  let f = with_registration_storage f in
+  add_waiter p (function Ok _ -> () | Error e -> f e)
+
+let on_termination p f =
+  let f = with_registration_storage f in
+  add_waiter p (fun _ -> f ())
+
+(* Runs [f] when the promise is rejected with [Canceled] — whether cancelled
+   directly or through propagation. Cancel callbacks run {e before} ordinary
+   waiters (Lwt's ordering guarantee); see [fill]. *)
+let on_cancel (type a) (p : a t) (f : unit -> unit) : unit =
+  let f = with_registration_storage f in
+  match (prj p).st with
+  | Pending pe -> pe.cancel_waiters <- f :: pe.cancel_waiters
+  | Rejected Canceled -> f ()
+  | Fulfilled _ | Rejected _ -> ()
+
 let dont_wait f handler =
   ignore
     (async (fun () ->
        try_bind f (fun () -> return_unit) (fun e -> handler e; return_unit)))
 
-let ignore_result p = on_any p ignore (fun e -> !async_exception_hook e)
+(* Lwt's [ignore_result]: an already-rejected promise raises synchronously; a
+   later rejection goes to [async_exception_hook]. *)
+let ignore_result p =
+  match (prj p).st with
+  | Fulfilled _ -> ()
+  | Rejected e -> raise e
+  | Pending _ -> on_failure p (fun e -> !async_exception_hook e)
 
-(* Cancellation-isolation: approximations for API coverage. *)
-let no_cancel p = p
-let protected p = p
+(* [no_cancel p] mirrors [p] but ignores [cancel]; [protected p] mirrors [p]
+   and is cancelable without affecting [p] (cancelling rejects the mirror only). *)
+let no_cancel (type a) (p : a t) : a t =
+  match (prj p).st with
+  | Fulfilled _ | Rejected _ -> p
+  | Pending _ ->
+    let result = new_pending () in
+    (match (prj result).st with
+    | Pending pe -> pe.cancel <- Not_cancelable
+    | Fulfilled _ | Rejected _ -> ());
+    add_waiter p (fun r -> fill result r);
+    result
+let protected (type a) (p : a t) : a t =
+  match (prj p).st with
+  | Fulfilled _ | Rejected _ -> p
+  | Pending _ ->
+    (* Default [Cancel_self ignore]: cancelable, leaves [p] untouched; a later
+       resolution of [p] is absorbed by [fill]'s no-op on resolved. *)
+    let result = new_pending () in
+    add_waiter p (fun r -> fill result r);
+    result
+
+(* [wrap_in_cancelable p] mirrors [p] and is cancelable even if [p] is not:
+   cancelling first forwards to [p] (no-op if [p] is not cancelable — its
+   rejection, if any, flows into the mirror), then rejects the mirror. *)
+let wrap_in_cancelable (type a) (p : a t) : a t =
+  match (prj p).st with
+  | Fulfilled _ | Rejected _ -> p
+  | Pending _ ->
+    let result = new_pending () in
+    set_on_cancel result (fun () -> cancel p);
+    add_waiter p (fun r -> fill result r);
+    result
 
 module Infix = struct
   let ( >>= ) = bind
@@ -857,6 +1259,10 @@ module Private = struct
   let new_pending = new_pending
   let fill = fill
   let set_on_cancel = set_on_cancel
+
+  (* Resolver with a caller-supplied function name in the double-resolve error
+     (for the core-swap candidate's "Lwt.wakeup" etc.). *)
+  let wakeup_named = wakeup_named
 
   (* Fiber-local storage internals, in the exact shape of
      [Lwt.Private.Sequence_associated_storage] (needed by the core-swap
