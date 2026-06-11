@@ -1,7 +1,22 @@
+; The engine-free core (promise machinery, resolution loop, run queue,
+; combinators) is a separate library with NO dependencies: the in-place Lwt
+; core swap requires the core to sit below lwt.unix, and this layering is
+; enforced by construction. Lwt_effects is the Lwt_engine layer over it
+; (timers, fd readiness, blocking idle wait, Lwt interop, I/O).
+
+(library
+ (name lwt_effects_core)
+ (public_name lwt_effects.core)
+ (synopsis "Engine-free core of the effect-based scheduler")
+ (modules lwt_effects_core)
+ (enabled_if
+  (>= %{ocaml_version} "5.0")))
+
 (library
  (name lwt_effects)
  (public_name lwt_effects)
  (synopsis "Effect-based scheduler for Lwt-style promises (POC)")
+ (modules lwt_effects)
  (enabled_if
   (>= %{ocaml_version} "5.0"))
- (libraries lwt.unix unix))
+ (libraries lwt_effects_core lwt.unix unix))
