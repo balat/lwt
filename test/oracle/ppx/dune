@@ -15,7 +15,7 @@
  (with-stdout-to
   oracle_ppx_main.ml
   (progn
-   (cat %{dep:ppx_prelude.in})
+   (cat %{dep:../sleep_prelude.in})
    (cat %{dep:../../ppx/main.ml}))))
 
 ; The tester uses Lwt_list: vendor it against the candidate (as in ../run),
