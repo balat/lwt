@@ -678,9 +678,9 @@ let abandon_paused () =
 (* Idle-wait hook: called when the run queue is empty, to block until external
    work arrives. Returns [true] if it may have produced new work (the loop
    continues), [false] if there is nothing left to wait for (scheduler is done).
-   A backend (the Lwt_engine layer in [Lwt_effects], or io_uring) installs its
-   own with [set_idle]. The bare core has no event source: with nothing to
-   block on, an empty run queue means the scheduler is done. *)
+   A backend ([Lwt_main], driving [Lwt_engine]) installs its own with
+   [set_idle]. The bare core has no event source: with nothing to block on, an
+   empty run queue means the scheduler is done. *)
 let core_idle () : bool = false
 
 (* Run at the start of [run] to reset back-end state (e.g. the I/O readiness
