@@ -85,61 +85,6 @@ let inj = Public_handle.inj
 let prj = Public_handle.prj
 
 (* ------------------------------------------------------------------ *)
-(* Promise primitives                                                 *)
-(* ------------------------------------------------------------------ *)
-
-let new_pending () : 'a t =
-  inj
-    { st = Pending { waiters = []; cancel_waiters = []; cancel = Cancel_self ignore } }
-
-let fill (type a) (p : a t) (r : (a, exn) result) : unit =
-  let p = prj p in
-  match p.st with
-  | Pending pe ->
-    p.st <- (match r with Ok v -> Fulfilled v | Error e -> Rejected e);
-    (match r with
-    | Error Canceled -> List.iter (fun f -> f ()) (List.rev pe.cancel_waiters)
-    | Ok _ | Error _ -> ());
-    List.iter (fun w -> w r) (List.rev pe.waiters)
-  | Fulfilled _ | Rejected _ -> ()
-
-let add_waiter (type a) (p : a t) (w : (a, exn) result -> unit) : unit =
-  match (prj p).st with
-  | Pending pe -> pe.waiters <- w :: pe.waiters
-  | Fulfilled v -> w (Ok v)
-  | Rejected e -> w (Error e)
-
-let set_on_cancel (type a) (p : a t) (f : unit -> unit) : unit =
-  match (prj p).st with
-  | Pending pe -> pe.cancel <- Cancel_self f
-  | Fulfilled _ | Rejected _ -> ()
-
-let cancel (type a) (p : a t) : unit =
-  match (prj p).st with
-  | Pending pe -> (
-    match pe.cancel with
-    | Not_cancelable -> ()
-    | Cancel_self hook ->
-      hook ();
-      fill p (Error Canceled)
-    | Cancel_forward fwd -> fwd ())
-  | Fulfilled _ | Rejected _ -> ()
-
-(* Mark [result] as forwarding cancellation to its current source [src] (no-op
-   if [result] is no longer pending). Used by the derived combinators. *)
-let set_cancel_forward (type a b) (result : a t) (src : b t) : unit =
-  match (prj result).st with
-  | Pending pe -> pe.cancel <- Cancel_forward (fun () -> cancel src)
-  | Fulfilled _ | Rejected _ -> ()
-
-(* Forward cancellation to a whole list of sources (Lwt's
-   [propagate_cancel_to_several], used by choose/pick/join/all/both/nchoose). *)
-let set_cancel_forward_list (type a b) (result : a t) (ps : b t list) : unit =
-  match (prj result).st with
-  | Pending pe -> pe.cancel <- Cancel_forward (fun () -> List.iter cancel ps)
-  | Fulfilled _ | Rejected _ -> ()
-
-(* ------------------------------------------------------------------ *)
 (* Fiber-local storage (Lwt.key)                                      *)
 (* ------------------------------------------------------------------ *)
 
@@ -189,6 +134,125 @@ let with_value key value f =
   | exception e ->
     current_storage := saved;
     raise e
+
+(* ------------------------------------------------------------------ *)
+(* Resolution loop (Lwt's callback-deferral semantics)                *)
+(* ------------------------------------------------------------------ *)
+
+(* Lwt runs resolution callbacks inside a "resolution loop". The promise STATE
+   is always set immediately; what may be deferred is running the callbacks:
+   - [wakeup] runs them immediately, whatever the current nesting;
+   - internal resolutions run them immediately up to a nesting depth of
+     [default_maximum_callback_nesting_depth], beyond which they are deferred
+     (Lwt's tail-call/stack protection);
+   - [wakeup_later] defers them whenever some resolution is already in
+     progress (nesting depth >= 1).
+   Deferred callbacks run when the outermost loop exits. The fiber-local
+   storage is snapshotted on entry and restored on exit, exactly as Lwt does
+   (callbacks run under their registration-time storage and must not leak it
+   to the resolver's caller). Mirroring Lwt, a callback that raises escapes
+   the loop without unwinding it (Lwt's own [run_in_resolution_loop] does not
+   catch). *)
+
+let default_maximum_callback_nesting_depth = 42
+let current_callback_nesting_depth = ref 0
+let deferred_callbacks : (unit -> unit) Queue.t = Queue.create ()
+
+(* Runs the deferred callbacks; called at depth 1, so a [wakeup_later]
+   performed by a deferred callback is itself deferred and picked up by the
+   same drain. *)
+let drain_deferred () =
+  while not (Queue.is_empty deferred_callbacks) do
+    (Queue.pop deferred_callbacks) ()
+  done
+
+let leave_resolution_loop (storage_snapshot : storage) : unit =
+  if !current_callback_nesting_depth = 1 then drain_deferred ();
+  decr current_callback_nesting_depth;
+  current_storage := storage_snapshot
+
+let run_in_resolution_loop (f : unit -> unit) : unit =
+  incr current_callback_nesting_depth;
+  let storage_snapshot = !current_storage in
+  f ();
+  leave_resolution_loop storage_snapshot
+
+(* Lwt.Private/abandon_wakeups: bail out of a resolution loop after an
+   exception escaped it (https://github.com/ocsigen/lwt/issues/48). *)
+let abandon_resolution_loop () =
+  if !current_callback_nesting_depth <> 0 then begin
+    current_callback_nesting_depth := 1;
+    leave_resolution_loop empty_storage
+  end
+
+(* ------------------------------------------------------------------ *)
+(* Promise primitives                                                 *)
+(* ------------------------------------------------------------------ *)
+
+let new_pending () : 'a t =
+  inj
+    { st = Pending { waiters = []; cancel_waiters = []; cancel = Cancel_self ignore } }
+
+let run_resolution_callbacks (type a) (pe : a pending) (r : (a, exn) result) :
+    unit =
+  (match r with
+  | Error Canceled -> List.iter (fun f -> f ()) (List.rev pe.cancel_waiters)
+  | Ok _ | Error _ -> ());
+  List.iter (fun w -> w r) (List.rev pe.waiters)
+
+let fill_general (type a) ~allow_deferring ~maximum_callback_nesting_depth
+    (p : a t) (r : (a, exn) result) : unit =
+  let p = prj p in
+  match p.st with
+  | Pending pe ->
+    p.st <- (match r with Ok v -> Fulfilled v | Error e -> Rejected e);
+    if
+      allow_deferring
+      && !current_callback_nesting_depth >= maximum_callback_nesting_depth
+    then Queue.push (fun () -> run_resolution_callbacks pe r) deferred_callbacks
+    else run_in_resolution_loop (fun () -> run_resolution_callbacks pe r)
+  | Fulfilled _ | Rejected _ -> ()
+
+(* Internal resolution: immediate up to the default nesting depth. *)
+let fill (type a) (p : a t) (r : (a, exn) result) : unit =
+  fill_general ~allow_deferring:true
+    ~maximum_callback_nesting_depth:default_maximum_callback_nesting_depth p r
+
+let add_waiter (type a) (p : a t) (w : (a, exn) result -> unit) : unit =
+  match (prj p).st with
+  | Pending pe -> pe.waiters <- w :: pe.waiters
+  | Fulfilled v -> w (Ok v)
+  | Rejected e -> w (Error e)
+
+let set_on_cancel (type a) (p : a t) (f : unit -> unit) : unit =
+  match (prj p).st with
+  | Pending pe -> pe.cancel <- Cancel_self f
+  | Fulfilled _ | Rejected _ -> ()
+
+let cancel (type a) (p : a t) : unit =
+  match (prj p).st with
+  | Pending pe -> (
+    match pe.cancel with
+    | Not_cancelable -> ()
+    | Cancel_self hook ->
+      hook ();
+      fill p (Error Canceled)
+    | Cancel_forward fwd -> fwd ())
+  | Fulfilled _ | Rejected _ -> ()
+
+(* Mark [result] as forwarding cancellation to its current source [src] (no-op
+   if [result] is no longer pending). Used by the derived combinators. *)
+let set_cancel_forward (type a b) (result : a t) (src : b t) : unit =
+  match (prj result).st with
+  | Pending pe -> pe.cancel <- Cancel_forward (fun () -> cancel src)
+  | Fulfilled _ | Rejected _ -> ()
+
+(* Forward cancellation to a whole list of sources (Lwt's
+   [propagate_cancel_to_several], used by choose/pick/join/all/both/nchoose). *)
+let set_cancel_forward_list (type a b) (result : a t) (ps : b t list) : unit =
+  match (prj result).st with
+  | Pending pe -> pe.cancel <- Cancel_forward (fun () -> List.iter cancel ps)
+  | Fulfilled _ | Rejected _ -> ()
 
 (* ------------------------------------------------------------------ *)
 (* Scheduler state                                                    *)
@@ -734,14 +798,33 @@ let task () =
 let wakeup_named (fname : string) (u : 'a u) (r : ('a, exn) result) : unit =
   let p = t_of_u u in
   match (prj p).st with
-  | Pending _ -> fill p r
+  | Pending _ ->
+    (* [wakeup] never defers: callbacks run now whatever the nesting. *)
+    fill_general ~allow_deferring:false
+      ~maximum_callback_nesting_depth:default_maximum_callback_nesting_depth p
+      r
+  | Rejected Canceled -> ()
+  | Fulfilled _ | Rejected _ -> invalid_arg fname
+
+(* [wakeup_later]: callbacks are deferred whenever some resolution is already
+   in progress (Lwt resolves with [~maximum_callback_nesting_depth:1]). *)
+let wakeup_later_named (fname : string) (u : 'a u) (r : ('a, exn) result) :
+    unit =
+  let p = t_of_u u in
+  match (prj p).st with
+  | Pending _ ->
+    fill_general ~allow_deferring:true ~maximum_callback_nesting_depth:1 p r
   | Rejected Canceled -> ()
   | Fulfilled _ | Rejected _ -> invalid_arg fname
 
 let wakeup (u : 'a u) v = wakeup_named "Lwt_effects.wakeup" u (Ok v)
 let wakeup_exn (u : 'a u) e = wakeup_named "Lwt_effects.wakeup_exn" u (Error e)
-let wakeup_later = wakeup
-let wakeup_later_exn = wakeup_exn
+
+let wakeup_later (u : 'a u) v =
+  wakeup_later_named "Lwt_effects.wakeup_later" u (Ok v)
+
+let wakeup_later_exn (u : 'a u) e =
+  wakeup_later_named "Lwt_effects.wakeup_later_exn" u (Error e)
 
 let state (type a) (p : a t) : a state =
   match (prj p).st with
@@ -1260,9 +1343,13 @@ module Private = struct
   let fill = fill
   let set_on_cancel = set_on_cancel
 
-  (* Resolver with a caller-supplied function name in the double-resolve error
+  (* Resolvers with a caller-supplied function name in the double-resolve error
      (for the core-swap candidate's "Lwt.wakeup" etc.). *)
   let wakeup_named = wakeup_named
+  let wakeup_later_named = wakeup_later_named
+
+  (* Bail out of the resolution loop (Lwt's [abandon_wakeups], issue #48). *)
+  let abandon_resolution_loop = abandon_resolution_loop
 
   (* Fiber-local storage internals, in the exact shape of
      [Lwt.Private.Sequence_associated_storage] (needed by the core-swap

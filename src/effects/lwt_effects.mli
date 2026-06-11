@@ -218,9 +218,18 @@ type -'a u
 
 val wait : unit -> 'a t * 'a u
 val task : unit -> 'a t * 'a u
+
 val wakeup : 'a u -> 'a -> unit
+(** Resolves the promise and runs its callbacks immediately, whatever the
+    current callback nesting (Lwt's [wakeup]). *)
+
 val wakeup_exn : 'a u -> exn -> unit
+
 val wakeup_later : 'a u -> 'a -> unit
+(** Like {!wakeup}, but if some promise resolution is already running its
+    callbacks, this promise's callbacks are deferred until the current
+    resolution finishes (Lwt's [wakeup_later] semantics). *)
+
 val wakeup_later_exn : 'a u -> exn -> unit
 val state : 'a t -> 'a state
 val is_sleeping : 'a t -> bool
@@ -345,6 +354,14 @@ module Private : sig
   (** [wakeup_named fname u r] resolves like {!wakeup}/{!wakeup_exn} but reports
       double resolution as [Invalid_argument fname] (no-op if the promise was
       cancelled). Lets a core-swap candidate report Lwt's own function names. *)
+
+  val wakeup_later_named : string -> 'a u -> ('a, exn) result -> unit
+  (** Same, with {!wakeup_later}'s deferral semantics. *)
+
+  val abandon_resolution_loop : unit -> unit
+  (** Bail out of the resolution loop after an exception escaped it, running
+      any deferred callbacks (Lwt's [abandon_wakeups],
+      {{:https://github.com/ocsigen/lwt/issues/48} issue #48}). *)
 
   (** Fiber-local storage internals (the shape of
       [Lwt.Private.Sequence_associated_storage]). *)

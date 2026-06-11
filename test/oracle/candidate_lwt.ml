@@ -54,15 +54,16 @@ let backtrace_try_bind _name _line _add_loc f g h = try_bind f g h
 (* The resolvers, reporting double resolution under Lwt's own function names. *)
 let wakeup u v = Lwt_effects.Private.wakeup_named "Lwt.wakeup" u (Ok v)
 let wakeup_exn u e = Lwt_effects.Private.wakeup_named "Lwt.wakeup_exn" u (Error e)
-let wakeup_later u v = Lwt_effects.Private.wakeup_named "Lwt.wakeup_later" u (Ok v)
+let wakeup_later u v =
+  Lwt_effects.Private.wakeup_later_named "Lwt.wakeup_later" u (Ok v)
 
 let wakeup_later_exn u e =
-  Lwt_effects.Private.wakeup_named "Lwt.wakeup_later_exn" u (Error e)
+  Lwt_effects.Private.wakeup_later_named "Lwt.wakeup_later_exn" u (Error e)
 
 let wakeup_result u r = Lwt_effects.Private.wakeup_named "Lwt.wakeup_result" u r
 
 let wakeup_later_result u r =
-  Lwt_effects.Private.wakeup_named "Lwt.wakeup_later_result" u r
+  Lwt_effects.Private.wakeup_later_named "Lwt.wakeup_later_result" u r
 
 
 (* ------------------------------------------------------------------ *)
@@ -117,8 +118,9 @@ let debug_state_is expected p =
      | _ -> false)
 
 (* The pause protocol comes from the effect core (real implementation).
-   [abandon_wakeups] also drops the paused queue, as Lwt's does. *)
-let abandon_wakeups () = abandon_paused ()
+   [abandon_wakeups] bails out of the resolution loop (Lwt's issue #48 hook);
+   the paused queue is dropped separately by [abandon_paused], as in Lwt. *)
+let abandon_wakeups () = Lwt_effects.Private.abandon_resolution_loop ()
 
 (* Lwt's [Private]: the storage internals (backed by the effect core's own
    fiber-local storage) and the tracing-context key. Shadows the effect core's
