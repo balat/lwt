@@ -1,3 +1,21 @@
-(* Run Lwt's own core suite (unchanged) against the effect-backed candidate. *)
+(* Run Lwt's own core suites (unchanged) against the effect-backed candidate.
+   Mirrors test/core/main.ml: the Lwt suite itself plus every auxiliary module
+   (recompiled against the candidate). *)
 
-let () = Test.run "core-on-effects" Test_lwt.suites
+let () =
+  Test.run "core-on-effects"
+    (Test_lwt.suites
+    @ [
+        Test_lwt_stream.suite;
+        Test_lwt_list.suite_primary;
+        Test_lwt_list.suite_intensive;
+        Test_lwt_switch.suite;
+        Test_lwt_mutex.suite;
+        Test_lwt_result.suite;
+        Test_lwt_mvar.suite;
+        Test_lwt_condition.suite;
+        Test_lwt_pool.suite;
+        Test_lwt_sequence.suite;
+        Test_lwt_seq.suite_base;
+        Test_lwt_seq.suite_fuzzing;
+      ])
