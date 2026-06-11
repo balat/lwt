@@ -4,47 +4,28 @@
    system capturing continuations and adding them as a callback to some lwt
    promises. *)
 
-(* part 1: tasks, getting the scheduler to call them *)
+(* part 1: tasks, getting the scheduler to call them.
 
-let tasks : (unit -> unit) Queue.t ref = ref (Queue.create ())
+   The effect-based core runs its own scheduler (a run queue drained by
+   [Lwt_main.run]): direct-style continuations are pushed straight onto it
+   through [Lwt.Private.scheduler_enqueue], with no intermediate task queue,
+   no [Lwt_main] iteration hooks and no engine round-trip per batch — a yield
+   costs one queue push/pop. The queued thunk runs under the fiber-local
+   storage current at the push. Exceptions escaping a task go to
+   [Lwt.async_exception_hook], as before. *)
 
-let[@inline] push_task f : unit = Queue.push f !tasks
+[@@@alert "-trespassing"]
 
-let absolute_max_number_of_steps =
-  (* TODO 6.0: what's a good number here? should it be customisable? *)
-  10_000
-
-let run_all_tasks () : unit =
-  let n_processed = ref 0 in
-  let max_number_of_steps = min absolute_max_number_of_steps (2 * Queue.length !tasks) in
-  while (not (Queue.is_empty !tasks)) && !n_processed < max_number_of_steps do
-    let t = Queue.pop !tasks in
-    incr n_processed;
-    try t ()
+let[@inline] push_task f : unit =
+  Lwt.Private.scheduler_enqueue (fun () ->
+    try f ()
     with exn ->
       (* TODO 6.0: change async_exception handler to accept a backtrace, pass it
          here and at the other use site. *)
       (* TODO 6.0: this and other try-with: respect exception-filter *)
-      !Lwt.async_exception_hook exn
-  done;
-  (* In the case where there are no promises ready for wakeup, the scheduler's
-     engine will pause until some IO completes. There might never be completed
-     IO, depending on the program structure and the state of the world. If this
-     happens and the queue is not empty, we add a [pause] so that the engine has
-     something to wakeup for so that the rest of the queue can be processed. *)
-  if not (Queue.is_empty !tasks) && Lwt.paused_count () = 0 then ignore (Lwt.pause () : unit Lwt.t)
+      !Lwt.async_exception_hook exn)
 
-let setup_hooks =
-  let already_done = ref false in
-  fun () ->
-    if not !already_done then (
-      already_done := true;
-      (* TODO 6.0: assess whether we should have both hooks or just one (which
-         one). Tempted to say we should only have the enter hook. *)
-      let _hook1 = Lwt_main.Enter_iter_hooks.add_first run_all_tasks in
-      let _hook2 = Lwt_main.Leave_iter_hooks.add_first run_all_tasks in
-      ()
-    )
+[@@@alert "+trespassing"]
 
 (* part 2: effects, performing them *)
 
@@ -88,14 +69,14 @@ let handler : _ Effect.Deep.effect_handler =
   let effc : type b. b Effect.t -> ((b, unit) Effect.Deep.continuation -> 'a) option =
     function
     | Yield ->
-      Some (fun k ->
-        let storage = Storage.save_current () in
-        push_task (fun () ->
-          Storage.restore_current storage;
-          Effect.Deep.continue k ()))
+      (* [push_task] runs the thunk under the storage current at the push,
+         i.e. this fiber's storage — no explicit capture needed. *)
+      Some (fun k -> push_task (fun () -> Effect.Deep.continue k ()))
     | Await fut ->
       Some
         (fun k ->
+          (* The [on_any] callback fires at resolution time, under the
+             RESOLVER's storage: capture this fiber's storage explicitly. *)
           let storage = Storage.save_current () in
           Lwt.on_any fut
             (fun res -> push_task (fun () ->
@@ -118,7 +99,6 @@ let run_inside_effect_handler_and_resolve_ (type a) (promise : a Lwt.u) f () : u
   Effect.Deep.try_with run_f_and_set_res () handler
 
 let spawn f : _ Lwt.t =
-  setup_hooks ();
   let lwt, resolve = Lwt.wait () in
   push_task (run_inside_effect_handler_and_resolve_ resolve f);
   lwt
@@ -136,5 +116,4 @@ let run_inside_effect_handler_in_the_background_ f () : unit =
   Effect.Deep.try_with run_f () handler
 
 let spawn_in_the_background f : unit =
-  setup_hooks ();
   push_task (run_inside_effect_handler_in_the_background_ f)
