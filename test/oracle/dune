@@ -10,4 +10,5 @@
 (library
  (name candidate_lwt)
  (enabled_if false)
+ (flags (:standard -alert -all))
  (libraries lwt_effects))
