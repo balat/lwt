@@ -134,6 +134,14 @@ val pause : unit -> unit t
 (** [pause ()] resolves on the next scheduler tick, giving other fibers a chance
     to run. *)
 
+(** Lwt's pause protocol (see {!Lwt.paused_count} etc.): the paused queue is
+    served by the scheduler on each tick; an external loop may also drive it. *)
+
+val paused_count : unit -> int
+val wakeup_paused : unit -> unit
+val register_pause_notifier : (int -> unit) -> unit
+val abandon_paused : unit -> unit
+
 val yield : unit -> unit
 (** [yield ()] reschedules the current fiber behind the others, like
     [await (pause ())] but without allocating a promise. Must be called inside a
@@ -235,6 +243,7 @@ val finalize : (unit -> 'a t) -> (unit -> unit t) -> 'a t
 val join : unit t list -> unit t
 val all : 'a t list -> 'a list t
 val nchoose : 'a t list -> 'a list t
+val nchoose_split : 'a t list -> ('a list * 'a t list) t
 val npick : 'a t list -> 'a list t
 
 val on_any : 'a t -> ('a -> unit) -> (exn -> unit) -> unit
@@ -256,11 +265,31 @@ val new_key : unit -> 'a key
 val get : 'a key -> 'a option
 val with_value : 'a key -> 'a option -> (unit -> 'b) -> 'b
 
+(** Which exceptions Lwt machinery may catch (and turn into rejections), vs let
+    bubble out of the scheduler. Same semantics and default
+    ([handle_all_except_runtime]) as {!Lwt.Exception_filter}. *)
+module Exception_filter : sig
+  type t
+
+  val handle_all : t
+  val handle_all_except_runtime : t
+  val set : t -> unit
+
+  (**/**)
+
+  val run : exn -> bool
+end
+
 val no_cancel : 'a t -> 'a t
-(** Approximation (cancellation isolation is not modelled). *)
+(** [no_cancel p] mirrors [p] but ignores {!cancel}. *)
 
 val protected : 'a t -> 'a t
-(** Approximation (cancellation isolation is not modelled). *)
+(** [protected p] mirrors [p] and is cancelable without affecting [p]
+    (cancelling rejects the mirror only). *)
+
+val wrap_in_cancelable : 'a t -> 'a t
+(** [wrap_in_cancelable p] mirrors [p] and is cancelable even if [p] is not
+    (cancelling also forwards to [p] when it is cancelable). *)
 
 (** Infix operators, as in {!Lwt.Infix}. *)
 module Infix : sig
@@ -311,6 +340,11 @@ module Private : sig
   val new_pending : unit -> 'a t
   val fill : 'a t -> ('a, exn) result -> unit
   val set_on_cancel : 'a t -> (unit -> unit) -> unit
+
+  val wakeup_named : string -> 'a u -> ('a, exn) result -> unit
+  (** [wakeup_named fname u r] resolves like {!wakeup}/{!wakeup_exn} but reports
+      double resolution as [Invalid_argument fname] (no-op if the promise was
+      cancelled). Lets a core-swap candidate report Lwt's own function names. *)
 
   (** Fiber-local storage internals (the shape of
       [Lwt.Private.Sequence_associated_storage]). *)
