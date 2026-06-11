@@ -42,8 +42,15 @@ let run (type a) (p : a Lwt.t) : a =
       (* Call enter hooks. *)
       Lwt_sequence.iter_l (fun f -> f ()) enter_iter_hooks;
 
-      (* Do the main loop call. *)
-      let should_block_waiting_for_io = Lwt.paused_count () = 0 in
+      (* Do the main loop call. Block only if nothing became ready meanwhile:
+         the enter hooks may have resolved promises (e.g. Lwt_direct pumps its
+         task queue from them) — possibly [p] itself — and the core scheduler
+         must run that work now, not after an unbounded engine wait. *)
+      let should_block_waiting_for_io =
+        Lwt.is_sleeping p
+        && Lwt.paused_count () = 0
+        && Lwt.Private.scheduler_queue_is_empty ()
+      in
       Lwt_engine.iter should_block_waiting_for_io;
 
       (* Fulfill paused promises. *)
