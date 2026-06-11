@@ -27,7 +27,12 @@ let wrap5 f = fun a b c d e -> (try return (f a b c d e) with ex -> fail ex)
 let wrap6 f = fun a b c d e g -> (try return (f a b c d e g) with ex -> fail ex)
 let wrap7 f = fun a b c d e g h -> (try return (f a b c d e g h) with ex -> fail ex)
 
-let reraise e = raise e
+external reraise : exn -> 'a = "%reraise"
+
+(* Lwt's [async] is fire-and-forget ([(unit -> unit t) -> unit]); rejections go
+   to [async_exception_hook]. Shadows the effect core's promise-returning
+   [async]. *)
+let async (f : unit -> unit t) : unit = dont_wait f (fun e -> !async_exception_hook e)
 
 (* The tracing/backtrace variants take location metadata (name, line, an
    exception-rewriting function) and otherwise delegate to the plain combinators:
@@ -49,7 +54,7 @@ let wrap_in_cancelable p = p
 (* [nchoose_split ps] resolves once at least one of [ps] has, with the values of
    the currently-resolved promises and the list of those still pending. *)
 let nchoose_split ps =
-  async (fun () ->
+  Lwt_effects.async (fun () ->
     ignore (Direct.await (choose ps));
     let resolved =
       List.filter_map (fun p -> match state p with Return v -> Some v | _ -> None) ps
@@ -72,6 +77,16 @@ module Let_syntax = struct
 
     module Open_on_rhs = struct end
   end
+end
+
+(* Lwt's [Infix] also carries [<&>]/[<?>] and a nested [Let_syntax]. *)
+module Infix = struct
+  include Infix
+
+  let ( <&> ) a b = join [ a; b ]
+  let ( <?> ) a b = choose [ a; b ]
+
+  module Let_syntax = Let_syntax.Let_syntax
 end
 
 (* [add_task_r]/[add_task_l]: a task whose resolver is added to an Lwt_sequence,
@@ -118,3 +133,19 @@ let paused_count () = 0
 let register_pause_notifier _f = ()
 let abandon_paused () = ()
 let abandon_wakeups () = ()
+
+(* Lwt's [Private]: the storage internals (backed by the effect core's own
+   fiber-local storage) and the tracing-context key. Shadows the effect core's
+   [Private] (scheduler hooks), which the candidate does not re-export. *)
+module Private = struct
+  type storage = Lwt_effects.Private.storage
+
+  module Sequence_associated_storage = struct
+    let get_from_storage = Lwt_effects.Private.get_from_storage
+    let modify_storage = Lwt_effects.Private.modify_storage
+    let empty_storage = Lwt_effects.Private.empty_storage
+    let current_storage = Lwt_effects.Private.current_storage
+  end
+
+  let tracing_context : string key = new_key ()
+end
