@@ -202,12 +202,16 @@ let new_pending () : 'a t =
   inj
     { st = Pending { waiters = []; cancel_waiters = []; cancel = Cancel_self ignore } }
 
+(* Both lists are most-recently-added first and are run in THAT order: Lwt
+   runs attached callbacks in reverse registration order (its callback trees
+   prepend new nodes and are traversed front-first — LIFO). Observable, e.g.,
+   through [Lwt_react.E.limit]'s flush racing a user [on_success]. *)
 let run_resolution_callbacks (type a) (pe : a pending) (r : (a, exn) result) :
     unit =
   (match r with
-  | Error Canceled -> List.iter (fun f -> f ()) (List.rev pe.cancel_waiters)
+  | Error Canceled -> List.iter (fun f -> f ()) pe.cancel_waiters
   | Ok _ | Error _ -> ());
-  List.iter (fun w -> w r) (List.rev pe.waiters)
+  List.iter (fun w -> w r) pe.waiters
 
 let fill_general (type a) ~allow_deferring ~maximum_callback_nesting_depth
     (p : a t) (r : (a, exn) result) : unit =
