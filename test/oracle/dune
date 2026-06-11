@@ -7,8 +7,11 @@
 ;
 ; Disabled by default so the branch stays buildable: flip [enabled_if] to [true]
 ; (or `dune build @test/oracle/all`) to re-measure while doing conformance work.
+
 (library
  (name candidate_lwt)
- (enabled_if false)
- (flags (:standard -alert -all))
+ (enabled_if
+  (>= %{ocaml_version} "5.0"))
+ (flags
+  (:standard -alert -all))
  (libraries lwt_effects))
