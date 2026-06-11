@@ -2,6 +2,15 @@
 
 ====== Additions ======
 
+  * The Lwt core (module Lwt) is reimplemented over OCaml 5 effects, behind
+    the unchanged lwt.mli: existing code, including the ppx and Lwt_react,
+    runs unchanged (the whole historical test suite passes identically).
+    Promises have no proxy indirection on the common paths, which makes bind
+    chains substantially faster (resolved binds ~2x, suspended bind chains up
+    to ~15x, with 2-3x fewer allocations); tail-recursive bind loops remain
+    O(1) in live memory. Lwt_main.run drives the core's run-queue scheduler,
+    which is also the substrate for direct-style layers. Requires OCaml >= 5.
+
   * lwt_uring: a new optional, Linux-only package providing an io_uring-based
     Lwt_engine and completion-based I/O. Installing it ([Lwt_uring.set ()])
     transparently routes Lwt_unix read/write — including the bigarray path used
