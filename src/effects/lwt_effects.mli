@@ -204,8 +204,9 @@ val to_lwt : 'a t -> 'a Lwt.t
 (** State of a promise, as in {!Lwt.state}. *)
 type 'a state = Return of 'a | Fail of exn | Sleep
 
-type 'a u
-(** A resolver for a pending promise (as {!Lwt.u}). *)
+type -'a u
+(** A resolver for a pending promise. Contravariant, like {!Lwt.u} (a resolver
+    only consumes values). *)
 
 val wait : unit -> 'a t * 'a u
 val task : unit -> 'a t * 'a u
@@ -310,4 +311,13 @@ module Private : sig
   val new_pending : unit -> 'a t
   val fill : 'a t -> ('a, exn) result -> unit
   val set_on_cancel : 'a t -> (unit -> unit) -> unit
+
+  (** Fiber-local storage internals (the shape of
+      [Lwt.Private.Sequence_associated_storage]). *)
+  type storage
+
+  val get_from_storage : 'a key -> storage -> 'a option
+  val modify_storage : 'a key -> 'a option -> storage -> storage
+  val empty_storage : storage
+  val current_storage : storage ref
 end
