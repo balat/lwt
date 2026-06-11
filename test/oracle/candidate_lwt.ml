@@ -29,10 +29,19 @@ let wrap7 f = fun a b c d e g h -> (try return (f a b c d e g h) with ex -> fail
 
 external reraise : exn -> 'a = "%reraise"
 
-(* Lwt's [async] is fire-and-forget ([(unit -> unit t) -> unit]); rejections go
-   to [async_exception_hook]. Shadows the effect core's promise-returning
-   [async]. *)
-let async (f : unit -> unit t) : unit = dont_wait f (fun e -> !async_exception_hook e)
+(* Lwt's [async] is fire-and-forget ([(unit -> unit t) -> unit]) and runs [f ()]
+   {e immediately} on the caller's stack (its callbacks register before the
+   caller's next action — tests rely on this); a synchronous raise or a rejection
+   goes to [async_exception_hook]. Shadows the effect core's fiber-spawning,
+   promise-returning [async]. *)
+let async (f : unit -> unit t) : unit =
+  let p = try f () with e when Exception_filter.run e -> fail e in
+  on_failure p (fun e -> !async_exception_hook e)
+
+(* Same immediate-run semantics for [dont_wait], with a user handler. *)
+let dont_wait (f : unit -> unit t) (handler : exn -> unit) : unit =
+  let p = try f () with e when Exception_filter.run e -> fail e in
+  on_failure p handler
 
 (* The tracing/backtrace variants take location metadata (name, line, an
    exception-rewriting function) and otherwise delegate to the plain combinators:
@@ -42,25 +51,19 @@ let backtrace_catch _name _line _add_loc f h = catch f h
 let backtrace_finalize _name _line _add_loc f g = finalize f g
 let backtrace_try_bind _name _line _add_loc f g h = try_bind f g h
 
-let wakeup_result u r =
-  match r with Ok v -> wakeup u v | Error e -> wakeup_exn u e
+(* The resolvers, reporting double resolution under Lwt's own function names. *)
+let wakeup u v = Lwt_effects.Private.wakeup_named "Lwt.wakeup" u (Ok v)
+let wakeup_exn u e = Lwt_effects.Private.wakeup_named "Lwt.wakeup_exn" u (Error e)
+let wakeup_later u v = Lwt_effects.Private.wakeup_named "Lwt.wakeup_later" u (Ok v)
+
+let wakeup_later_exn u e =
+  Lwt_effects.Private.wakeup_named "Lwt.wakeup_later_exn" u (Error e)
+
+let wakeup_result u r = Lwt_effects.Private.wakeup_named "Lwt.wakeup_result" u r
 
 let wakeup_later_result u r =
-  match r with Ok v -> wakeup_later u v | Error e -> wakeup_later_exn u e
+  Lwt_effects.Private.wakeup_named "Lwt.wakeup_later_result" u r
 
-(* Approximation: cancellation isolation is not fully modelled yet. *)
-let wrap_in_cancelable p = p
-
-(* [nchoose_split ps] resolves once at least one of [ps] has, with the values of
-   the currently-resolved promises and the list of those still pending. *)
-let nchoose_split ps =
-  Lwt_effects.async (fun () ->
-    ignore (Direct.await (choose ps));
-    let resolved =
-      List.filter_map (fun p -> match state p with Return v -> Some v | _ -> None) ps
-    in
-    let pending = List.filter is_sleeping ps in
-    return (resolved, pending))
 
 (* ------------------------------------------------------------------ *)
 (* Conformance batch 2: ppx syntax, task/sequence, exception filter,   *)
@@ -103,19 +106,6 @@ let add_task_l seq =
   on_cancel p (fun () -> Lwt_sequence.remove node);
   p
 
-module Exception_filter = struct
-  type t = exn -> bool
-
-  let handle_all : t = fun _ -> true
-  let handle_all_except_runtime : t = function
-    | Out_of_memory | Stack_overflow -> false
-    | _ -> true
-
-  let current = ref handle_all
-  let set t = current := t
-  let run e = !current e
-end
-
 (* Tracing is a no-op here (the effect core does not emit Lwt's span events). *)
 let with_tracing_context _name f = f ()
 
@@ -126,13 +116,9 @@ let debug_state_is expected p =
      | Return _, Return _ | Fail _, Fail _ | Sleep, Sleep -> true
      | _ -> false)
 
-(* Lwt_main pause/wakeup internals. The effect scheduler has its own run queue
-   and idle loop, so these are shims (Lwt_main integration is a later concern). *)
-let wakeup_paused () = ()
-let paused_count () = 0
-let register_pause_notifier _f = ()
-let abandon_paused () = ()
-let abandon_wakeups () = ()
+(* The pause protocol comes from the effect core (real implementation).
+   [abandon_wakeups] also drops the paused queue, as Lwt's does. *)
+let abandon_wakeups () = abandon_paused ()
 
 (* Lwt's [Private]: the storage internals (backed by the effect core's own
    fiber-local storage) and the tracing-context key. Shadows the effect core's

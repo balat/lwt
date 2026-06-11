@@ -1,0 +1,39 @@
+(* Prelude prepended to test/test.ml (the tester) so that it drives the
+   effect-backed candidate instead of the real Lwt:
+   - [Lwt] is the candidate (constrained by the unchanged lwt.mli);
+   - [Lwt_main.run] bridges to the effect scheduler through the candidate's
+     PUBLIC API only ([on_any]) — promise machinery and scheduler are the same
+     global lwt_effects instance, so resolving [p] wakes the bridge;
+   - [Lwt_list] provides the two functions the tester uses. *)
+
+module Lwt = Candidate_lwt
+
+module Lwt_main = struct
+  let run p =
+    Lwt_effects.run (fun () ->
+      let q, r = Lwt_effects.wait () in
+      Candidate_lwt.on_any p
+        (fun v -> Lwt_effects.wakeup r v)
+        (fun e -> Lwt_effects.wakeup_exn r e);
+      q)
+end
+
+module Lwt_list = struct
+  let map_s f l =
+    let rec go = function
+      | [] -> Lwt.return []
+      | x :: xs ->
+        Lwt.bind (f x) (fun y -> Lwt.bind (go xs) (fun ys -> Lwt.return (y :: ys)))
+    in
+    go l
+
+  (* Start everything first (bind is non-blocking), then collect in order. *)
+  let map_p f l =
+    let ps = List.map f l in
+    let rec go = function
+      | [] -> Lwt.return []
+      | p :: ps ->
+        Lwt.bind p (fun y -> Lwt.bind (go ps) (fun ys -> Lwt.return (y :: ys)))
+    in
+    go ps
+end
