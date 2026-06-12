@@ -1532,7 +1532,11 @@ type completion_io = {
     [on_close] is called when Lwt_unix closes a descriptor, so the backend
     can release per-descriptor state (e.g. cancel an armed multishot accept,
     which holds a kernel reference to the socket and would shadow a later
-    descriptor reusing the same number). *)
+    descriptor reusing the same number).
+
+    (Routing the close(2) itself through the backend was tried and measured
+    slower: the worker pool performs it on another core, in parallel with the
+    event loop.) *)
 
 val fd_kind : file_descr -> Unix.file_kind
 (** [fd_kind fd] is the [Unix.fstat] kind of [fd] (whether it is a socket, a
