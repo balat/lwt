@@ -579,6 +579,42 @@ let both (a : 'a t) (b : 'b t) : ('a * 'b) t =
     settle ());
   result
 
+(* Removable waiters (Lwt's "explicitly removable callbacks"). One shared cell
+   holds [f]; a small wrapper is added to every promise in [ps]. The first
+   resolution runs [f] once and REMOVES the wrapper from the still-pending
+   promises, dropping [f] and its captures. Without this, a long-lived promise
+   repeatedly passed to [choose]/[pick] (e.g. a server's shutdown promise, one
+   pick per request/connection) accumulates dead waiters without bound — the
+   leak classic Lwt prevents with [clear_explicitly_removable_callback_cell].
+   Returns the remover, for mirrors ([protected]) that must detach on
+   cancellation; calling it after the waiter fired is a no-op. *)
+let add_removable_waiter_to_each_of (ps : 'a t list)
+    (f : ('a, exn) result -> unit) : unit -> unit =
+  let cell = ref (Some f) in
+  let rec wrapper r =
+    match !cell with
+    | None -> ()
+    | Some f ->
+      remove ();
+      f r
+  and remove () =
+    match !cell with
+    | None -> ()
+    | Some _ ->
+      cell := None;
+      (* The promise being resolved is no longer [Pending], so this never
+         mutates a waiter list while [run_resolution_callbacks] iterates it. *)
+      List.iter
+        (fun p ->
+          match (prj p).st with
+          | Pending pe ->
+            pe.waiters <- List.filter (fun w -> w != wrapper) pe.waiters
+          | Fulfilled _ | Rejected _ -> ())
+        ps
+  in
+  List.iter (fun p -> add_waiter p wrapper) ps;
+  remove
+
 (* Among already-resolved promises, Lwt's [choose]/[pick] prefer a {e rejection};
    with several fulfilled and none rejected, one is chosen at random (fairness,
    as Lwt). The [Invalid_argument] messages use Lwt's wording: this core is meant
@@ -606,8 +642,11 @@ let choose (ps : 'a t list) : 'a t =
   | None ->
     let result = new_pending () in
     set_cancel_forward_list result ps;
-    (* [fill] is a no-op on an already-filled promise: first resolution wins. *)
-    List.iter (fun p -> add_waiter p (fun r -> fill result r)) ps;
+    (* The removable waiter fires once (first resolution wins) and detaches
+       from the losers, so they don't retain a dead waiter. *)
+    let (_ : unit -> unit) =
+      add_removable_waiter_to_each_of ps (fun r -> fill result r)
+    in
     result
 
 let pick (ps : 'a t list) : 'a t =
@@ -620,22 +659,16 @@ let pick (ps : 'a t list) : 'a t =
   | None ->
     let result = new_pending () in
     set_cancel_forward_list result ps;
-    (* [settling] keeps the losers' own waiters (fired by the cancellations
-       below) from resolving [result] before the winner's value does. *)
-    let settling = ref false in
-    List.iter
-      (fun p ->
-        add_waiter p (fun r ->
-          if not !settling then
-            match (prj result).st with
-            | Pending _ ->
-              settling := true;
-              (* Cancel the losers BEFORE resolving the result, so their
-                 cancellation callbacks run first (Lwt's ordering). *)
-              List.iter (fun q -> if q != p then cancel q) ps;
-              fill result r
-            | Fulfilled _ | Rejected _ -> ()))
-      ps;
+    (* By the time the waiter runs it has detached from the losers, so the
+       cancellations below cannot re-enter it; the winner is already resolved,
+       so cancelling the whole list only reaches the losers. Cancel BEFORE
+       resolving the result, so the losers' cancellation callbacks run first
+       (Lwt's ordering). *)
+    let (_ : unit -> unit) =
+      add_removable_waiter_to_each_of ps (fun r ->
+        List.iter cancel ps;
+        fill result r)
+    in
     result
 
 (* ------------------------------------------------------------------ *)
@@ -922,13 +955,12 @@ let nchoose (ps : 'a t list) : 'a list t =
   else begin
     let result = new_pending () in
     set_cancel_forward_list result ps;
-    List.iter
-      (fun p ->
-        add_waiter p (fun _ ->
-          match (prj result).st with
-          | Pending _ -> fill result (nchoose_result ps)
-          | Fulfilled _ | Rejected _ -> ()))
-      ps;
+    (* Fires once on the first resolution, snapshotting the fulfilled ones,
+       and detaches from the still-pending promises. *)
+    let (_ : unit -> unit) =
+      add_removable_waiter_to_each_of ps (fun _ ->
+        fill result (nchoose_result ps))
+    in
     result
   end
 
@@ -953,13 +985,9 @@ let nchoose_split (type a) (ps : a t list) : (a list * a t list) t =
   else begin
     let result = new_pending () in
     set_cancel_forward_list result ps;
-    List.iter
-      (fun p ->
-        add_waiter p (fun _ ->
-          match (prj result).st with
-          | Pending _ -> fill result (snapshot ())
-          | Fulfilled _ | Rejected _ -> ()))
-      ps;
+    let (_ : unit -> unit) =
+      add_removable_waiter_to_each_of ps (fun _ -> fill result (snapshot ()))
+    in
     result
   end
 
@@ -979,19 +1007,15 @@ let npick (ps : 'a t list) : 'a list t =
   else begin
     let result = new_pending () in
     set_cancel_forward_list result ps;
-    let settling = ref false in
-    List.iter
-      (fun p ->
-        add_waiter p (fun _ ->
-          if not !settling then
-            match (prj result).st with
-            | Pending _ ->
-              settling := true;
-              let r = nchoose_result ps in
-              cancel_pending ();
-              fill result r
-            | Fulfilled _ | Rejected _ -> ()))
-      ps;
+    (* Detached from the losers before it runs, so [cancel_pending] cannot
+       re-enter it. Snapshot before cancelling: the cancellations must not
+       become the result. *)
+    let (_ : unit -> unit) =
+      add_removable_waiter_to_each_of ps (fun _ ->
+        let r = nchoose_result ps in
+        cancel_pending ();
+        fill result r)
+    in
     result
   end
 
@@ -1081,10 +1105,13 @@ let protected (type a) (p : a t) : a t =
   match (prj p).st with
   | Fulfilled _ | Rejected _ -> p
   | Pending _ ->
-    (* Default [Cancel_self ignore]: cancelable, leaves [p] untouched; a later
-       resolution of [p] is absorbed by [fill]'s no-op on resolved. *)
+    (* Cancelable, leaves [p] untouched. The mirror waiter is removable:
+       cancelling the mirror detaches it from [p], so repeated
+       [protected]+[cancel] against a long-lived [p] does not accumulate dead
+       waiters. *)
     let result = new_pending () in
-    add_waiter p (fun r -> fill result r);
+    let remove = add_removable_waiter_to_each_of [ p ] (fun r -> fill result r) in
+    set_on_cancel result remove;
     result
 
 (* [wrap_in_cancelable p] mirrors [p] and is cancelable even if [p] is not:
@@ -1095,8 +1122,13 @@ let wrap_in_cancelable (type a) (p : a t) : a t =
   | Fulfilled _ | Rejected _ -> p
   | Pending _ ->
     let result = new_pending () in
-    set_on_cancel result (fun () -> cancel p);
-    add_waiter p (fun r -> fill result r);
+    let remove = add_removable_waiter_to_each_of [ p ] (fun r -> fill result r) in
+    (* Cancel [p] first (if it is cancelable, its rejection flows into the
+       mirror through the still-attached waiter, as before); then detach, so a
+       non-cancelable long-lived [p] is not left holding a dead waiter. *)
+    set_on_cancel result (fun () ->
+      cancel p;
+      remove ());
     result
 
 (* ------------------------------------------------------------------ *)
