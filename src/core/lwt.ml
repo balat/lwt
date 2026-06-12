@@ -675,13 +675,21 @@ let abandon_paused () =
 (* The scheduler loop                                                 *)
 (* ------------------------------------------------------------------ *)
 
-(* Idle-wait hook: called when the run queue is empty, to block until external
-   work arrives. Returns [true] if it may have produced new work (the loop
+(* Idle-wait hook: called when the run queue is empty, to advance the world by
+   exactly one lap. Returns [true] if it may have produced new work (the loop
    continues), [false] if there is nothing left to wait for (scheduler is done).
    A backend ([Lwt_main], driving [Lwt_engine]) installs its own with
-   [set_idle]. The bare core has no event source: with nothing to block on, an
-   empty run queue means the scheduler is done. *)
-let core_idle () : bool = false
+   [set_idle]; it serves one paused batch per lap, interleaved with one engine
+   iteration, mirroring classic Lwt's loop (see [Lwt_main.run]).
+
+   The bare core has no event source, so a lap is just one paused batch: serve
+   it and report progress, otherwise — empty run queue, no pauses — the
+   scheduler is done. Serving pauses one batch per lap (rather than draining
+   every pause generation between laps) is what keeps a backend's engine
+   iterations from starving under a sustained stream of pauses. *)
+let core_idle () : bool =
+  if !paused_n > 0 then begin wakeup_paused (); true end
+  else false
 
 (* Run at the start of [run] to reset back-end state (e.g. the I/O readiness
    table) that must not leak across independent scheduler runs. *)
@@ -692,13 +700,12 @@ let set_idle (f : unit -> bool) : unit = idle_hook := f
 
 let rec run_scheduler () : unit =
   if Run_queue.is_empty run_queue then begin
-    (* Serve the paused promises first: a [pause] resolves on the next tick,
-       before the scheduler blocks in the engine (whatever the idle backend). *)
-    if !paused_n > 0 then begin
-      wakeup_paused ();
-      run_scheduler ()
-    end
-    else if !idle_hook () then run_scheduler ()
+    (* Run queue drained: advance the world by one lap through the idle hook.
+       The hook serves at most one paused batch (and, for a backend, one engine
+       iteration) before returning here — so under a sustained stream of pauses
+       the engine still runs once per batch instead of after the whole pause
+       cascade settles. Returns [false] only when there is nothing left to do. *)
+    if !idle_hook () then run_scheduler ()
   end
   else begin
     (match Run_queue.pop run_queue with
