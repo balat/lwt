@@ -73,11 +73,15 @@
  (name lwt_uring)
  (version 6.0.0)
  (synopsis "io_uring-based engine for Lwt (Linux only)")
+ ; NOTE: requires ocaml-uring with multishot-accept support (accept_multishot,
+ ; the completion [more]/F_MORE flag, file_descr_of_accept_result) — a patch
+ ; on ocaml-uring 2.7.0 (branch "multishot-accept"), to be upstreamed; pin it
+ ; until then.
  (depends
   (ocaml (>= 4.14))
   base-unix
   (lwt (>= 6))
-  (uring (>= 0.9))))
+  (uring (>= 2.7))))
 
 (package
  (name lwt_runtime_events)
