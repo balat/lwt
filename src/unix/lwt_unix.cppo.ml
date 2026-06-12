@@ -603,10 +603,18 @@ let openfile name flags perms =
 
 external close_job : Unix.file_descr -> unit job = "lwt_unix_close_job"
 
+(* Notification to the completion-based I/O backend (see [completion_io]
+   below) that a descriptor is being closed, so it can release per-descriptor
+   state — e.g. cancel an armed multishot accept, which would otherwise keep a
+   kernel reference to the socket alive and shadow a later descriptor with the
+   same number. Synced by [set_completion_io]. *)
+let completion_close_hook : (Unix.file_descr -> unit) ref = ref ignore
+
 let close ch =
   if ch.state = Closed then check_descriptor ch;
   set_state ch Closed;
   clear_events ch;
+  !completion_close_hook ch.fd;
   if Sys.win32 then
     Lwt.return (Unix.close ch.fd)
   else
@@ -632,11 +640,23 @@ type completion_io = {
   read_bigarray : file_descr -> bigarray -> int -> int -> int Lwt.t option;
   write_bigarray : file_descr -> bigarray -> int -> int -> int Lwt.t option;
   connect : file_descr -> Unix.sockaddr -> unit Lwt.t option;
+  accept : file_descr -> (Unix.file_descr * Unix.sockaddr) Lwt.t option;
+  (* The back end accepts on the given listening descriptor and returns the
+     accepted descriptor — already non-blocking and without close-on-exec
+     (Lwt's defaults) — with the peer address. [None] declines (back end not
+     available, or unsupported); the default readiness path is used. *)
+  on_close : Unix.file_descr -> unit;
+  (* Called when Lwt_unix closes a descriptor: release any per-descriptor
+     backend state (cancel an armed multishot accept, drop queued accepted
+     connections). *)
 }
 
 let completion_io : completion_io option ref = ref None
 
-let set_completion_io backend = completion_io := backend
+let set_completion_io backend =
+  completion_io := backend;
+  completion_close_hook :=
+    (match backend with Some io -> io.on_close | None -> ignore)
 
 let wait_read ch =
   Lwt.catch
@@ -1745,7 +1765,19 @@ let accept_and_set_nonblock ?cloexec ch_fd =
     (mk_ch ~blocking:false fd, addr)
 
 let accept ?cloexec ch =
-  wrap_syscall Read ch (fun _ -> accept_and_set_nonblock ?cloexec ch.fd)
+  let default () =
+    wrap_syscall Read ch (fun _ -> accept_and_set_nonblock ?cloexec ch.fd)
+  in
+  (* The completion back end accepts with Lwt's default flags (non-blocking,
+     no close-on-exec): only take over when the caller wants exactly that. *)
+  match cloexec, ch.state, !completion_io with
+  | (None | Some false), Opened, Some io -> (
+    match io.accept ch with
+    | Some p ->
+      Lwt.bind p (fun (fd, addr) ->
+        Lwt.return (mk_ch ~blocking:false ~set_flags:false fd, addr))
+    | None -> default ())
+  | _ -> default ()
 
 let accept_n ?cloexec ch n =
   let l = ref [] in

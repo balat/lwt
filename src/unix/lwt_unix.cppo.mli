@@ -1511,6 +1511,8 @@ type completion_io = {
     (char, Bigarray.int8_unsigned_elt, Bigarray.c_layout) Bigarray.Array1.t ->
     int -> int -> int Lwt.t option;
   connect : file_descr -> Unix.sockaddr -> unit Lwt.t option;
+  accept : file_descr -> (Unix.file_descr * Unix.sockaddr) Lwt.t option;
+  on_close : Unix.file_descr -> unit;
 }
 (** A completion-based I/O backend (e.g. io_uring), installed by a library such
     as [lwt_uring]. Each function may return [Some promise] to perform the
@@ -1519,9 +1521,18 @@ type completion_io = {
     taken by {!Lwt_io} (and hence most higher-level libraries).
 
     [connect] resolves once the connection completes (or fails); it is only
-    consulted for sockets. ([accept] is intentionally not part of this hook:
-    routing single-shot [accept] through completion measured slower than the
-    readiness path, which already runs on the io_uring engine.) *)
+    consulted for sockets.
+
+    [accept] resolves with an accepted connection on the given listening
+    descriptor; the accepted descriptor must already be non-blocking and
+    without close-on-exec (Lwt's defaults — the hook is only consulted when
+    the caller wants those). A backend typically implements it with a
+    multishot accept.
+
+    [on_close] is called when Lwt_unix closes a descriptor, so the backend
+    can release per-descriptor state (e.g. cancel an armed multishot accept,
+    which holds a kernel reference to the socket and would shadow a later
+    descriptor reusing the same number). *)
 
 val fd_kind : file_descr -> Unix.file_kind
 (** [fd_kind fd] is the [Unix.fstat] kind of [fd] (whether it is a socket, a
