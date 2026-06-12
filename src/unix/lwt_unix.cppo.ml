@@ -2131,12 +2131,37 @@ type getaddrinfo_option =
 
 external getaddrinfo_job : string -> string -> Unix.getaddrinfo_option list -> Unix.addr_info list job = "lwt_unix_getaddrinfo_job"
 
+(* A numeric host (parsed by [inet_addr_of_string]) with an all-digits (or
+   empty) service resolves without consulting DNS: adding [AI_NUMERICHOST]
+   (a no-op on an already-numeric input) guarantees it, and the libc parses
+   an all-digits service directly (no name-service lookup either). The call
+   therefore cannot block and needs no worker-pool job. This is the common
+   case of every client connecting by IP:port — e.g. an HTTP client doing one
+   resolution per connection otherwise pays a thread round-trip per
+   request. *)
+let getaddrinfo_numeric_fast_path host service opts =
+  let numeric_host =
+    host <> "" && (match Unix.inet_addr_of_string host with
+                   | (_ : Unix.inet_addr) -> true
+                   | exception _ -> false)
+  in
+  let numeric_service =
+    service = "" || String.for_all (fun c -> c >= '0' && c <= '9') service
+  in
+  if numeric_host && numeric_service then
+    Some (Unix.getaddrinfo host service (Unix.AI_NUMERICHOST :: opts))
+  else
+    None
+
 let getaddrinfo host service opts =
   if Sys.win32 then
     Lwt.return (Unix.getaddrinfo host service opts)
   else
-    run_job (getaddrinfo_job host service opts) >>= fun l ->
-    Lwt.return (List.rev l)
+    match getaddrinfo_numeric_fast_path host service opts with
+    | Some result -> Lwt.return result
+    | None ->
+      run_job (getaddrinfo_job host service opts) >>= fun l ->
+      Lwt.return (List.rev l)
 
 type name_info =
   Unix.name_info =
