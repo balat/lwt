@@ -29,8 +29,26 @@ type req =
   | Io of (int -> unit)
       (* A completion-based I/O submission (read/write/...). The handler is
          called with the syscall result (negative for an errno). *)
+  | Accept of accept_stream
+      (* A multishot accept on a listening socket: ONE submission, one
+         completion per accepted connection (no syscall per accept). *)
   | Cancel
       (* Completion of an [Uring.cancel] submission; nothing to do. *)
+
+(* Multishot-accept state of one listening socket. Accepted descriptors are
+   handed to waiting [Lwt_unix.accept] callers (FIFO), or queued until one
+   arrives — they were going to be accepted anyway, the kernel merely got
+   ahead. Cancelled waiters are skipped via [Lwt.is_sleeping] on their
+   promise. *)
+and accept_stream = {
+  ls_fd : Unix.file_descr; (* the listening socket *)
+  mutable armed : req U.job option; (* the in-flight multishot, if any *)
+  accepted : Unix.file_descr Queue.t; (* accepted, not yet claimed *)
+  acceptors :
+    ((Unix.file_descr * Unix.sockaddr) Lwt.t
+    * (Unix.file_descr * Unix.sockaddr) Lwt.u)
+    Queue.t; (* waiting accept calls *)
+}
 
 and poll_req = {
   fd : Unix.file_descr;
@@ -84,7 +102,59 @@ let cancel ring job =
   with Invalid_argument _ -> ()
   (* The job was already collected — nothing to cancel. *)
 
-let dispatch ring result data =
+(* ---- multishot accept ---- *)
+
+(* Set to [false] when the kernel rejects a multishot accept (EINVAL: Linux
+   < 5.19): the back end then declines and Lwt_unix uses its readiness path. *)
+let multishot_supported = ref true
+
+(* One stream per listening descriptor, created at the first hooked accept and
+   torn down when the engine is destroyed (or on accept error). *)
+let accept_streams : (Unix.file_descr, accept_stream) Hashtbl.t =
+  Hashtbl.create 8
+
+let arm_accept ring str =
+  str.armed <-
+    Some
+      (submit ring (Accept str) (fun ring data ->
+           U.accept_multishot ~cloexec:false ~nonblock:true ring str.ls_fd data))
+
+(* Hand [fd] to the first still-waiting acceptor, or queue it. The peer
+   address comes from [getpeername] (a multishot accept collects none). If the
+   peer already vanished (ENOTCONN race), drop the connection and keep the
+   waiter for the next one — the readiness path would never have seen that
+   connection either. *)
+let deliver_accepted str fd =
+  match Unix.getpeername fd with
+  | exception Unix.Unix_error (_, _, _) -> (try Unix.close fd with _ -> ())
+  | addr ->
+    let rec wake () =
+      match Queue.take_opt str.acceptors with
+      | None -> Queue.push fd str.accepted
+      | Some (p, r) ->
+        if Lwt.is_sleeping p then Lwt.wakeup_later r (fd, addr) else wake ()
+    in
+    wake ()
+
+(* A real accept error: fail the current waiters (the stream is disarmed by
+   the caller and re-armed lazily by the next accept call). *)
+let reject_acceptors str exn =
+  Queue.iter
+    (fun (p, r) -> if Lwt.is_sleeping p then Lwt.wakeup_later_exn r exn)
+    str.acceptors;
+  Queue.clear str.acceptors
+
+let teardown_accept_streams () =
+  Hashtbl.iter
+    (fun _ str ->
+      Queue.iter (fun fd -> try Unix.close fd with _ -> ()) str.accepted;
+      Queue.clear str.accepted;
+      reject_acceptors str Lwt.Canceled;
+      str.armed <- None)
+    accept_streams;
+  Hashtbl.reset accept_streams
+
+let dispatch ring result more data =
   match data with
   | Cancel -> ()
   | Io handler -> handler result
@@ -100,6 +170,35 @@ let dispatch ring result data =
     if tr.t_active then begin
       tr.t_callback ();
       if tr.repeat && tr.t_active then submit_timer ring tr
+    end
+  | Accept str ->
+    if not more then str.armed <- None;
+    (* The stream is live iff it is still the table entry for its descriptor
+       (physical equality: after a close the number may already name a new
+       listener with its own stream). Late completions for a dead stream must
+       not deliver or re-arm. *)
+    let live =
+      match Hashtbl.find_opt accept_streams str.ls_fd with
+      | Some s -> s == str
+      | None -> false
+    in
+    if result >= 0 then begin
+      let fd = U.file_descr_of_accept_result result in
+      if live then begin
+        deliver_accepted str fd;
+        (* [more = false] on a success means the operation stopped (e.g. CQ
+           pressure): re-arm so the stream keeps accepting. *)
+        if not more then arm_accept ring str
+      end
+      else try Unix.close fd with _ -> ()
+    end
+    else if result <> -125 (* ECANCELED: stream torn down, nothing to do *)
+            && live
+    then begin
+      let error = U.error_of_errno result in
+      if error = Unix.EINVAL then multishot_supported := false;
+      Hashtbl.remove accept_streams str.ls_fd;
+      reject_acceptors str (Unix.Unix_error (error, "accept", ""))
     end
 
 (* The ring of the currently-installed io_uring engine, if any. It is used by
@@ -120,6 +219,7 @@ class uring ?(queue_depth = 256) () = object
 
   method private cleanup =
     (match !the_ring with Some r when r == ring -> the_ring := None | _ -> ());
+    teardown_accept_streams ();
     U.exit ring
 
   method private register_readable fd f =
@@ -155,12 +255,14 @@ class uring ?(queue_depth = 256) () = object
        nothing outstanding there is nothing to wait for, so we never block. *)
     if block && U.active_ops ring > 0 then begin
       match U.wait ring with
-      | U.Some { result; data } -> dispatch ring result data
+      | U.Some { result; data; more } -> dispatch ring result more data
       | U.None -> ()
     end;
     let rec drain () =
       match U.get_cqe_nonblocking ring with
-      | U.Some { result; data } -> dispatch ring result data; drain ()
+      | U.Some { result; data; more } ->
+        dispatch ring result more data;
+        drain ()
       | U.None -> ()
     in
     drain ()
@@ -329,13 +431,82 @@ let completion_backend : Lwt_unix.completion_io =
         (submit_io "connect" unit_result (fun ring data ->
            U.connect ring fd addr data))
   in
-  (* [accept] is deliberately left on Lwt's default path: under the io_uring
-     engine its readiness already runs on the ring (poll), and routing single-shot
-     IORING_OP_ACCEPT measured slower (the op forces SOCK_CLOEXEC, needing a
-     compensating fcntl, and sequential accepts do not batch).
-     Possible improvement: a multishot accept (IORING_OP_ACCEPT_MULTI, not in the
-     [uring] API surface used here) would batch and might flip that verdict. *)
-  { Lwt_unix.read; write; read_bigarray; write_bigarray; connect }
+  (* [accept] uses a MULTISHOT accept (IORING_OP_ACCEPT +
+     IORING_ACCEPT_MULTISHOT, Linux >= 5.19): one submission per listening
+     socket, one completion per accepted connection — no submission, no
+     accept(2) and no fcntl per accept (the kernel applies SOCK_NONBLOCK and
+     Lwt's no-cloexec default directly). Routing the SINGLE-shot accept had
+     measured slower (forced SOCK_CLOEXEC needing a compensating fcntl, no
+     batching); multishot removes both objections. On kernels without
+     multishot support the first completion is EINVAL: the back end then
+     declines for good and Lwt_unix falls back to its readiness path. *)
+  let accept ch =
+    match !the_ring with
+    | None -> None
+    | Some ring ->
+      if not !multishot_supported then None
+      else begin
+        let fd = Lwt_unix.unix_file_descr ch in
+        let str =
+          match Hashtbl.find_opt accept_streams fd with
+          | Some str -> str
+          | None ->
+            let str =
+              {
+                ls_fd = fd;
+                armed = None;
+                accepted = Queue.create ();
+                acceptors = Queue.create ();
+              }
+            in
+            Hashtbl.add accept_streams fd str;
+            str
+        in
+        if str.armed = None then arm_accept ring str;
+        match Queue.take_opt str.accepted with
+        | Some afd -> (
+          match Unix.getpeername afd with
+          | addr -> Some (Lwt.return (afd, addr))
+          | exception Unix.Unix_error (_, _, _) ->
+            (* The peer vanished while queued: drop it and wait for the next
+               connection like the readiness path would. *)
+            (try Unix.close afd with _ -> ());
+            let p, r = Lwt.task () in
+            Queue.push (p, r) str.acceptors;
+            Some p)
+        | None ->
+          let p, r = Lwt.task () in
+          Queue.push (p, r) str.acceptors;
+          Some p
+      end
+  in
+  (* The descriptor is being closed: tear its accept stream down NOW. The
+     armed multishot holds a kernel reference to the socket (it would keep
+     accepting after the close), and the table entry would shadow a later
+     descriptor reusing the same number. *)
+  let on_close fd =
+    match Hashtbl.find_opt accept_streams fd with
+    | None -> ()
+    | Some str ->
+      Hashtbl.remove accept_streams fd;
+      (match !the_ring, str.armed with
+      | Some ring, Some job ->
+        str.armed <- None;
+        cancel ring job
+      | _ -> str.armed <- None);
+      Queue.iter (fun afd -> try Unix.close afd with _ -> ()) str.accepted;
+      Queue.clear str.accepted;
+      reject_acceptors str (Unix.Unix_error (Unix.EBADF, "accept", ""))
+  in
+  {
+    Lwt_unix.read;
+    write;
+    read_bigarray;
+    write_bigarray;
+    connect;
+    accept;
+    on_close;
+  }
 
 let () = Lwt_unix.set_completion_io (Some completion_backend)
 
