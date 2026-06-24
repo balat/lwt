@@ -755,13 +755,40 @@ let run (type a) (main : unit -> a t) : a =
   !on_reset ();
   current_storage := empty_storage;
   let outcome = ref None in
+  (* When the main fiber escapes with a synchronous exception (direct style: a
+     [raise]/[failwith] or an [await] on a rejected promise propagates up the
+     fiber's native stack), capture its raw backtrace here, at the boundary, so we
+     can re-raise it faithfully below with [Printexc.raise_with_backtrace] instead
+     of resetting the trace with a bare [raise]. Without this, the precise fiber
+     stack the effect continuation preserved is discarded on the way out of [run].
+     The monadic path keeps no stack to preserve (each [bind] reboxes the
+     exception into a rejected promise), so it leaves [raw_bt] at [None]. This is
+     off the hot path: [run] is entered once per event-loop run, and the capture
+     only happens on the exception path. *)
+  let raw_bt = ref None in
   spawn (fun () ->
-    let r = try await_result (main ()) with e when Exception_filter.run e -> Error e in
+    let r =
+      try await_result (main ())
+      with e when Exception_filter.run e ->
+        raw_bt := Some (Printexc.get_raw_backtrace ());
+        Error e
+    in
     outcome := Some r);
   run_scheduler ();
   match !outcome with
   | Some (Ok v) -> v
-  | Some (Error e) -> raise e
+  | Some (Error e) ->
+    (* Prefer the backtrace captured synchronously at the boundary (direct-style
+       fiber whose body raised into the [with] above). Otherwise (the fiber was
+       rejected via its own handler — e.g. [Lwt_direct] reboxes into a rejected
+       promise — so [await_result] returned an [Error] value, not a raise) fall
+       back to the runtime's current backtrace buffer, which still holds the
+       fiber's trace. Either way re-raise *with* a backtrace rather than a bare
+       [raise], which would reset it to this point. *)
+    let bt =
+      match !raw_bt with Some bt -> bt | None -> Printexc.get_raw_backtrace ()
+    in
+    Printexc.raise_with_backtrace e bt
   | None ->
     failwith
       "Lwt.Private.scheduler_run: scheduler stalled before the main promise \
