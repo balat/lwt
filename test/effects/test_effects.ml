@@ -15,6 +15,11 @@ let check name cond =
     Printf.printf "FAIL - %s\n" name
   end
 
+let contains ~needle haystack =
+  let nl = String.length needle and hl = String.length haystack in
+  let rec go i = i + nl <= hl && (String.sub haystack i nl = needle || go (i + 1)) in
+  nl = 0 || go 0
+
 (* [return]/[bind] fast path: a long resolved chain. *)
 let () =
   let r =
@@ -123,6 +128,26 @@ let () =
       return (try ignore (Direct.await p); "no" with Failure msg -> "caught:" ^ msg))
   in
   check "direct-style try/await catches rejection" (r = "caught:boom")
+
+(* Regression: a synchronous (direct-style) exception escaping [run] keeps its
+   native backtrace. [run] must re-raise with [raise_with_backtrace], not a bare
+   [raise] that would reset the trace to [run] itself. The fiber frame
+   [bt_regression_level] (below the [run] call site) only appears if the stack the
+   effect continuation preserved is propagated faithfully out of [run]. *)
+let[@inline never] bt_regression_boom () = failwith "bt-regression"
+let[@inline never] bt_regression_level () =
+  Direct.yield ();
+  (* non-tail call so this frame survives on the fiber stack *)
+  let x = bt_regression_boom () in
+  Sys.opaque_identity x
+
+let () =
+  Printexc.record_backtrace true;
+  let bt =
+    try ignore (run (fun () -> return (bt_regression_level ()))); ""
+    with Failure _ -> Printexc.get_backtrace ()
+  in
+  check "direct-style backtrace survives run" (contains ~needle:"bt_regression_level" bt)
 
 (* [choose] resolves with the first promise to complete. *)
 let () =

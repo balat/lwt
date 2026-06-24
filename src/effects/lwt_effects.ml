@@ -434,13 +434,33 @@ let run (type a) (main : unit -> a t) : a =
   !on_reset ();
   current_storage := empty_storage;
   let outcome = ref None in
+  (* When [main]'s fiber escapes with a synchronous exception (direct style: a
+     [raise]/[failwith] or [Direct.await] on a rejected promise propagates up the
+     fiber's native stack), capture its raw backtrace here, at the boundary, so we
+     can re-raise it faithfully below instead of resetting the trace with a bare
+     [raise]. Without this, the precise fiber stack the effect continuation
+     preserved would be discarded on the way out of [run]. The monadic path keeps
+     no stack to preserve (each [bind] reboxes the exception into a rejected
+     promise), so it simply leaves [raw_bt] at [None] and we fall back to the
+     runtime's current backtrace buffer (still holding the fiber's trace, as
+     [reraise] would use). *)
+  let raw_bt = ref None in
   spawn (fun () ->
-    let r = try await_result (main ()) with e -> Error e in
+    let r =
+      try await_result (main ())
+      with e ->
+        raw_bt := Some (Printexc.get_raw_backtrace ());
+        Error e
+    in
     outcome := Some r);
   run_scheduler ();
   match !outcome with
   | Some (Ok v) -> v
-  | Some (Error e) -> raise e
+  | Some (Error e) ->
+    let bt =
+      match !raw_bt with Some bt -> bt | None -> Printexc.get_raw_backtrace ()
+    in
+    Printexc.raise_with_backtrace e bt
   | None -> failwith "Lwt_effects.run: scheduler stalled before main resolved"
 
 module Syntax = struct
