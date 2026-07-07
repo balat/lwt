@@ -65,7 +65,7 @@
  (synopsis "Direct-style control-flow and `await` for Lwt")
  (authors "Simon Cruanes")
  (depends
-  (ocaml (>= 5.0))
+  (ocaml (>= 5.3))
   base-unix
   (lwt (>= 6))))
 
@@ -107,8 +107,8 @@ synchronization primitives. Code can be run in parallel on an opt-in basis.
 ")
  (maintenance_intent "(latest)")
  (depends
-  ; the effect-based core requires OCaml 5
-  (ocaml (>= 5.0))
+  ; the effect-based core uses OCaml 5.3 effect-handler syntax
+  (ocaml (>= 5.3))
   (cppo (and :build (>= 1.1)))
   (ocamlfind (and :dev (>= 1.7.3-1)))
   (odoc (and :with-doc (>= 2.3)))
