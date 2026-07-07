@@ -107,8 +107,9 @@ synchronization primitives. Code can be run in parallel on an opt-in basis.
 ")
  (maintenance_intent "(latest)")
  (depends
-  ; the effect-based core uses OCaml 5.3 effect-handler syntax
-  (ocaml (>= 5.3))
+  ; the lean core uses no OCaml-5 machinery; 4.14 is the oldest version
+  ; exercised by the test suite (older may work, unverified)
+  (ocaml (>= 4.14))
   (cppo (and :build (>= 1.1)))
   (ocamlfind (and :dev (>= 1.7.3-1)))
   (odoc (and :with-doc (>= 2.3)))
