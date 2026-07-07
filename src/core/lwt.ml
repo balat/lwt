@@ -1,7 +1,9 @@
 (* This file is part of Lwt, released under the MIT license. See LICENSE.md for
    details, or visit https://github.com/ocsigen/lwt/blob/master/LICENSE.md. *)
 
-(* Effect-based Lwt core (the in-place core swap, OCaml >= 5).
+(* Lean Lwt core (the in-place core swap, WITHOUT effects — the control
+   experiment for the effect-based core: same promise machinery, same run
+   queue and pause protocol, with the fiber/effect-handler layer removed).
 
    This implementation satisfies the historical lwt.mli unchanged (the only
    addition is a handful of scheduler hooks under [Private], used by
@@ -17,9 +19,10 @@
      promises: [bind] never allocates an intermediate proxy, which is where
      most of the speedup over the historical core comes from.
    - The whole public (monadic) API is callback-based and non-blocking, like
-     the historical Lwt: implicit concurrency is preserved. The effect/fiber
-     machinery (run queue, handler) is engaged by [Private.scheduler_run]
-     (i.e. by [Lwt_main.run]) and is the substrate for direct-style layers.
+     the historical Lwt: implicit concurrency is preserved. The run queue is
+     drained by [Private.scheduler_run] (i.e. by [Lwt_main.run]); direct-style
+     layers ([Lwt_direct]) push their resumptions onto it through
+     [Private.scheduler_enqueue].
    - Attached callbacks run in Lwt's order (most recent first), under Lwt's
      resolution loop (deferral semantics of [wakeup_later], nesting cap). *)
 
@@ -129,9 +132,9 @@ let prj (p : 'a t) : 'a promise = underlying (Public_handle.prj p)
 
 (* Same trick as Lwt (no Obj.magic): each key owns a typed scratch cell, and the
    storage maps a key id to a "refresh" closure that writes the stored value
-   into that cell. The current storage is restored on every fiber resume/start
-   (see [run_scheduler] and the [Await]/[Yield] handler), so a value set with
-   [with_value] survives suspensions and is inherited by spawned fibers. *)
+   into that cell. The current storage is restored before every task the run
+   queue executes (see [run_scheduler]) and around every waiter callback, so a
+   value set with [with_value] survives suspensions. *)
 module Storage_map = Map.Make (Int)
 
 type storage = (unit -> unit) Storage_map.t
@@ -309,13 +312,9 @@ let set_cancel_forward_list (type a b) (result : a t) (ps : b t list) : unit =
 (* Scheduler state                                                    *)
 (* ------------------------------------------------------------------ *)
 
-(* A ready unit of work in the run queue. [Resume] avoids allocating a
-   [fun () -> continue k r] closure for every suspension: the waiter pushes the
-   continuation and its result directly. Each task carries the fiber-local
-   storage to restore before it runs. *)
-type task =
-  | Thunk of storage * (unit -> unit)
-  | Resume : storage * 'b * ('b, unit) Effect.Deep.continuation -> task
+(* A ready unit of work in the run queue. Each task carries the storage to
+   restore before it runs. *)
+type task = Thunk of storage * (unit -> unit)
 
 (* Growable ring buffer used as the run queue. Stdlib.Queue allocates a list
    cell on every push; this allocates only when it has to grow. Capacity is kept
@@ -359,20 +358,6 @@ let enqueue (f : unit -> unit) : unit =
 (* Shared [Ok ()] outcome: events and [pause] all resolve unit promises, so
    there is no need to allocate a fresh [Ok ()] each time. *)
 let ok_unit : (unit, exn) result = Ok ()
-
-(* ------------------------------------------------------------------ *)
-(* Effects                                                            *)
-(* ------------------------------------------------------------------ *)
-
-type _ Effect.t += Await : 'a t -> ('a, exn) result Effect.t
-
-(* Perform [Await] only when actually pending: resolved cases stay
-   allocation-free and never touch the scheduler. *)
-let await_result (type a) (p : a t) : (a, exn) result =
-  match (prj p).st with
-  | Fulfilled v -> Ok v
-  | Rejected e -> Error e
-  | Pending _ -> Effect.perform (Await p)
 
 (* ------------------------------------------------------------------ *)
 (* Constructors and combinators                                       *)
@@ -515,23 +500,6 @@ let try_bind (f : unit -> 'a t) (g : 'a -> 'b t) (h : exn -> 'b t) : 'b t =
     result
 
 let catch (f : unit -> 'a t) (h : exn -> 'a t) : 'a t = try_bind f return h
-
-(* ------------------------------------------------------------------ *)
-(* Running fibers                                                     *)
-(* ------------------------------------------------------------------ *)
-
-(* Start [body] as a fresh fiber under the effect handler, using the OCaml 5.3+
-   [match … with effect] syntax. On [Await] the fiber suspends and registers a
-   waiter that re-enqueues the continuation once the awaited promise resolves.
-   An exception escaping [body] propagates out of the match (formerly
-   [exnc = raise]); the [() -> ()] arm is the former [retc]. *)
-let spawn (body : unit -> unit) : unit =
-  enqueue (fun () ->
-    match body () with
-    | () -> ()
-    | effect Await p, k ->
-      let s = !current_storage in
-      add_waiter p (fun r -> Run_queue.push run_queue (Resume (s, r, k))))
 
 (* Lwt's [both] waits for {e both} promises even when one is already rejected
    (the result stays pending until the other resolves), then rejects with the
@@ -735,10 +703,7 @@ let rec run_scheduler () : unit =
     (match Run_queue.pop run_queue with
     | Thunk (s, f) ->
       current_storage := s;
-      f ()
-    | Resume (s, v, k) ->
-      current_storage := s;
-      Effect.Deep.continue k v);
+      f ());
     run_scheduler ()
   end
 
@@ -746,36 +711,34 @@ let run (type a) (main : unit -> a t) : a =
   !on_reset ();
   current_storage := empty_storage;
   let outcome = ref None in
-  (* When the main fiber escapes with a synchronous exception (direct style: a
-     [raise]/[failwith] or an [await] on a rejected promise propagates up the
-     fiber's native stack), capture its raw backtrace here, at the boundary, so we
-     can re-raise it faithfully below with [Printexc.raise_with_backtrace] instead
-     of resetting the trace with a bare [raise]. Without this, the precise fiber
-     stack the effect continuation preserved is discarded on the way out of [run].
-     The monadic path keeps no stack to preserve (each [bind] reboxes the
-     exception into a rejected promise), so it leaves [raw_bt] at [None]. This is
-     off the hot path: [run] is entered once per event-loop run, and the capture
-     only happens on the exception path. *)
+  (* When [main ()] itself raises synchronously, capture its raw backtrace at
+     the boundary so we can re-raise it faithfully below with
+     [Printexc.raise_with_backtrace] instead of resetting the trace with a bare
+     [raise]. The monadic path keeps no stack to preserve (each [bind] reboxes
+     the exception into a rejected promise), so it leaves [raw_bt] at [None].
+     This is off the hot path: [run] is entered once per event-loop run, and
+     the capture only happens on the exception path. *)
   let raw_bt = ref None in
-  spawn (fun () ->
-    let r =
-      try await_result (main ())
-      with e when Exception_filter.run e ->
-        raw_bt := Some (Printexc.get_raw_backtrace ());
-        Error e
-    in
-    outcome := Some r);
+  enqueue (fun () ->
+    match main () with
+    | p -> (
+      match (prj p).st with
+      | Fulfilled v -> outcome := Some (Ok v)
+      | Rejected e -> outcome := Some (Error e)
+      | Pending _ -> add_waiter p (fun r -> outcome := Some r))
+    | exception e when Exception_filter.run e ->
+      raw_bt := Some (Printexc.get_raw_backtrace ());
+      outcome := Some (Error e));
   run_scheduler ();
   match !outcome with
   | Some (Ok v) -> v
   | Some (Error e) ->
-    (* Prefer the backtrace captured synchronously at the boundary (direct-style
-       fiber whose body raised into the [with] above). Otherwise (the fiber was
-       rejected via its own handler — e.g. [Lwt_direct] reboxes into a rejected
-       promise — so [await_result] returned an [Error] value, not a raise) fall
-       back to the runtime's current backtrace buffer, which still holds the
-       fiber's trace. Either way re-raise *with* a backtrace rather than a bare
-       [raise], which would reset it to this point. *)
+    (* Prefer the backtrace captured synchronously at the boundary ([main ()]
+       raised). Otherwise (the main promise was rejected asynchronously — e.g.
+       a [Lwt_direct] task reboxed an exception into a rejected promise) fall
+       back to the runtime's current backtrace buffer, which may still hold the
+       relevant trace. Either way re-raise *with* a backtrace rather than a
+       bare [raise], which would reset it to this point. *)
     let bt =
       match !raw_bt with Some bt -> bt | None -> Printexc.get_raw_backtrace ()
     in
@@ -893,8 +856,7 @@ let finalize f g =
     (fun x -> bind (g ()) (fun () -> return x))
     (fun e -> bind (g ()) (fun () -> fail e))
 
-(* Non-blocking like Lwt's: the awaiting happens in a spawned fiber. *)
-(* [join]/[all] are callback-counting (no fiber): they resolve {e immediately}
+(* [join]/[all] are callback-counting: they resolve {e immediately}
    when every promise is already resolved — Lwt code observes the state right
    after the call — and otherwise settle when the last pending one does. On
    rejection they still wait for all, then reject with the {e first} rejection
