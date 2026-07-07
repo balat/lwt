@@ -1,0 +1,10 @@
+; PoC (branch lwt-on-eio-poc): run Lwt on top of Eio's runtime.
+; Private, Linux-only library (not installed): Level A shares Eio's event loop
+; with an Lwt_engine, Level B routes Lwt's read/write/connect through Eio's
+; io_uring via Lwt_unix.set_completion_io. Experimental branch, not for release.
+
+(library
+ (name lwt_eio_backend)
+ (enabled_if
+  (= %{system} linux))
+ (libraries lwt.unix eio eio.unix eio_linux cstruct optint unix))

@@ -1,0 +1,8 @@
+; PoC test for "Lwt on top of Eio" (branch lwt-on-eio-poc). Forces the io_uring
+; backend via Eio_linux.run and exercises the Level B backend end to end.
+
+(executable
+ (name test_poc)
+ (enabled_if
+  (= %{system} linux))
+ (libraries lwt.unix lwt_eio_backend eio eio.unix eio_linux unix))
