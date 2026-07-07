@@ -9,6 +9,6 @@
   "io_uring back end for the Lwt_effects scheduler (POC, Linux only)")
  (enabled_if
   (and
-   (>= %{ocaml_version} "5.0")
+   (>= %{ocaml_version} "5.3")
    (= %{system} linux)))
  (libraries lwt_effects uring cstruct optint unix))
