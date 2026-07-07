@@ -84,38 +84,35 @@ end
 
 (* part 3: handling effects *)
 
-let handler : _ Effect.Deep.effect_handler =
-  let effc : type b. b Effect.t -> ((b, unit) Effect.Deep.continuation -> 'a) option =
-    function
-    | Yield ->
-      Some (fun k ->
-        let storage = Storage.save_current () in
-        push_task (fun () ->
-          Storage.restore_current storage;
-          Effect.Deep.continue k ()))
-    | Await fut ->
-      Some
-        (fun k ->
-          let storage = Storage.save_current () in
-          Lwt.on_any fut
-            (fun res -> push_task (fun () ->
-              Storage.restore_current storage; Effect.Deep.continue k res))
-            (fun exn -> push_task (fun () ->
-              Storage.restore_current storage; Effect.Deep.discontinue k exn)))
-    | _ -> None
-  in
-  { effc }
+(* Run [f ()] under the effect handler, using the OCaml 5.3+
+   [match … with effect] syntax. [Yield] re-schedules the continuation as a
+   task; [Await] resumes it (or discontinues it) once the awaited Lwt promise
+   settles. In both cases the fiber-local storage is saved and restored around
+   the continuation. *)
+let with_effect_handler (f : unit -> unit) : unit =
+  match f () with
+  | () -> ()
+  | effect Yield, k ->
+    let storage = Storage.save_current () in
+    push_task (fun () ->
+      Storage.restore_current storage;
+      Effect.Deep.continue k ())
+  | effect Await fut, k ->
+    let storage = Storage.save_current () in
+    Lwt.on_any fut
+      (fun res -> push_task (fun () ->
+        Storage.restore_current storage; Effect.Deep.continue k res))
+      (fun exn -> push_task (fun () ->
+        Storage.restore_current storage; Effect.Deep.discontinue k exn))
 
 (* part 4: putting it all together: running tasks *)
 
 let run_inside_effect_handler_and_resolve_ (type a) (promise : a Lwt.u) f () : unit =
-  let run_f_and_set_res () =
+  with_effect_handler (fun () ->
     Storage.reset_to_empty();
     match f () with
     | res -> Lwt.wakeup promise res
-    | exception exc -> Lwt.wakeup_exn promise exc
-  in
-  Effect.Deep.try_with run_f_and_set_res () handler
+    | exception exc -> Lwt.wakeup_exn promise exc)
 
 let spawn f : _ Lwt.t =
   setup_hooks ();
@@ -126,14 +123,12 @@ let spawn f : _ Lwt.t =
 (* part 4 (encore): running a task in the background *)
 
 let run_inside_effect_handler_in_the_background_ f () : unit =
-  let run_f () : unit =
+  with_effect_handler (fun () ->
     Storage.reset_to_empty();
     try
       f ()
     with exn ->
-      !Lwt.async_exception_hook exn
-  in
-  Effect.Deep.try_with run_f () handler
+      !Lwt.async_exception_hook exn)
 
 let spawn_in_the_background f : unit =
   setup_hooks ();
