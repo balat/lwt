@@ -41,6 +41,20 @@ let get_loop_switch () =
 
 let active () = Option.is_some !loop_switch
 
+(* Cache of Eio Fd wrappers, keyed by the raw descriptor (see [submit]). Cleared
+   when the event loop tears down, since the wrappers are registered on its
+   switch. Caveat: within one loop it does not survive fd-number reuse after
+   close; a production backend would invalidate on close. *)
+let fd_cache : (Unix.file_descr, Eio_unix.Fd.t) Hashtbl.t = Hashtbl.create 64
+
+let eio_fd sw raw_fd =
+  match Hashtbl.find_opt fd_cache raw_fd with
+  | Some efd -> efd
+  | None ->
+    let efd = Eio_unix.Fd.of_unix ~sw ~blocking:false ~close_unix:false raw_fd in
+    Hashtbl.replace fd_cache raw_fd efd;
+    efd
+
 (* ===================== Level A: Lwt_engine backed by Eio ===================== *)
 
 (* Run [fn] in a background fiber and return the [unit Lazy.t] unregister action
@@ -114,7 +128,9 @@ let main ~clock user_promise =
      Switch.run (fun sw ->
          if Option.is_some !loop_switch then
            invalid_arg "Lwt_eio_backend: event loop already running";
-         Switch.on_release sw (fun () -> loop_switch := None);
+         Switch.on_release sw (fun () ->
+             loop_switch := None;
+             Hashtbl.clear fd_cache);
          loop_switch := Some sw;
          Lwt_engine.set ~destroy:false (make_engine ~sw ~clock);
          (* An Eio fiber may resume an Lwt thread while inside [iter]; a
@@ -146,32 +162,29 @@ let file_offset (kind : Unix.file_kind) =
 
 (* Run a completion op [perform efd] on Eio's ring in a fresh fiber, and bridge
    its result to a cancelable Lwt promise. Cancelling the Lwt promise cancels
-   the in-flight Eio op (which cancels the io_uring submission). Mirrors
-   lwt_uring.ml:submit_io. *)
+   the in-flight Eio op (which cancels the io_uring submission). A fiber fork is
+   required per op because Eio's public completion API ([Low_level.readv], ...)
+   is direct-style (it suspends the caller) rather than callback-style: this is
+   the structural cost of routing Lwt's callback-based [completion_io] through
+   Eio, which the [uring]-library-based maison backend (lwt_uring.ml:submit_io)
+   avoids. *)
 let submit perform raw_fd =
   let sw = get_loop_switch () in
+  let efd = eio_fd sw raw_fd in
   let waiter, wakener = Lwt.task () in
   let cc = ref None in
   incr eio_ops;
   Fiber.fork ~sw (fun () ->
       Eio.Cancel.sub (fun cancel ->
           cc := Some cancel;
-          let efd =
-            Eio_unix.Fd.of_unix ~sw ~blocking:false ~close_unix:false raw_fd
-          in
-          let finish () =
-            Eio.Cancel.protect (fun () -> ignore (Eio_unix.Fd.remove efd))
-          in
           match perform efd with
           | n ->
-            finish ();
             Lwt.wakeup wakener n;
             notify ()
           | exception Eio.Cancel.Cancelled _ ->
             (* The Lwt promise is already rejected with [Canceled]. *)
-            finish ()
+            ()
           | exception ex ->
-            finish ();
             Lwt.wakeup_exn wakener ex;
             notify ()));
   Lwt.on_cancel waiter (fun () ->
