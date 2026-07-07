@@ -65,7 +65,7 @@
  (synopsis "Direct-style control-flow and `await` for Lwt")
  (authors "Simon Cruanes")
  (depends
-  (ocaml (>= 5.0))
+  (ocaml (>= 5.3))
   base-unix
   (lwt (>= 6))))
 

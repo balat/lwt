@@ -1,5 +1,5 @@
 (library
  (public_name lwt_direct)
  (synopsis "Direct-style control-flow and `await` for Lwt")
- (enabled_if (>= %{ocaml_version} "5.0"))
+ (enabled_if (>= %{ocaml_version} "5.3"))
  (libraries lwt lwt.unix))
