@@ -65,7 +65,7 @@
  (synopsis "Direct-style control-flow and `await` for Lwt")
  (authors "Simon Cruanes")
  (depends
-  (ocaml (>= 5.0))
+  (ocaml (>= 5.3))
   base-unix
   (lwt (>= 6))))
 
@@ -84,7 +84,7 @@
  (version 6.0.0)
  (synopsis "Effect-based scheduler for Lwt-style promises (POC)")
  (depends
-  (ocaml (>= 5.0))
+  (ocaml (>= 5.3))
   base-unix
   (lwt (>= 6))))
 
@@ -93,7 +93,7 @@
  (version 6.0.0)
  (synopsis "io_uring back end for the Lwt_effects scheduler (POC, Linux only)")
  (depends
-  (ocaml (>= 5.0))
+  (ocaml (>= 5.3))
   (lwt_effects (= :version))
   (uring (>= "0.9"))
   cstruct

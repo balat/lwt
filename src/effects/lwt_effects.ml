@@ -288,29 +288,21 @@ let catch (f : unit -> 'a t) (h : exn -> 'a t) : 'a t =
 (* Running fibers                                                     *)
 (* ------------------------------------------------------------------ *)
 
-(* The single effect handler shared by every fiber. On [Await] it suspends the
-   fiber and registers a waiter that re-enqueues the continuation once the
-   awaited promise resolves. *)
-let handler : (unit, unit) Effect.Deep.handler =
-  let retc () = () in
-  let exnc e = raise e in
-  let effc : type b.
-      b Effect.t -> ((b, unit) Effect.Deep.continuation -> unit) option =
-    function
-    | Await p ->
-      Some
-        (fun k ->
-          let s = !current_storage in
-          add_waiter p (fun r -> Run_queue.push run_queue (Resume (s, r, k))))
-    | Yield ->
-      Some (fun k -> Run_queue.push run_queue (Resume (!current_storage, (), k)))
-    | _ -> None
-  in
-  { retc; exnc; effc }
-
-(* Start [body] as a fresh fiber under the shared handler. *)
+(* Start [body] as a fresh fiber under the effect handler, using the OCaml 5.3+
+   [match … with effect] syntax. On [Await] the fiber suspends and registers a
+   waiter that re-enqueues the continuation once the awaited promise resolves;
+   [Yield] re-enqueues it immediately. An exception escaping [body] propagates
+   out of the match (formerly [exnc = raise]); the [() -> ()] arm is the former
+   [retc]. *)
 let spawn (body : unit -> unit) : unit =
-  enqueue (fun () -> Effect.Deep.match_with body () handler)
+  enqueue (fun () ->
+    match body () with
+    | () -> ()
+    | effect Await p, k ->
+      let s = !current_storage in
+      add_waiter p (fun r -> Run_queue.push run_queue (Resume (s, r, k)))
+    | effect Yield, k ->
+      Run_queue.push run_queue (Resume (!current_storage, (), k)))
 
 let async (f : unit -> 'a t) : 'a t =
   let p = new_pending () in
