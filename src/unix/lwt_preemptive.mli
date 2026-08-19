@@ -10,6 +10,17 @@
     See {{:https://github.com/hcarty/mwt} Mwt} for a more modern
     implementation. *)
 
+(** {2 Which domain these belong to}
+
+    The pool of system threads is a process resource and is shared, but
+    {!detach} hands its result back through Lwt's notification pipe, which is
+    read by the domain that initialised {!Lwt_unix}. So {!detach}, {!init} and
+    {!set_bounds} belong to that domain and raise [Failure] elsewhere.
+
+    {!run_in_main} and {!run_in_main_dont_wait} go the other way and may be
+    called from any thread and any domain; the function they are given runs on
+    that same owning domain. *)
+
 val detach : ('a -> 'b) -> 'a -> 'b Lwt.t
   (** [detach f x] runs the computation [f x] in a separate preemptive thread.
       [detach] evaluates to an Lwt promise, which is pending until the

@@ -16,7 +16,20 @@
    domain_exit_hooks
    domain_engines
    domain_channels
-   domain_unix_policy)))
+   domain_unix_policy
+   domain_timeouts)))
+
+; Each domain runs its own timer wheel, while the preemptive thread pool stays
+; shared and detaching belongs to the notification owner. Needs a second domain,
+; hence OCaml 5.
+
+(test
+ (name domain_timeouts)
+ (package lwt)
+ (modules domain_timeouts)
+ (build_if
+  (>= %{ocaml_version} "5.0"))
+ (libraries lwt.unix))
 
 ; Jobs, signals and child waiting go through the process-wide notification file
 ; descriptor, so they belong to the domain that initialised Lwt_unix. Needs a

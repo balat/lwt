@@ -1647,5 +1647,15 @@ val install_sigchld_handler : unit -> unit
 (** Installs the SIGCHLD handler if it is not installed yet. The handler is
     process-wide, so this installs it once per PROCESS however many domains call
     it, and it is safe to call concurrently, which forcing
-    {!sigchld_handler_installer} is not. For internal use: [Lwt_main.run] and
-    {!waitpid} call it. *)
+    {!sigchld_handler_installer} is not. On a domain that does not own the
+    notification pipe it does nothing, since the handler could neither be
+    delivered there nor safely wake that domain's waiters. For internal use:
+    [Lwt_main.run] and {!waitpid} call it. *)
+
+val check_notification_owner : string -> unit
+  [@@alert lwt_internal "Internal to the Lwt packages, keep away."]
+(** [check_notification_owner name] fails, mentioning [name], unless the calling
+    domain is the one that initialised this module and therefore owns the
+    notification file descriptor. Exposed for the Lwt packages built on
+    notifications, {!Lwt_preemptive} in particular; it goes away once each domain
+    has a descriptor of its own. *)

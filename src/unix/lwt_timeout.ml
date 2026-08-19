@@ -3,15 +3,35 @@
 
 
 
+(* PER DOMAIN, the whole wheel. This module is a hashed timer wheel driven by
+   [Lwt_unix.sleep], which is an engine timer and not a notification, so a second
+   domain can perfectly well run its own wheel on its own loop: there is nothing
+   process-wide to share here, and everything to lose by sharing, the buckets
+   being intrusive doubly-linked lists spliced on every [start] and [stop].
+
+   A timeout therefore belongs to the domain that created it, and carries its
+   wheel rather than a domain identity: [start] compares that pointer with the
+   caller's wheel, which is one word of comparison, and the operations that
+   splice it refuse to touch a wheel that is not theirs. *)
 type t =
   { mutable delay : int; action : unit -> unit;
-    mutable prev : t; mutable next : t }
+    mutable prev : t; mutable next : t;
+    owner : wheel }
 
-let make delay action =
-  let rec x = { delay = delay; action = action; prev = x; next = x } in
+and wheel = {
+  mutable count : int;
+  mutable buckets : t array;
+  mutable curr : int;
+  mutable stopped : bool;
+}
+
+let make owner delay action =
+  let rec x =
+    { delay = delay; action = action; prev = x; next = x; owner = owner }
+  in
   x
 
-let lst_empty () = make (-1) (fun () -> ())
+let lst_empty owner = make owner (-1) (fun () -> ())
 
 let lst_remove x =
   let p = x.prev in
@@ -36,72 +56,94 @@ let lst_peek s = let x = s.next in lst_remove x; x
 
 (****)
 
-let count = ref 0
+[@@@alert "-lwt_internal"]
 
-let buckets = ref [||]
+(* The buckets start empty and [size] grows them, which is also what breaks the
+   circularity: a bucket's sentinel needs its wheel, so the wheel is built
+   first. *)
+let wheel : wheel Lwt_dls.t =
+  Lwt_dls.new_key (fun () ->
+    { count = 0; buckets = [||]; curr = 0; stopped = true })
 
-let curr = ref 0
+let[@inline] self_wheel () = Lwt_dls.get wheel
 
-let stopped = ref true
+let[@inline never] not_our_wheel name =
+  invalid_arg
+    (name ^ ": this timeout belongs to another domain. A timeout is created, \
+     started and stopped on one domain, the one whose loop runs its action")
 
-let size l =
-  let len = Array.length !buckets in
+let[@inline] check_owner name w x =
+  if x.owner != w then not_our_wheel name
+
+let size w l =
+  let len = Array.length w.buckets in
   if l >= len then begin
-    let b = Array.init (l + 1) (fun _ -> lst_empty ()) in
-    Array.blit !buckets !curr b 0 (len - !curr);
-    Array.blit !buckets 0 b (len - !curr) !curr;
-    buckets := b; curr := 0;
+    let b = Array.init (l + 1) (fun _ -> lst_empty w) in
+    Array.blit w.buckets w.curr b 0 (len - w.curr);
+    Array.blit w.buckets 0 b (len - w.curr) w.curr;
+    w.buckets <- b; w.curr <- 0;
   end
 
 (****)
 
+(* Process-wide, like [Lwt.async_exception_hook] it defaults to: it says what the
+   program does with a stray exception, not what one loop does. Atomic rather
+   than a ref because the module owns the cell and exposes only the setter, the
+   same treatment as [Lwt.Exception_filter]. *)
 let handle_exn =
-  ref
+  Atomic.make
     (fun exn ->
       !Lwt.async_exception_hook exn)
 
-let set_exn_handler f = handle_exn := f
+let set_exn_handler f = Atomic.set handle_exn f
 
-let rec loop () =
-  stopped := false;
+let rec loop w =
+  w.stopped <- false;
   Lwt.bind (Lwt_unix.sleep 1.) (fun () ->
-    let s = !buckets.(!curr) in
+    let s = w.buckets.(w.curr) in
     while not (lst_is_empty s) do
       let x = lst_peek s in
-      decr count;
+      w.count <- w.count - 1;
       (*XXX Should probably report any exception *)
       try
         x.action ()
       with e when Lwt.Exception_filter.run e ->
-        !handle_exn e
+        (Atomic.get handle_exn) e
     done;
-    curr := (!curr + 1) mod (Array.length !buckets);
-    if !count > 0 then loop () else begin stopped := true; Lwt.return_unit end)
+    w.curr <- (w.curr + 1) mod (Array.length w.buckets);
+    if w.count > 0 then loop w
+    else begin w.stopped <- true; Lwt.return_unit end)
 
 let start x =
+  let w = self_wheel () in
+  check_owner "Lwt_timeout.start" w x;
   let in_list = lst_in_list x in
-  let slot = (!curr + x.delay) mod (Array.length !buckets) in
+  let slot = (w.curr + x.delay) mod (Array.length w.buckets) in
   lst_remove x;
-  lst_insert !buckets.(slot) x;
+  lst_insert w.buckets.(slot) x;
   if not in_list then begin
-    incr count;
-    if !count = 1 && !stopped then ignore (loop ())
+    w.count <- w.count + 1;
+    if w.count = 1 && w.stopped then ignore (loop w)
   end
 
 let create delay action =
   if delay < 1 then invalid_arg "Lwt_timeout.create";
-  let x = make delay action in
-  size delay;
+  let w = self_wheel () in
+  let x = make w delay action in
+  size w delay;
   x
 
 let stop x =
+  check_owner "Lwt_timeout.stop" (self_wheel ()) x;
   if lst_in_list x then begin
     lst_remove x;
-    decr count
+    x.owner.count <- x.owner.count - 1
   end
 
 let change x delay =
   if delay < 1 then invalid_arg "Lwt_timeout.change";
+  let w = self_wheel () in
+  check_owner "Lwt_timeout.change" w x;
   x.delay <- delay;
-  size delay;
+  size w delay;
   if lst_in_list x then start x
