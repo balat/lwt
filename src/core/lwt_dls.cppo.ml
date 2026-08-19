@@ -14,6 +14,11 @@ let[@inline] set k v = Domain.DLS.set k v
 let is_main_domain () = Domain.is_main_domain ()
 let at_domain_exit f = Domain.at_exit f
 
+type token = unit ref
+
+let token_key : token t = new_key (fun () -> ref ())
+let[@inline] self_token () = get token_key
+
 #else
 
 (* One domain, so a slot is a cell. The initialiser runs eagerly: the core's
@@ -30,4 +35,22 @@ let[@inline] set k v = k := v
 let is_main_domain () = true
 let at_domain_exit f = Stdlib.at_exit f
 
+(* One domain, so one token, and every comparison against it succeeds. *)
+type token = unit ref
+
+let the_token : token = ref ()
+let[@inline] self_token () = the_token
+
 #endif
+
+(* Shared by both branches: the affinity check for the domain-affine containers.
+   One implementation and one message shape for all of them, since the only thing
+   that varies is the name of the operation being refused. *)
+
+let[@inline never] foreign name =
+  invalid_arg
+    (name
+    ^ ": this value belongs to another domain. An Lwt container that holds        waiters lives on one domain, the one whose loop runs its callbacks")
+
+let[@inline] check_owner name owner =
+  if owner != self_token () then foreign name

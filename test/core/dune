@@ -9,6 +9,7 @@
   test_lwt_dls_domains
   test_sched_domains
   test_ownership
+  test_containers_domains
   test_browser_invariants)
  (libraries lwttester))
 
@@ -57,6 +58,17 @@
  (name test_ownership)
  (package lwt)
  (modules test_ownership)
+ (build_if
+  (>= %{ocaml_version} "5.0"))
+ (libraries lwt))
+
+; The domain-affine containers: mutex, condition, mvar, pool, stream. Needs a
+; second domain, hence OCaml 5.
+
+(test
+ (name test_containers_domains)
+ (package lwt)
+ (modules test_containers_domains)
  (build_if
   (>= %{ocaml_version} "5.0"))
  (libraries lwt))
