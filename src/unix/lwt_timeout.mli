@@ -5,6 +5,14 @@
 
 (** Cancelable timeouts. *)
 
+(** {2 Which domain a timeout belongs to}
+
+    A timeout is created, started and stopped on ONE domain: the one whose
+    [Lwt_main.run] runs its action. Each domain has its own timer wheel, so
+    several can use this module at the same time, but passing a timeout to
+    another domain and starting it there raises [Invalid_argument] rather than
+    splicing it into the wrong wheel. *)
+
 type t
 
 val create : int -> (unit -> unit) -> t

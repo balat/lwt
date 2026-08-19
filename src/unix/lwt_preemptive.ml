@@ -12,6 +12,20 @@ module Lwt_sequence = Lwt_sequence
 
 open Lwt.Infix
 
+(* The worker pool is PROCESS-WIDE and stays so: a pool of system threads is a
+   process resource, and N pools of [max_threads] threads is not what anyone
+   asked for. What makes it safe is the same rule as [Lwt_unix]'s jobs, and for
+   the same reason: [detach] gets its result back through a notification, whose
+   handler runs on the domain that owns the notification descriptor, so a detach
+   from anywhere else would wake a promise from a domain that does not own it.
+   Only the owner may detach, and therefore only the owner touches the pool, the
+   waiter queue and the thread count, which need no lock as a result.
+
+   [run_in_main] and [run_in_main_dont_wait] are the other direction and stay
+   callable from any thread and any domain: that is their entire purpose. The
+   function they take runs on the owning domain. *)
+[@@@alert "-lwt_internal"]
+
 (* +-----------------------------------------------------------------+
    | Parameters                                                      |
    +-----------------------------------------------------------------+ *)
@@ -142,6 +156,7 @@ let get_worker () =
 let get_bounds () = (!min_threads, !max_threads)
 
 let set_bounds (min, max) =
+  Lwt_unix.check_notification_owner "Lwt_preemptive.set_bounds";
   if min < 0 || max < min then invalid_arg "Lwt_preemptive.set_bounds";
   let diff = min - !threads_count in
   min_threads := min;
@@ -174,6 +189,7 @@ let nbthreadsbusy () = !threads_count - Queue.length workers
 let init_result = Result.Error (Failure "Lwt_preemptive.detach")
 
 let detach f args =
+  Lwt_unix.check_notification_owner "Lwt_preemptive.detach";
   simple_init ();
   let result = ref init_result in
   (* The task for the worker thread: *)
