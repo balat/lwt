@@ -12,7 +12,19 @@
    ocaml_runtime_exc_4
    ocaml_runtime_exc_5
    ocaml_runtime_exc_6
-   set_engine)))
+   set_engine
+   domain_exit_hooks)))
+
+; Exit hooks belong to a loop, so they must run on the domain that registered
+; them. Needs a second domain, hence OCaml 5.
+
+(test
+ (name domain_exit_hooks)
+ (package lwt)
+ (modules domain_exit_hooks)
+ (build_if
+  (>= %{ocaml_version} "5.0"))
+ (libraries lwt.unix))
 
 (executable
  (name dummy)
