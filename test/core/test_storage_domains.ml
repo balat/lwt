@@ -76,4 +76,32 @@ let () =
     assert (Storage.get_from_storage k2 storage = Some "two")
   in
   check ();
-  Domain.join (Domain.spawn check)
+  Domain.join (Domain.spawn check);
+  (* Keys created concurrently must be distinct. Their ids come from a shared
+     counter, and two keys sharing an id share a slot in the storage, so the
+     second binding shadows the first and the first no longer projects. *)
+  let keys_per_domain = 20_000 in
+  let make () = List.init keys_per_domain (fun _ -> Lwt.new_key ()) in
+  let other = Domain.spawn make in
+  let mine = make () in
+  let keys = mine @ Domain.join other in
+  let storage =
+    List.fold_left
+      (fun (storage, i) key -> (Storage.modify_storage key (Some i) storage, i + 1))
+      (Storage.empty_storage, 0) keys
+    |> fst
+  in
+  let shadowed =
+    List.fold_left
+      (fun (n, i) key ->
+        ((if Storage.get_from_storage key storage = Some i then n else n + 1), i + 1))
+      (0, 0) keys
+    |> fst
+  in
+  if shadowed > 0 then begin
+    Printf.eprintf
+      "Lwt.new_key is not domain-safe: %d of %d concurrently created keys \
+       share an id with another\n"
+      shadowed (List.length keys);
+    exit 1
+  end

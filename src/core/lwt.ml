@@ -169,14 +169,16 @@ type 'a key = {
        injection is [None], the constructor being fresh per key. *)
 }
 
-let next_key_id = ref 0
+(* Atomic, not [incr]: two domains creating a key at the same time must not be
+   handed the same id, since two keys sharing an id share a slot in the storage
+   and would shadow each other. *)
+let next_key_id = Atomic.make 0
 
 let new_key (type a) () : a key =
   let module M = struct
     exception E of a option
   end in
-  let id = !next_key_id in
-  incr next_key_id;
+  let id = Atomic.fetch_and_add next_key_id 1 in
   { id; inject = (fun v -> M.E v); project = (function M.E v -> v | _ -> None) }
 
 let empty_storage : storage = Storage_map.empty
