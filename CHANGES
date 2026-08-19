@@ -30,6 +30,10 @@
     other's value, or none at all. The storage now carries the values
     themselves, through a per-key exception constructor.
 
+  * Lwt.new_key: allocate key ids atomically, so that keys created
+    concurrently cannot be handed the same id and shadow each other in a
+    storage.
+
 ===== 6.1.2 =====
 
 ====== Fixes ======
