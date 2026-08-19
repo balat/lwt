@@ -13,7 +13,19 @@
    ocaml_runtime_exc_5
    ocaml_runtime_exc_6
    set_engine
-   domain_exit_hooks)))
+   domain_exit_hooks
+   domain_engines)))
+
+; An event source belongs to a loop: each domain gets its own engine. Needs a
+; second domain, hence OCaml 5.
+
+(test
+ (name domain_engines)
+ (package lwt)
+ (modules domain_engines)
+ (build_if
+  (>= %{ocaml_version} "5.0"))
+ (libraries lwt.unix))
 
 ; Exit hooks belong to a loop, so they must run on the domain that registered
 ; them. Needs a second domain, hence OCaml 5.
