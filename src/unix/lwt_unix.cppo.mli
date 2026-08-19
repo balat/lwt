@@ -1434,6 +1434,25 @@ val wait_for_jobs : unit -> unit Lwt.t
 (** Lwt internally use a pipe to send notification to the main
     thread. The following functions allow to use this pipe. *)
 
+(** {3 Which domain these belong to}
+
+    There is one notification pipe per process, and the event that reads it is
+    registered on the engine of the domain that initialised this module.
+    Completions therefore always run on that domain, whichever domain submitted
+    the work, so jobs ({!run_job} and every operation built on it), signal
+    handlers ({!on_signal} and friends) and child waiting ({!waitpid},
+    {!wait4}) are only available there: called from another domain they raise
+    [Failure] with an explanatory message, rather than silently waking a promise
+    that belongs to a domain which is not running it.
+
+    {!make_notification}, {!stop_notification}, {!set_notification} and
+    {!send_notification} are the exception: they are safe to call from any thread
+    and any domain, and the handler runs on the owning domain. That is what makes
+    them the way to wake Lwt from elsewhere.
+
+    Nothing that does not go through the pipe is restricted: any domain can run
+    its own {!Lwt_main.run} with its own timers and its own socket I/O. *)
+
 type notification
 
 val make_notification : ?once : bool -> (unit -> unit) -> notification

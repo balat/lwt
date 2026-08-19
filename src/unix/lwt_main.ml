@@ -165,9 +165,10 @@ let run p =
   | None -> ()
   end;
 
-  Lwt_unix.install_sigchld_handler ();
-
-  match run p with
+  (* Inside the [match], not before it: if it raises, [finished ()] must still
+     run, or the flag stays set and every later [Lwt_main.run] in the process
+     reports a nested call. *)
+  match Lwt_unix.install_sigchld_handler (); run p with
   | result ->
     finished ();
     result
