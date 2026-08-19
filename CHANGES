@@ -33,6 +33,14 @@
     works after any number of engine replacements. From the second one on, it
     stopped nothing, and libev could then abort on a closed descriptor.
 
+====== Fixes ======
+
+  * Lwt.key: the sequence-associated storage no longer routes values through a
+    mutable cell held in the key. A key is a single process-wide value, so two
+    systhreads looking the same key up in their own storages could read each
+    other's value, or none at all. The storage now carries the values
+    themselves, through a per-key exception constructor.
+
 ===== 6.1.2 =====
 
 ====== Fixes ======
