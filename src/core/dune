@@ -1,11 +1,26 @@
+; The per-domain slot: Domain.DLS on OCaml 5, a plain cell on 4.14. cppo rather
+; than a dune (select), which can only key on whether a library is available,
+; never on the compiler version.
+
+(rule
+ (targets lwt_dls.ml)
+ (deps
+  (:ml lwt_dls.cppo.ml))
+ (action
+  (chdir
+   %{project_root}
+   (run %{bin:cppo} -V OCAML:%{ocaml_version} %{ml} -o %{targets}))))
+
 (library
  (public_name lwt)
  (synopsis "Monadic promises and concurrent I/O")
  (wrapped false)
  (libraries
- (select lwt_rte.ml from
-  (lwt_runtime_events -> lwt_rte.with.ml)
-  (-> lwt_rte.without.ml))))
+  (select
+   lwt_rte.ml
+   from
+   (lwt_runtime_events -> lwt_rte.with.ml)
+   (-> lwt_rte.without.ml))))
 
 (documentation
  (package lwt))

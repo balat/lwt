@@ -182,7 +182,16 @@ let new_key (type a) () : a key =
   { id; inject = (fun v -> M.E v); project = (function M.E v -> v | _ -> None) }
 
 let empty_storage : storage = Storage_map.empty
-let current_storage = ref empty_storage
+
+(* S0 SPIKE: the scheduler's fiber-local storage moves to a per-domain slot.
+   This is the minimal de-globalisation patch of the plan's S0 item 2 --
+   [current_storage] and nothing else -- so that the A/B against the unchanged
+   core measures the per-domain lookup and only that. *)
+let current_storage_slot : storage Lwt_dls.t =
+  Lwt_dls.new_key (fun () -> empty_storage)
+
+let[@inline] get_current_storage () = Lwt_dls.get current_storage_slot
+let[@inline] set_current_storage (s : storage) = Lwt_dls.set current_storage_slot s
 
 let get_from_storage key storage =
   match Storage_map.find_opt key.id storage with
@@ -194,17 +203,17 @@ let modify_storage key value storage =
   | Some _ -> Storage_map.add key.id (key.inject value) storage
   | None -> Storage_map.remove key.id storage
 
-let get key = get_from_storage key !current_storage
+let get key = get_from_storage key (get_current_storage ())
 
 let with_value key value f =
-  let saved = !current_storage in
-  current_storage := modify_storage key value saved;
+  let saved = (get_current_storage ()) in
+  set_current_storage @@ modify_storage key value saved;
   match f () with
   | r ->
-    current_storage := saved;
+    set_current_storage @@ saved;
     r
   | exception e ->
-    current_storage := saved;
+    set_current_storage @@ saved;
     raise e
 
 (* ------------------------------------------------------------------ *)
@@ -241,11 +250,11 @@ let drain_deferred () =
 let leave_resolution_loop (storage_snapshot : storage) : unit =
   if !current_callback_nesting_depth = 1 then drain_deferred ();
   decr current_callback_nesting_depth;
-  current_storage := storage_snapshot
+  set_current_storage @@ storage_snapshot
 
 let run_in_resolution_loop (f : unit -> unit) : unit =
   incr current_callback_nesting_depth;
-  let storage_snapshot = !current_storage in
+  let storage_snapshot = (get_current_storage ()) in
   f ();
   leave_resolution_loop storage_snapshot
 
@@ -383,7 +392,7 @@ end
 
 let run_queue : Run_queue.t = Run_queue.create ()
 let enqueue (f : unit -> unit) : unit =
-  Run_queue.push run_queue (Thunk (!current_storage, f))
+  Run_queue.push run_queue (Thunk ((get_current_storage ()), f))
 
 (* Shared [Ok ()] outcome: events and [pause] all resolve unit promises, so
    there is no need to allocate a fresh [Ok ()] each time. *)
@@ -474,12 +483,12 @@ let bind (type a b) (p : a t) (f : a -> b t) : b t =
   | Pending _ ->
     let result = new_pending () in
     set_cancel_forward result p;
-    let saved = !current_storage in
+    let saved = (get_current_storage ()) in
     add_waiter p (fun r ->
-      let outer = !current_storage in
-      current_storage := saved;
+      let outer = (get_current_storage ()) in
+      set_current_storage @@ saved;
       (match r with Ok v -> forward result (apply f v) | Error e -> fill result (Error e));
-      current_storage := outer);
+      set_current_storage @@ outer);
     result
 
 (* Unlike {!bind}, [map] captures a synchronous exception of [f] into a rejected
@@ -493,16 +502,16 @@ let map (type a b) (f : a -> b) (p : a t) : b t =
   | Pending _ ->
     let result = new_pending () in
     set_cancel_forward result p;
-    let saved = !current_storage in
+    let saved = (get_current_storage ()) in
     add_waiter p (fun r ->
-      let outer = !current_storage in
-      current_storage := saved;
+      let outer = (get_current_storage ()) in
+      set_current_storage @@ saved;
       (match r with
       | Ok v -> (
         try fill result (Ok (f v))
         with e when Exception_filter.run e -> fill result (Error e))
       | Error e -> fill result (Error e));
-      current_storage := outer);
+      set_current_storage @@ outer);
     result
 
 let ( >>= ) = bind
@@ -521,12 +530,12 @@ let try_bind (f : unit -> 'a t) (g : 'a -> 'b t) (h : exn -> 'b t) : 'b t =
   | Pending _ ->
     let result = new_pending () in
     set_cancel_forward result p;
-    let saved = !current_storage in
+    let saved = (get_current_storage ()) in
     add_waiter p (fun r ->
-      let outer = !current_storage in
-      current_storage := saved;
+      let outer = (get_current_storage ()) in
+      set_current_storage @@ saved;
       forward result (match r with Ok v -> apply g v | Error e -> apply h e);
-      current_storage := outer);
+      set_current_storage @@ outer);
     result
 
 let catch (f : unit -> 'a t) (h : exn -> 'a t) : 'a t = try_bind f return h
@@ -732,14 +741,14 @@ let rec run_scheduler () : unit =
   else begin
     (match Run_queue.pop run_queue with
     | Thunk (s, f) ->
-      current_storage := s;
+      set_current_storage @@ s;
       f ());
     run_scheduler ()
   end
 
 let run (type a) (main : unit -> a t) : a =
   !on_reset ();
-  current_storage := empty_storage;
+  set_current_storage @@ empty_storage;
   let outcome = ref None in
   (* When [main ()] itself raises synchronously, capture its raw backtrace at
      the boundary so we can re-raise it faithfully below with
@@ -1045,12 +1054,12 @@ let hooked f x =
 
 (* Wrap a one-argument callback so it restores the registration-time storage. *)
 let with_registration_storage f =
-  let saved = !current_storage in
+  let saved = (get_current_storage ()) in
   fun x ->
-    let outer = !current_storage in
-    current_storage := saved;
+    let outer = (get_current_storage ()) in
+    set_current_storage @@ saved;
     hooked f x;
-    current_storage := outer
+    set_current_storage @@ outer
 
 let on_any p f g =
   let f = with_registration_storage f and g = with_registration_storage g in
@@ -1227,7 +1236,8 @@ module Private = struct
     let get_from_storage = get_from_storage
     let modify_storage = modify_storage
     let empty_storage = empty_storage
-    let current_storage = current_storage
+    let get_current_storage = get_current_storage
+    let set_current_storage = set_current_storage
   end
 
   let tracing_context : string key = new_key ()

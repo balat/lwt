@@ -1,0 +1,25 @@
+(* This file is part of Lwt, released under the MIT license. See LICENSE.md for
+   details, or visit https://github.com/ocsigen/lwt/blob/master/LICENSE.md. *)
+
+#if OCAML_VERSION >= (5, 0, 0)
+
+type 'a t = 'a Domain.DLS.key
+
+let new_key init = Domain.DLS.new_key init
+
+(* [Domain.DLS.get] is not inlinable (it goes through the recursive
+   [maybe_grow]), so at least spare the wrapper's own frame. *)
+let[@inline] get k = Domain.DLS.get k
+let[@inline] set k v = Domain.DLS.set k v
+
+#else
+
+(* One domain, so a slot is a cell. The initialiser runs eagerly: the core's
+   only use is its scheduler record, whose initialiser is pure. *)
+type 'a t = 'a ref
+
+let new_key init = ref (init ())
+let[@inline] get k = !k
+let[@inline] set k v = k := v
+
+#endif

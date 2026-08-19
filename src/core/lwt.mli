@@ -2075,7 +2075,14 @@ module Private : sig
     val get_from_storage : 'a key -> storage -> 'a option
     val modify_storage : 'a key -> 'a option -> storage -> storage
     val empty_storage : storage
-    val current_storage : storage ref
+
+    val get_current_storage : unit -> storage
+    val set_current_storage : storage -> unit
+    (** S0 SPIKE: was [val current_storage : storage ref]. The [ref] VALUE
+        cannot survive per-domain scheduler state: whoever read it would keep
+        the cell of the domain that loaded the module, for good. See the audit,
+        2.1. [Lwt.Private] is alerted as internal and its only consumers are
+        in-tree ([Lwt_direct], [Lwt_main], [ppx_lwt]). *)
   end
 
   val tracing_context : string key
