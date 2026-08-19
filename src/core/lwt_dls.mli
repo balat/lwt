@@ -36,6 +36,27 @@ val is_main_domain : unit -> bool
   [@@alert lwt_internal "Lwt_dls is internal to the Lwt packages, keep away."]
 (** Always [true] on 4.14, where there is one domain and it is the main one. *)
 
+type token
+(** The identity of a domain, as something to compare: physically distinct per
+    domain, and never reused, which a [Domain.id] would not give since those are
+    recycled after a domain terminates.
+
+    This is what the domain-affine CONTAINERS are stamped with. Promises carry
+    the core's own scheduler record instead, which serves the same purpose there
+    and costs no extra slot; containers have no scheduler to point at, and the
+    core is above them. *)
+
+val self_token : unit -> token
+  [@@alert lwt_internal "Lwt_dls is internal to the Lwt packages, keep away."]
+(** The calling domain's token. Compare with [!=]. *)
+
+val check_owner : string -> token -> unit
+  [@@alert lwt_internal "Lwt_dls is internal to the Lwt packages, keep away."]
+(** [check_owner name owner] raises [Invalid_argument], mentioning [name], unless
+    [owner] is the calling domain's token. One implementation for every
+    domain-affine container, since all that varies is the name of the operation
+    being refused. *)
+
 val at_domain_exit : (unit -> unit) -> unit
   [@@alert lwt_internal "Lwt_dls is internal to the Lwt packages, keep away."]
 (** [at_domain_exit f] runs [f] when the CURRENT domain exits. On the main domain

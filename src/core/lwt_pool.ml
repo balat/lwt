@@ -12,6 +12,13 @@ module Lwt_sequence = Lwt_sequence
 
 open Lwt.Infix
 
+(* DOMAIN-AFFINE: a pool holds live resources (connections, descriptors) and a
+   queue of waiters for them, which is the plainest case of the rule -- a
+   resource that does I/O, or that holds waiters, belongs to its domain. A pool
+   shared across domains would hand the same connection to two loops at once, and
+   [clear] would dispose of another domain's members under it. *)
+[@@@alert "-lwt_internal"]
+
 type 'a t = {
   create : unit -> 'a Lwt.t;
   (* Create a new pool member. *)
@@ -31,6 +38,8 @@ type 'a t = {
   (* Available pool members. *)
   waiters : 'a Lwt.u Lwt_sequence.t;
   (* Promise resolvers waiting for a free member. *)
+  owner : Lwt_dls.token;
+  (* The domain this pool lives on. *)
 }
 
 let create m ?(validate = fun _ -> Lwt.return_true) ?(check = fun _ f -> f true) ?(dispose = fun _ -> Lwt.return_unit) create =
@@ -42,7 +51,8 @@ let create m ?(validate = fun _ -> Lwt.return_true) ?(check = fun _ f -> f true)
     cleared = ref (ref false);
     count = 0;
     list = Queue.create ();
-    waiters = Lwt_sequence.create () }
+    waiters = Lwt_sequence.create ();
+    owner = Lwt_dls.self_token () }
 
 (* Create a pool member. *)
 let create_member p =
@@ -139,6 +149,7 @@ let check_and_release p c cleared =
   )
 
 let use p f =
+  Lwt_dls.check_owner "Lwt_pool.use" p.owner;
   acquire p >>= fun c ->
   (* Capture the current cleared state so we can see if it changes while this
      element is in use *)
@@ -162,6 +173,7 @@ let use p f =
   )
 
 let clear p =
+  Lwt_dls.check_owner "Lwt_pool.clear" p.owner;
   let elements = Queue.fold (fun l element -> element :: l) [] p.list in
   Queue.clear p.list;
   (* Indicate to any currently in-use elements that we cleared the pool *)
@@ -170,4 +182,5 @@ let clear p =
   p.cleared := ref false;
   Lwt_list.iter_s (dispose p) elements
 
+(* A read, so unchecked. *)
 let wait_queue_length p = Lwt_sequence.length p.waiters

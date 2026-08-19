@@ -36,6 +36,12 @@
    module without triggering any more warnings. *)
 module Lwt_sequence = Lwt_sequence
 
+(* DOMAIN-AFFINE: two queues of waiters and a cell, and a [put] into an empty
+   mvar with no reader waiting mutates the cell without a promise in sight, so
+   nothing below would catch it. Stamped at creation, checked at each operation,
+   which is free at a synchronisation point. *)
+[@@@alert "-lwt_internal"]
+
 type 'a t = {
   mutable mvar_contents : 'a option;
   (* Current contents *)
@@ -45,19 +51,25 @@ type 'a t = {
 
   readers : 'a Lwt.u Lwt_sequence.t;
   (* Threads waiting for a value *)
+
+  owner : Lwt_dls.token;
+  (* The domain this mvar lives on *)
 }
 
 let create_empty () =
   { mvar_contents = None;
     writers = Lwt_sequence.create ();
-    readers = Lwt_sequence.create () }
+    readers = Lwt_sequence.create ();
+    owner = Lwt_dls.self_token () }
 
 let create v =
   { mvar_contents = Some v;
     writers = Lwt_sequence.create ();
-    readers = Lwt_sequence.create () }
+    readers = Lwt_sequence.create ();
+    owner = Lwt_dls.self_token () }
 
 let put mvar v =
+  Lwt_dls.check_owner "Lwt_mvar.put" mvar.owner;
   match mvar.mvar_contents with
   | None ->
     begin match Lwt_sequence.take_opt_l mvar.readers with
@@ -82,6 +94,7 @@ let next_writer mvar =
     mvar.mvar_contents <- None
 
 let take_available mvar =
+  Lwt_dls.check_owner "Lwt_mvar.take_available" mvar.owner;
   match mvar.mvar_contents with
   | Some v ->
     next_writer mvar;
@@ -90,10 +103,12 @@ let take_available mvar =
     None
 
 let take mvar =
+  Lwt_dls.check_owner "Lwt_mvar.take" mvar.owner;
   match take_available mvar with
   | Some v -> Lwt.return v
   | None -> (Lwt.add_task_r [@ocaml.warning "-3"]) mvar.readers
 
+(* A read, so unchecked, like [Lwt_mutex.is_locked]. *)
 let is_empty mvar =
   match mvar.mvar_contents with
   | Some _ -> false

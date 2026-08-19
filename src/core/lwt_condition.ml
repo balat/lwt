@@ -33,12 +33,21 @@
    module without triggering any more warnings. *)
 module Lwt_sequence = Lwt_sequence
 
-type 'a t = 'a Lwt.u Lwt_sequence.t
+(* DOMAIN-AFFINE, for [Lwt_mutex]'s reason: a condition variable is a queue of
+   waiters, and signalling one from another domain wakes promises that domain does
+   not own -- or, when the queue happens to be empty, does nothing at all, in
+   silence. It becomes a record so that it can carry its domain; the type is
+   abstract in the interface, so that is invisible. *)
+[@@@alert "-lwt_internal"]
 
-let create = Lwt_sequence.create
+type 'a t = { waiters : 'a Lwt.u Lwt_sequence.t; owner : Lwt_dls.token }
+
+let create () =
+  { waiters = Lwt_sequence.create (); owner = Lwt_dls.self_token () }
 
 let wait ?mutex cvar =
-  let waiter = (Lwt.add_task_r [@ocaml.warning "-3"]) cvar in
+  Lwt_dls.check_owner "Lwt_condition.wait" cvar.owner;
+  let waiter = (Lwt.add_task_r [@ocaml.warning "-3"]) cvar.waiters in
   let () =
     match mutex with
     | Some m -> Lwt_mutex.unlock m
@@ -52,17 +61,21 @@ let wait ?mutex cvar =
        | None -> Lwt.return_unit)
 
 let signal cvar arg =
+  Lwt_dls.check_owner "Lwt_condition.signal" cvar.owner;
   try
-    Lwt.wakeup_later (Lwt_sequence.take_l cvar) arg
+    Lwt.wakeup_later (Lwt_sequence.take_l cvar.waiters) arg
   with Lwt_sequence.Empty ->
     ()
 
+let take_all cvar =
+  let wakeners = Lwt_sequence.fold_r (fun x l -> x :: l) cvar.waiters [] in
+  Lwt_sequence.iter_node_l Lwt_sequence.remove cvar.waiters;
+  wakeners
+
 let broadcast cvar arg =
-  let wakeners = Lwt_sequence.fold_r (fun x l -> x :: l) cvar [] in
-  Lwt_sequence.iter_node_l Lwt_sequence.remove cvar;
-  List.iter (fun wakener -> Lwt.wakeup_later wakener arg) wakeners
+  Lwt_dls.check_owner "Lwt_condition.broadcast" cvar.owner;
+  List.iter (fun wakener -> Lwt.wakeup_later wakener arg) (take_all cvar)
 
 let broadcast_exn cvar exn =
-  let wakeners = Lwt_sequence.fold_r (fun x l -> x :: l) cvar [] in
-  Lwt_sequence.iter_node_l Lwt_sequence.remove cvar;
-  List.iter (fun wakener -> Lwt.wakeup_later_exn wakener exn) wakeners
+  Lwt_dls.check_owner "Lwt_condition.broadcast_exn" cvar.owner;
+  List.iter (fun wakener -> Lwt.wakeup_later_exn wakener exn) (take_all cvar)
