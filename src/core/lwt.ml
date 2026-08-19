@@ -568,9 +568,21 @@ module Exception_filter = struct
     | Out_of_memory | Stack_overflow -> false
     | _ -> true
 
-  let v = ref handle_all_except_runtime
-  let set f = v := f
-  let run e = !v e
+  (* Process-wide by design (it decides what the whole program's Lwt machinery
+     may catch), so it stays ONE cell rather than becoming per-domain. Atomic
+     rather than a ref: with several domains, [set] from one and [run] from
+     another is otherwise an unsynchronised access. The type is abstract and the
+     module exposes only [set], so this is invisible from outside.
+
+     [async_exception_hook] is the other process-wide setting and it CANNOT get
+     the same treatment: [lwt.mli] declares it [(exn -> unit) ref], the ref value
+     itself, and code across the ecosystem writes [Lwt.async_exception_hook := f].
+     It therefore stays a ref, and the documented advice is to install it at
+     start-up, before spawning domains, which is where [Domain.spawn] provides
+     the publication. *)
+  let v = Atomic.make handle_all_except_runtime
+  let set f = Atomic.set v f
+  let run e = (Atomic.get v) e
 end
 
 (* Apply the continuation of a bind, turning a synchronous exception into a
