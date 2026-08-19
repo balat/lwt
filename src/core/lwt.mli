@@ -1077,6 +1077,29 @@ exception Canceled
 (** Canceled promises are those rejected with this exception, [Lwt.Canceled].
     See {!Lwt.cancel}. *)
 
+exception Foreign_promise
+(** Raised when a {e pending} promise is mutated from a domain other than the one
+    that created it: binding it, resolving it, cancelling it, or attaching a
+    callback to it. Lwt promises are domain-local, and a promise's callbacks
+    always run on the domain that owns it, so touching a foreign pending promise
+    would corrupt the owner's waiter list. The check is ALWAYS ON, in every
+    build, because the corruption it prevents is silent: a lost callback, or a
+    request that never completes, possibly in an innocent domain.
+
+    Two things are deliberately NOT raised on.
+
+    A {e resolved} promise is immutable and has no owner, so it can be shared and
+    read from any domain. [Lwt.return_unit], a memoised constant, an already
+    forced [lazy]: all safe by construction.
+
+    A read of a pending promise, such as {!Lwt.state}, is not checked either. It
+    cannot corrupt the owner's state, and whether it is guaranteed to observe a
+    fully initialised value across domains is a question for the OCaml memory
+    model rather than for Lwt.
+
+    To pass a value between domains, do not share the promise: use the
+    cross-domain primitives, which resolve a promise LOCAL to each consumer. *)
+
 val task : unit -> ('a t * 'a u)
 (** [Lwt.task] is the same as {!Lwt.wait}, except the resulting promise [p] is
     {{!Lwt.cancel} cancelable}.
