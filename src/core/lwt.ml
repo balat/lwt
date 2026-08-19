@@ -186,12 +186,23 @@ let empty_storage : storage = Storage_map.empty
 (* S0 SPIKE: the scheduler's fiber-local storage moves to a per-domain slot.
    This is the minimal de-globalisation patch of the plan's S0 item 2 --
    [current_storage] and nothing else -- so that the A/B against the unchanged
-   core measures the per-domain lookup and only that. *)
-let current_storage_slot : storage Lwt_dls.t =
-  Lwt_dls.new_key (fun () -> empty_storage)
+   core measures the per-domain lookup and only that.
 
-let[@inline] get_current_storage () = Lwt_dls.get current_storage_slot
-let[@inline] set_current_storage (s : storage) = Lwt_dls.set current_storage_slot s
+   Variant 3 of the spike: the slot holds a RECORD rather than the storage
+   itself, so that a caller can obtain the record once and then read and write
+   the field with no further per-domain lookup. That is section 4a's hot-path
+   strategy, applied where it is cheapest to apply: a waiter installed by [bind]
+   captures the record of the domain that installed it. Sound under the
+   isolation contract, since a promise's callbacks always run on the domain that
+   owns it, which is the domain that created the waiter. *)
+type sched = { mutable storage : storage }
+
+let sched_slot : sched Lwt_dls.t =
+  Lwt_dls.new_key (fun () -> { storage = empty_storage })
+
+let[@inline] self_sched () = Lwt_dls.get sched_slot
+let[@inline] get_current_storage () = (self_sched ()).storage
+let[@inline] set_current_storage (s : storage) = (self_sched ()).storage <- s
 
 let get_from_storage key storage =
   match Storage_map.find_opt key.id storage with
@@ -483,12 +494,14 @@ let bind (type a b) (p : a t) (f : a -> b t) : b t =
   | Pending _ ->
     let result = new_pending () in
     set_cancel_forward result p;
-    let saved = (get_current_storage ()) in
+    (* ONE per-domain lookup, captured by the waiter: see [sched] above. *)
+    let sched = self_sched () in
+    let saved = sched.storage in
     add_waiter p (fun r ->
-      let outer = (get_current_storage ()) in
-      set_current_storage @@ saved;
+      let outer = sched.storage in
+      sched.storage <- saved;
       (match r with Ok v -> forward result (apply f v) | Error e -> fill result (Error e));
-      set_current_storage @@ outer);
+      sched.storage <- outer);
     result
 
 (* Unlike {!bind}, [map] captures a synchronous exception of [f] into a rejected
