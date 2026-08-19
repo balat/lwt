@@ -14,7 +14,20 @@
    ocaml_runtime_exc_6
    set_engine
    domain_exit_hooks
-   domain_engines)))
+   domain_engines
+   domain_channels)))
+
+; The table of open output channels is per domain: [flush_all] flushes the
+; calling domain's channels, and each domain flushes its own when it ends. Needs
+; a second domain, hence OCaml 5.
+
+(test
+ (name domain_channels)
+ (package lwt)
+ (modules domain_channels)
+ (build_if
+  (>= %{ocaml_version} "5.0"))
+ (libraries lwt.unix))
 
 ; An event source belongs to a loop: each domain gets its own engine. Needs a
 ; second domain, hence OCaml 5.

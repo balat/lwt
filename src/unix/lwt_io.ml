@@ -147,12 +147,16 @@ let mode wrapper = wrapper.channel.mode
    suitable, because then all channels will end up in the same hash bucket.
 
    A weak hash set is used instead of a weak array to avoid having to include
-   resizing and compaction code in Lwt_io. *)
+   resizing and compaction code in Lwt_io.
+
+   The counter is shared by every domain and atomic, rather than per domain:
+   bucket spread only matters inside one table, so a second per-domain slot would
+   buy nothing, and the counter is touched once per channel creation. Lost
+   increments would merely collide buckets, but there is no reason to leave a
+   racy read-modify-write in place at this price. *)
 let hash_output_channel =
-  let index = ref 0 in
-  fun () ->
-    index := !index + 1;
-    !index
+  let index = Atomic.make 0 in
+  fun () -> Atomic.fetch_and_add index 1
 
 module Outputs = Weak.Make(struct
     type t = output_channel
@@ -160,9 +164,6 @@ module Outputs = Weak.Make(struct
     let equal = ( == )
   end)
 
-(* Table of all opened output channels. On exit they are all
-   flushed: *)
-let outputs = Outputs.create 32
 
 let position : type mode. mode channel -> int64 = fun wrapper ->
   let ch = wrapper.channel in
@@ -483,8 +484,8 @@ let is_closed wrapper =
   | Closed -> true
   | Busy_primitive | Busy_atomic _ | Waiting_for_busy | Idle | Invalid -> false
 
-let flush_all () =
-  let wrappers = Outputs.fold (fun x l -> x :: l) outputs [] in
+let flush_registry registry =
+  let wrappers = Outputs.fold (fun x l -> x :: l) registry [] in
   Lwt_list.iter_p
     (fun wrapper ->
        Lwt.catch
@@ -492,9 +493,36 @@ let flush_all () =
          (fun _  -> Lwt.return_unit))
     wrappers
 
+(* PER DOMAIN: the table of open output channels, flushed on exit.
+
+   A channel is a mutable buffer plus a lock built out of Lwt promises, so it
+   belongs to the domain that created it, and flushing one means running Lwt
+   operations on that domain. A process-wide table would hand a domain its
+   neighbours' channels to flush, which is precisely the cross-domain use the
+   ownership contract forbids.
+
+   The initialiser registers this domain's flush hook, closing over ITS table
+   rather than reading the slot again. The main domain is excluded because it
+   keeps the historical registration below: exit hooks run last-registered-first,
+   so the one made at module initialisation time runs LAST, after every hook a
+   user has since added, and a lazy registration would slip it in front of them
+   and drop what they wrote. The domain the guard actually excludes is the one
+   that initialises this module, and the test is [is_main_domain] so that the
+   registration happens exactly once in either case. *)
+[@@@alert "-lwt_internal"]
+
+let outputs : Outputs.t Lwt_dls.t =
+  Lwt_dls.new_key (fun () ->
+    let registry = Outputs.create 32 in
+    if not (Lwt_dls.is_main_domain ()) then
+      Lwt_main.at_exit (fun () -> flush_registry registry);
+    registry)
+
+let flush_all () = flush_registry (Lwt_dls.get outputs)
+
 let () =
-  (* Flush all opened output channels on exit: *)
-  Lwt_main.at_exit flush_all
+  (* Flush all output channels opened by THIS domain on exit: *)
+  if Lwt_dls.is_main_domain () then Lwt_main.at_exit flush_all
 
 let no_seek _pos _cmd =
   Lwt.fail (Failure "Lwt_io.seek: seek not supported on this channel")
@@ -546,7 +574,7 @@ let make :
   } in
   (match mode with
    | Input -> ()
-   | Output -> Outputs.add outputs wrapper);
+   | Output -> Outputs.add (Lwt_dls.get outputs) wrapper);
   wrapper
 
 let of_bytes (type m) ~(mode : m mode) bytes =
