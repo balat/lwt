@@ -258,23 +258,29 @@ let drain_deferred () =
     (Queue.pop deferred_callbacks) ()
   done
 
-let leave_resolution_loop (storage_snapshot : storage) : unit =
+(* S0 SPIKE, variant 4: the resolution machinery takes the scheduler record as
+   an argument instead of looking it up. Callers either already hold it (a waiter
+   captured it, see [bind]) or take it once at a public entry point. This is
+   section 4a's "one lookup per scheduler entry, then pass the record down",
+   applied to the path the benchmark exercises; the cold call sites below still
+   look it up at their own site, which is correct but unoptimised. *)
+let leave_resolution_loop (sched : sched) (storage_snapshot : storage) : unit =
   if !current_callback_nesting_depth = 1 then drain_deferred ();
   decr current_callback_nesting_depth;
-  set_current_storage @@ storage_snapshot
+  sched.storage <- storage_snapshot
 
-let run_in_resolution_loop (f : unit -> unit) : unit =
+let run_in_resolution_loop (sched : sched) (f : unit -> unit) : unit =
   incr current_callback_nesting_depth;
-  let storage_snapshot = (get_current_storage ()) in
+  let storage_snapshot = sched.storage in
   f ();
-  leave_resolution_loop storage_snapshot
+  leave_resolution_loop sched storage_snapshot
 
 (* Lwt.Private/abandon_wakeups: bail out of a resolution loop after an
    exception escaped it (https://github.com/ocsigen/lwt/issues/48). *)
 let abandon_resolution_loop () =
   if !current_callback_nesting_depth <> 0 then begin
     current_callback_nesting_depth := 1;
-    leave_resolution_loop empty_storage
+    leave_resolution_loop (self_sched ()) empty_storage
   end
 
 (* ------------------------------------------------------------------ *)
@@ -304,8 +310,8 @@ let run_resolution_callbacks (type a) (pe : a pending) (r : (a, exn) result) :
   | Ok _ | Error _ -> ());
   List.iter (fun w -> w r) pe.waiters
 
-let fill_general (type a) ~allow_deferring ~maximum_callback_nesting_depth
-    (p : a t) (r : (a, exn) result) : unit =
+let fill_general (type a) (sched : sched) ~allow_deferring
+    ~maximum_callback_nesting_depth (p : a t) (r : (a, exn) result) : unit =
   let p = prj p in
   match p.st with
   | Pending pe ->
@@ -314,12 +320,12 @@ let fill_general (type a) ~allow_deferring ~maximum_callback_nesting_depth
       allow_deferring
       && !current_callback_nesting_depth >= maximum_callback_nesting_depth
     then Queue.push (fun () -> run_resolution_callbacks pe r) deferred_callbacks
-    else run_in_resolution_loop (fun () -> run_resolution_callbacks pe r)
+    else run_in_resolution_loop sched (fun () -> run_resolution_callbacks pe r)
   | Fulfilled _ | Rejected _ -> ()
 
 (* Internal resolution: immediate up to the default nesting depth. *)
-let fill (type a) (p : a t) (r : (a, exn) result) : unit =
-  fill_general ~allow_deferring:true
+let fill (type a) (sched : sched) (p : a t) (r : (a, exn) result) : unit =
+  fill_general sched ~allow_deferring:true
     ~maximum_callback_nesting_depth:default_maximum_callback_nesting_depth p r
 
 let add_waiter (type a) (p : a t) (w : (a, exn) result -> unit) : unit =
@@ -340,7 +346,7 @@ let cancel (type a) (p : a t) : unit =
     | Not_cancelable -> ()
     | Cancel_self hook ->
       hook ();
-      fill p (Error Canceled)
+      fill (self_sched ()) p (Error Canceled)
     | Cancel_forward fwd -> fwd ())
   | Fulfilled _ | Rejected _ -> ()
 
@@ -454,11 +460,11 @@ let apply (f : 'a -> 'b t) (v : 'a) : 'b t =
    merge direction would do, the latter saved upstream only by Lwt_main's
    per-lap [poll] compressing the proxy chain — our scheduler serves pauses
    without polling the main promise). *)
-let forward (type a) (result : a t) (p' : a t) : unit =
+let forward (type a) (sched : sched) (result : a t) (p' : a t) : unit =
   let rp' = prj p' in
   match rp'.st with
-  | Fulfilled v' -> fill result (Ok v')
-  | Rejected e -> fill result (Error e)
+  | Fulfilled v' -> fill sched result (Ok v')
+  | Rejected e -> fill sched result (Error e)
   | Pending pe' -> (
     let r = prj result in
     if r == rp' then ()
@@ -474,7 +480,7 @@ let forward (type a) (result : a t) (p' : a t) : unit =
       | Fulfilled _ | Rejected _ ->
         (* [result] already resolved (it was cancelled): drop the link; a
            resolution of [p'] is then a no-op, as Lwt's. *)
-        add_waiter p' (fun r' -> fill result r'))
+        add_waiter p' (fun r' -> fill sched result r'))
 
 (* [bind] is non-blocking (like Lwt's): it does not suspend the caller, so a
    pending bind preserves Lwt's implicit concurrency — e.g.
@@ -500,7 +506,9 @@ let bind (type a b) (p : a t) (f : a -> b t) : b t =
     add_waiter p (fun r ->
       let outer = sched.storage in
       sched.storage <- saved;
-      (match r with Ok v -> forward result (apply f v) | Error e -> fill result (Error e));
+      (match r with
+      | Ok v -> forward sched result (apply f v)
+      | Error e -> fill sched result (Error e));
       sched.storage <- outer);
     result
 
@@ -515,16 +523,17 @@ let map (type a b) (f : a -> b) (p : a t) : b t =
   | Pending _ ->
     let result = new_pending () in
     set_cancel_forward result p;
-    let saved = (get_current_storage ()) in
+    let sched = self_sched () in
+    let saved = sched.storage in
     add_waiter p (fun r ->
-      let outer = (get_current_storage ()) in
-      set_current_storage @@ saved;
+      let outer = sched.storage in
+      sched.storage <- saved;
       (match r with
       | Ok v -> (
-        try fill result (Ok (f v))
-        with e when Exception_filter.run e -> fill result (Error e))
-      | Error e -> fill result (Error e));
-      set_current_storage @@ outer);
+        try fill sched result (Ok (f v))
+        with e when Exception_filter.run e -> fill sched result (Error e))
+      | Error e -> fill sched result (Error e));
+      sched.storage <- outer);
     result
 
 let ( >>= ) = bind
@@ -543,12 +552,13 @@ let try_bind (f : unit -> 'a t) (g : 'a -> 'b t) (h : exn -> 'b t) : 'b t =
   | Pending _ ->
     let result = new_pending () in
     set_cancel_forward result p;
-    let saved = (get_current_storage ()) in
+    let sched = self_sched () in
+    let saved = sched.storage in
     add_waiter p (fun r ->
-      let outer = (get_current_storage ()) in
-      set_current_storage @@ saved;
-      forward result (match r with Ok v -> apply g v | Error e -> apply h e);
-      set_current_storage @@ outer);
+      let outer = sched.storage in
+      sched.storage <- saved;
+      forward sched result (match r with Ok v -> apply g v | Error e -> apply h e);
+      sched.storage <- outer);
     result
 
 let catch (f : unit -> 'a t) (h : exn -> 'a t) : 'a t = try_bind f return h
@@ -574,8 +584,8 @@ let both (a : 'a t) (b : 'b t) : ('a * 'b) t =
     decr remaining;
     if !remaining = 0 then
       match (!failure, !va, !vb) with
-      | Some e, _, _ -> fill result (Error e)
-      | None, Some x, Some y -> fill result (Ok (x, y))
+      | Some e, _, _ -> fill (self_sched ()) result (Error e)
+      | None, Some x, Some y -> fill (self_sched ()) result (Ok (x, y))
       | None, _, _ -> ()
   in
   add_waiter a (fun r ->
@@ -656,7 +666,7 @@ let choose (ps : 'a t list) : 'a t =
     (* The removable waiter fires once (first resolution wins) and detaches
        from the losers, so they don't retain a dead waiter. *)
     let (_ : unit -> unit) =
-      add_removable_waiter_to_each_of ps (fun r -> fill result r)
+      add_removable_waiter_to_each_of ps (fun r -> fill (self_sched ()) result r)
     in
     result
 
@@ -678,7 +688,7 @@ let pick (ps : 'a t list) : 'a t =
     let (_ : unit -> unit) =
       add_removable_waiter_to_each_of ps (fun r ->
         List.iter cancel ps;
-        fill result r)
+        fill (self_sched ()) result r)
     in
     result
 
@@ -703,13 +713,16 @@ let pause () : unit t =
 
 let paused_count () = !paused_n
 
-let wakeup_paused () =
+(* [Lwt.wakeup_paused] is public API and keeps its [unit -> unit] shape; the
+   threaded variant is what the scheduler and the idle hook use. *)
+let wakeup_paused_sched (sched : sched) =
   (* Snapshot first: a [pause] performed while waking lands in the next batch. *)
   let ps = List.rev !paused in
   paused := [];
   paused_n := 0;
-  List.iter (fun p -> fill p ok_unit) ps
+  List.iter (fun p -> fill sched p ok_unit) ps
 
+let wakeup_paused () = wakeup_paused_sched (self_sched ())
 let register_pause_notifier f = pause_notifier := Some f
 let abandon_paused () =
   paused := [];
@@ -731,37 +744,45 @@ let abandon_paused () =
    scheduler is done. Serving pauses one batch per lap (rather than draining
    every pause generation between laps) is what keeps a backend's engine
    iterations from starving under a sustained stream of pauses. *)
-let core_idle () : bool =
-  if !paused_n > 0 then begin wakeup_paused (); true end
+let core_idle (sched : sched) : bool =
+  if !paused_n > 0 then begin
+    wakeup_paused_sched sched;
+    true
+  end
   else false
 
 (* Run at the start of [run] to reset back-end state (e.g. the I/O readiness
    table) that must not leak across independent scheduler runs. *)
 let on_reset : (unit -> unit) ref = ref ignore
 
-let idle_hook : (unit -> bool) ref = ref core_idle
-let set_idle (f : unit -> bool) : unit = idle_hook := f
+(* The hook takes the scheduler record, so that the whole pause-serving path
+   runs on ONE lookup per [run] rather than one per lap. [Private] keeps the
+   historical [unit -> bool] shape for back ends, which do not need it. *)
+let idle_hook : (sched -> bool) ref = ref core_idle
+let set_idle (f : sched -> bool) : unit = idle_hook := f
 
-let rec run_scheduler () : unit =
+let rec run_scheduler (sched : sched) : unit =
   if Run_queue.is_empty run_queue then begin
     (* Run queue drained: advance the world by one lap through the idle hook.
        The hook serves at most one paused batch (and, for a backend, one engine
        iteration) before returning here — so under a sustained stream of pauses
        the engine still runs once per batch instead of after the whole pause
        cascade settles. Returns [false] only when there is nothing left to do. *)
-    if !idle_hook () then run_scheduler ()
+    if !idle_hook sched then run_scheduler sched
   end
   else begin
     (match Run_queue.pop run_queue with
     | Thunk (s, f) ->
-      set_current_storage @@ s;
+      sched.storage <- s;
       f ());
-    run_scheduler ()
+    run_scheduler sched
   end
 
 let run (type a) (main : unit -> a t) : a =
   !on_reset ();
-  set_current_storage @@ empty_storage;
+  (* ONE lookup for the whole run: everything below is threaded. *)
+  let sched = self_sched () in
+  sched.storage <- empty_storage;
   let outcome = ref None in
   (* When [main ()] itself raises synchronously, capture its raw backtrace at
      the boundary so we can re-raise it faithfully below with
@@ -781,7 +802,7 @@ let run (type a) (main : unit -> a t) : a =
     | exception e when Exception_filter.run e ->
       raw_bt := Some (Printexc.get_raw_backtrace ());
       outcome := Some (Error e));
-  run_scheduler ();
+  run_scheduler sched;
   match !outcome with
   | Some (Ok v) -> v
   | Some (Error e) ->
@@ -848,7 +869,7 @@ let wakeup_named (fname : string) (u : 'a u) (r : ('a, exn) result) : unit =
   match (prj p).st with
   | Pending _ ->
     (* [wakeup] never defers: callbacks run now whatever the nesting. *)
-    fill_general ~allow_deferring:false
+    fill_general (self_sched ()) ~allow_deferring:false
       ~maximum_callback_nesting_depth:default_maximum_callback_nesting_depth p
       r
   | Rejected Canceled -> ()
@@ -861,7 +882,8 @@ let wakeup_later_named (fname : string) (u : 'a u) (r : ('a, exn) result) :
   let p = t_of_u u in
   match (prj p).st with
   | Pending _ ->
-    fill_general ~allow_deferring:true ~maximum_callback_nesting_depth:1 p r
+    fill_general (self_sched ()) ~allow_deferring:true
+      ~maximum_callback_nesting_depth:1 p r
   | Rejected Canceled -> ()
   | Fulfilled _ | Rejected _ -> invalid_arg fname
 
@@ -930,8 +952,8 @@ let join (ps : unit t list) : unit t =
           decr remaining;
           if !remaining = 0 then
             match !failure with
-            | None -> fill result (Ok ())
-            | Some e -> fill result (Error e)))
+            | None -> fill (self_sched ()) result (Ok ())
+            | Some e -> fill (self_sched ()) result (Error e)))
       ps;
     result
 
@@ -956,8 +978,8 @@ let all (ps : 'a t list) : 'a list t =
             match !failure with
             | None ->
               (* Every slot is [Some] once [remaining] is 0 with no failure. *)
-              fill result (Ok (Array.to_list values |> List.filter_map Fun.id))
-            | Some e -> fill result (Error e)))
+              fill (self_sched ()) result (Ok (Array.to_list values |> List.filter_map Fun.id))
+            | Some e -> fill (self_sched ()) result (Error e)))
       ps;
     result
 
@@ -991,7 +1013,7 @@ let nchoose (ps : 'a t list) : 'a list t =
        and detaches from the still-pending promises. *)
     let (_ : unit -> unit) =
       add_removable_waiter_to_each_of ps (fun _ ->
-        fill result (nchoose_result ps))
+        fill (self_sched ()) result (nchoose_result ps))
     in
     result
   end
@@ -1018,7 +1040,7 @@ let nchoose_split (type a) (ps : a t list) : (a list * a t list) t =
     let result = new_pending () in
     set_cancel_forward_list result ps;
     let (_ : unit -> unit) =
-      add_removable_waiter_to_each_of ps (fun _ -> fill result (snapshot ()))
+      add_removable_waiter_to_each_of ps (fun _ -> fill (self_sched ()) result (snapshot ()))
     in
     result
   end
@@ -1046,7 +1068,7 @@ let npick (ps : 'a t list) : 'a list t =
       add_removable_waiter_to_each_of ps (fun _ ->
         let r = nchoose_result ps in
         cancel_pending ();
-        fill result r)
+        fill (self_sched ()) result r)
     in
     result
   end
@@ -1131,7 +1153,7 @@ let no_cancel (type a) (p : a t) : a t =
     (match (prj result).st with
     | Pending pe -> pe.cancel <- Not_cancelable
     | Fulfilled _ | Rejected _ -> ());
-    add_waiter p (fun r -> fill result r);
+    add_waiter p (fun r -> fill (self_sched ()) result r);
     result
 let protected (type a) (p : a t) : a t =
   match (prj p).st with
@@ -1142,7 +1164,7 @@ let protected (type a) (p : a t) : a t =
        [protected]+[cancel] against a long-lived [p] does not accumulate dead
        waiters. *)
     let result = new_pending () in
-    let remove = add_removable_waiter_to_each_of [ p ] (fun r -> fill result r) in
+    let remove = add_removable_waiter_to_each_of [ p ] (fun r -> fill (self_sched ()) result r) in
     set_on_cancel result remove;
     result
 
@@ -1154,7 +1176,7 @@ let wrap_in_cancelable (type a) (p : a t) : a t =
   | Fulfilled _ | Rejected _ -> p
   | Pending _ ->
     let result = new_pending () in
-    let remove = add_removable_waiter_to_each_of [ p ] (fun r -> fill result r) in
+    let remove = add_removable_waiter_to_each_of [ p ] (fun r -> fill (self_sched ()) result r) in
     (* Cancel [p] first (if it is cancelable, its rejection flows into the
        mirror through the still-attached waiter, as before); then detach, so a
        non-cancelable long-lived [p] is not left holding a dead waiter. *)
@@ -1258,7 +1280,7 @@ module Private = struct
   (* Effect-scheduler hooks (this core is engine-free): [Lwt_main.run] drives
      the run queue and installs the engine-blocking idle hook through these. *)
   let scheduler_run = run
-  let scheduler_set_idle = set_idle
+  let scheduler_set_idle (f : unit -> bool) = set_idle (fun _ -> f ())
   let scheduler_queue_is_empty () = Run_queue.is_empty run_queue
   let scheduler_enqueue = enqueue
 end
