@@ -8,6 +8,9 @@
    independent cells. The second half only builds from OCaml 5, so it lives in
    its own executable, like the storage test. *)
 
+(* Lwt's own tests may use the internal slot. *)
+[@@@alert "-lwt_internal"]
+
 let check name b = if not b then (Printf.eprintf "FAILED: %s\n" name; exit 1)
 
 let () =

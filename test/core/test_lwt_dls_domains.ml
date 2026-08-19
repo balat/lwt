@@ -6,6 +6,9 @@
    observe the other's writes. Built from OCaml 5 only; the single-domain half is
    in test_lwt_dls.ml and builds everywhere. *)
 
+(* Lwt's own tests may use the internal slot. *)
+[@@@alert "-lwt_internal"]
+
 let check name b = if not b then (Printf.eprintf "FAILED: %s\n" name; exit 1)
 
 let () =

@@ -34,6 +34,10 @@
 module Lwt_sequence = Lwt_sequence
 [@@@ocaml.warning "+3"]
 
+(* The per-domain slot is internal to the Lwt packages; this module is one of
+   the two that may use it. *)
+[@@@alert "-lwt_internal"]
+
 (* The concrete promise is a mutable cell, so its type parameter is necessarily
    {e invariant}. But the public type [+'a t] (below) must be {e covariant} to be
    a drop-in for [Lwt.t] (e.g. so that [int t :> [> ] t] and so that cohttp's

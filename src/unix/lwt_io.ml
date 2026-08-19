@@ -1409,10 +1409,21 @@ let with_file ?buffer ?flags ?perm ~mode filename f =
     (fun () -> f ic)
     (fun () -> close ic)
 
-let prng = lazy (Random.State.make_self_init ())
+(* PER DOMAIN, not a shared lazy. Two reasons, and the second is the real one:
+   forcing a [lazy] from two domains at once raises [Lazy.Undefined] in one of
+   them; and a [Random.State.t] is mutable and was never safe to share, so two
+   domains drawing temporary file names concurrently were racing on it before
+   any of this. One state per domain removes both, and self-initialisation makes
+   the states independent. *)
+[@@@alert "-lwt_internal"]
+
+(* The per-domain slot is internal to the Lwt packages; this module is one of
+   the two that may use it. *)
+let prng : Random.State.t Lwt_dls.t =
+  Lwt_dls.new_key (fun () -> Random.State.make_self_init ())
 
 let temp_file_name temp_dir prefix suffix =
-  let rnd = Random.State.int (Lazy.force prng) 0x1000000 in
+  let rnd = Random.State.int (Lwt_dls.get prng) 0x1000000 in
   Filename.concat temp_dir (Printf.sprintf "%s%06x%s" prefix rnd suffix)
 
 let open_temp_file ?buffer ?flags ?perm ?temp_dir ?prefix ?(suffix = "") () =

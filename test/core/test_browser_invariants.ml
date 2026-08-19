@@ -21,7 +21,9 @@
    6.3.2 with node 18. If a backend ever lacked it, the shim would silently take
    the wrong branch, and this test is the only thing that would say so. *)
 
+(* Lwt's own tests may use the internal slot and Private. *)
 [@@@alert "-trespassing"]
+[@@@alert "-lwt_internal"]
 
 let failures = ref 0
 let check name b = if not b then (Printf.printf "FAILED: %s\n" name; incr failures)
