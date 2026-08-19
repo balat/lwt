@@ -7,7 +7,8 @@
   test_storage_domains
   test_lwt_dls
   test_lwt_dls_domains
-  test_sched_domains)
+  test_sched_domains
+  test_ownership)
  (libraries lwttester))
 
 ; The per-domain slot, single-domain half: builds everywhere, including 4.14.
@@ -35,6 +36,17 @@
  (name test_sched_domains)
  (package lwt)
  (modules test_sched_domains)
+ (build_if
+  (>= %{ocaml_version} "5.0"))
+ (libraries lwt))
+
+; The always-on ownership check, and what it must NOT reject. Needs a second
+; domain, hence OCaml 5.
+
+(test
+ (name test_ownership)
+ (package lwt)
+ (modules test_ownership)
  (build_if
   (>= %{ocaml_version} "5.0"))
  (libraries lwt))

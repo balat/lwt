@@ -98,6 +98,22 @@ and 'a promise_state =
   | Pending of 'a pending
 
 and 'a pending = {
+  owner : sched;
+    (* The scheduler that owns this promise, i.e. the domain that created it.
+
+       IMMUTABLE, so reading it is safe from anywhere and needs no
+       synchronisation; and it lives in the [pending] record, so it costs one
+       word only during the window where mutation is possible, and a RESOLVED
+       promise has no owner at all. That is what makes shared constants such as
+       [Lwt.return_unit] safe by construction rather than by convention: they
+       are born resolved, so there is nothing to compare.
+
+       Stamped at creation rather than claimed on first mutation. Both were
+       measured (study, 13.2ter): claiming spares a per-domain lookup at the
+       creating entry points but makes the field mutable, and the write barrier
+       it then pays on every promise costs slightly more than the lookup saved.
+       Stamping also attributes a violation to the true creator, and it is what
+       the level-2 sanitizer of annexe B.8 needs. *)
   mutable waiters : (('a, exn) result -> unit) list;
     (* Most-recently-added first; each waiter runs once and only enqueues.
 
@@ -394,11 +410,47 @@ let abandon_resolution_loop () =
 (* Promise primitives                                                 *)
 (* ------------------------------------------------------------------ *)
 
-let new_pending () : 'a t =
+exception Foreign_promise
+
+(* The ownership check: a load and a pointer comparison against the scheduler the
+   caller already holds. No per-domain lookup of its own, which is why it is
+   placed at the MUTATION SITES rather than inside [underlying]: [underlying]
+   receives no scheduler and would have to find one on every call, and section 13
+   of the study measured that at about 85 instructions.
+
+   The sites, enumerated rather than assumed, because an earlier version of this
+   comment claimed four and the ownership test immediately found a fifth:
+
+   - CHECKED, one per mutating operation: [fill_general] (writes [p.st]),
+     [add_waiter], [set_on_cancel], [set_cancel_forward],
+     [set_cancel_forward_list], [forward] (which moves waiters between TWO
+     pending records, so both are checked), [both] (sets the cancel mode
+     directly), the remover of a removable waiter (filters waiter lists), and
+     [on_cancel] (writes [cancel_waiters]).
+   - NOT checked because the promise is provably ours: [wait] and [no_cancel]
+     set [Not_cancelable] on a promise [new_pending] has just created for us,
+     so the owner is this scheduler by construction.
+   - NOT checked, and it is the one known hole: the path compression in
+     [underlying], [pe.link <- Some root]. It is a mutation performed on a READ
+     path, and [underlying] receives no scheduler, so checking it would cost a
+     per-domain lookup on every projection, which is precisely what this design
+     avoids. The study anticipated it (only compress when the owner matches);
+     resolving it is a decision recorded in the S1 log, not something to settle
+     silently here.
+
+   Reads are deliberately not checked: a resolved promise is immutable, so a
+   foreign read cannot corrupt anything, and whether a foreign read of a pending
+   promise's state is guaranteed to observe a fully initialised value is the open
+   memory-model question of annexe C.3. *)
+let[@inline] check_owner (sched : sched) (pe : 'a pending) : unit =
+  if pe.owner != sched then raise Foreign_promise
+
+let new_pending (sched : sched) : 'a t =
   inj
     { st =
         Pending
           {
+            owner = sched;
             waiters = [];
             cancel_waiters = [];
             cancel = Cancel_self ignore;
@@ -422,6 +474,7 @@ let fill_general (type a) (sched : sched) ~allow_deferring
   let p = prj p in
   match p.st with
   | Pending pe ->
+    check_owner sched pe;
     p.st <- (match r with Ok v -> Fulfilled v | Error e -> Rejected e);
     if allow_deferring && sched.nesting >= maximum_callback_nesting_depth then
       Queue.push (fun () -> run_resolution_callbacks pe r) sched.deferred
@@ -433,15 +486,20 @@ let fill (type a) (sched : sched) (p : a t) (r : (a, exn) result) : unit =
   fill_general sched ~allow_deferring:true
     ~maximum_callback_nesting_depth:default_maximum_callback_nesting_depth p r
 
-let add_waiter (type a) (p : a t) (w : (a, exn) result -> unit) : unit =
+let add_waiter (type a) (sched : sched) (p : a t)
+    (w : (a, exn) result -> unit) : unit =
   match (prj p).st with
-  | Pending pe -> pe.waiters <- w :: pe.waiters
+  | Pending pe ->
+    check_owner sched pe;
+    pe.waiters <- w :: pe.waiters
   | Fulfilled v -> w (Ok v)
   | Rejected e -> w (Error e)
 
-let set_on_cancel (type a) (p : a t) (f : unit -> unit) : unit =
+let set_on_cancel (type a) (sched : sched) (p : a t) (f : unit -> unit) : unit =
   match (prj p).st with
-  | Pending pe -> pe.cancel <- Cancel_self f
+  | Pending pe ->
+    check_owner sched pe;
+    pe.cancel <- Cancel_self f
   | Fulfilled _ | Rejected _ -> ()
 
 let cancel_gen (type a) (sched : sched) (p : a t) : unit =
@@ -460,16 +518,21 @@ let cancel (type a) (p : a t) : unit = cancel_gen (self_sched ()) p
 
 (* Mark [result] as forwarding cancellation to its current source [src] (no-op
    if [result] is no longer pending). Used by the derived combinators. *)
-let set_cancel_forward (type a b) (result : a t) (src : b t) : unit =
+let set_cancel_forward (type a b) (sched : sched) (result : a t) (src : b t) :
+    unit =
   match (prj result).st with
-  | Pending pe -> pe.cancel <- Cancel_forward (fun sched -> cancel_gen sched src)
+  | Pending pe ->
+    check_owner sched pe;
+    pe.cancel <- Cancel_forward (fun sched -> cancel_gen sched src)
   | Fulfilled _ | Rejected _ -> ()
 
 (* Forward cancellation to a whole list of sources (Lwt's
    [propagate_cancel_to_several], used by choose/pick/join/all/both/nchoose). *)
-let set_cancel_forward_list (type a b) (result : a t) (ps : b t list) : unit =
+let set_cancel_forward_list (type a b) (sched : sched) (result : a t)
+    (ps : b t list) : unit =
   match (prj result).st with
   | Pending pe ->
+    check_owner sched pe;
     pe.cancel <- Cancel_forward (fun sched -> List.iter (cancel_gen sched) ps)
   | Fulfilled _ | Rejected _ -> ()
 
@@ -542,6 +605,8 @@ let forward (type a) (sched : sched) (result : a t) (p' : a t) : unit =
     else
       match r.st with
       | Pending pe ->
+        check_owner sched pe;
+        check_owner sched pe';
         pe.waiters <- pe'.waiters @ pe.waiters;
         pe.cancel_waiters <- pe'.cancel_waiters @ pe.cancel_waiters;
         pe.cancel <- pe'.cancel;
@@ -551,7 +616,7 @@ let forward (type a) (sched : sched) (result : a t) (p' : a t) : unit =
       | Fulfilled _ | Rejected _ ->
         (* [result] already resolved (it was cancelled): drop the link; a
            resolution of [p'] is then a no-op, as Lwt's. *)
-        add_waiter p' (fun r' -> fill sched result r'))
+        add_waiter sched p' (fun r' -> fill sched result r'))
 
 (* [bind] is non-blocking (like Lwt's): it does not suspend the caller, so a
    pending bind preserves Lwt's implicit concurrency — e.g.
@@ -570,10 +635,10 @@ let bind (type a b) (p : a t) (f : a -> b t) : b t =
   | Rejected e -> inj { st = Rejected e }
   | Pending _ ->
     let sched = self_sched () in
-    let result = new_pending () in
-    set_cancel_forward result p;
+    let result = new_pending sched in
+    set_cancel_forward sched result p;
     let saved = sched.storage in
-    add_waiter p (fun r ->
+    add_waiter sched p (fun r ->
       let outer = sched.storage in
       sched.storage <- saved;
       (match r with
@@ -592,10 +657,10 @@ let map (type a b) (f : a -> b) (p : a t) : b t =
   | Rejected e -> inj { st = Rejected e }
   | Pending _ ->
     let sched = self_sched () in
-    let result = new_pending () in
-    set_cancel_forward result p;
+    let result = new_pending sched in
+    set_cancel_forward sched result p;
     let saved = sched.storage in
-    add_waiter p (fun r ->
+    add_waiter sched p (fun r ->
       let outer = sched.storage in
       sched.storage <- saved;
       (match r with
@@ -621,10 +686,10 @@ let try_bind (f : unit -> 'a t) (g : 'a -> 'b t) (h : exn -> 'b t) : 'b t =
   | Rejected e -> h e
   | Pending _ ->
     let sched = self_sched () in
-    let result = new_pending () in
-    set_cancel_forward result p;
+    let result = new_pending sched in
+    set_cancel_forward sched result p;
     let saved = sched.storage in
-    add_waiter p (fun r ->
+    add_waiter sched p (fun r ->
       let outer = sched.storage in
       sched.storage <- saved;
       forward sched result (match r with Ok v -> apply g v | Error e -> apply h e);
@@ -638,9 +703,10 @@ let catch (f : unit -> 'a t) (h : exn -> 'a t) : 'a t = try_bind f return h
    first rejection encountered. Callback-counting, like [join] below. *)
 let both (a : 'a t) (b : 'b t) : ('a * 'b) t =
   let sched = self_sched () in
-  let result = new_pending () in
+  let result = new_pending sched in
   (match (prj result).st with
   | Pending pe ->
+    check_owner sched pe;
     pe.cancel <-
       Cancel_forward
         (fun sched ->
@@ -659,12 +725,12 @@ let both (a : 'a t) (b : 'b t) : ('a * 'b) t =
       | None, Some x, Some y -> fill sched result (Ok (x, y))
       | None, _, _ -> ()
   in
-  add_waiter a (fun r ->
+  add_waiter sched a (fun r ->
     (match r with
     | Ok x -> va := Some x
     | Error e -> if !failure = None then failure := Some e);
     settle sched);
-  add_waiter b (fun r ->
+  add_waiter sched b (fun r ->
     (match r with
     | Ok y -> vb := Some y
     | Error e -> if !failure = None then failure := Some e);
@@ -680,7 +746,7 @@ let both (a : 'a t) (b : 'b t) : ('a * 'b) t =
    leak classic Lwt prevents with [clear_explicitly_removable_callback_cell].
    Returns the remover, for mirrors ([protected]) that must detach on
    cancellation; calling it after the waiter fired is a no-op. *)
-let add_removable_waiter_to_each_of (ps : 'a t list)
+let add_removable_waiter_to_each_of (sched : sched) (ps : 'a t list)
     (f : ('a, exn) result -> unit) : unit -> unit =
   let cell = ref (Some f) in
   let rec wrapper r =
@@ -700,11 +766,12 @@ let add_removable_waiter_to_each_of (ps : 'a t list)
         (fun p ->
           match (prj p).st with
           | Pending pe ->
+            check_owner sched pe;
             pe.waiters <- List.filter (fun w -> w != wrapper) pe.waiters
           | Fulfilled _ | Rejected _ -> ())
         ps
   in
-  List.iter (fun p -> add_waiter p wrapper) ps;
+  List.iter (fun p -> add_waiter sched p wrapper) ps;
   remove
 
 (* Among already-resolved promises, Lwt's [choose]/[pick] prefer a {e rejection};
@@ -733,12 +800,12 @@ let choose (ps : 'a t list) : 'a t =
   match select_resolved ps with
   | Some p -> p
   | None ->
-    let result = new_pending () in
-    set_cancel_forward_list result ps;
+    let result = new_pending sched in
+    set_cancel_forward_list sched result ps;
     (* The removable waiter fires once (first resolution wins) and detaches
        from the losers, so they don't retain a dead waiter. *)
     let (_ : unit -> unit) =
-      add_removable_waiter_to_each_of ps (fun r ->
+      add_removable_waiter_to_each_of sched ps (fun r ->
         fill sched result r)
     in
     result
@@ -752,15 +819,15 @@ let pick (ps : 'a t list) : 'a t =
     List.iter (fun q -> if q != p then cancel q) ps;
     p
   | None ->
-    let result = new_pending () in
-    set_cancel_forward_list result ps;
+    let result = new_pending sched in
+    set_cancel_forward_list sched result ps;
     (* By the time the waiter runs it has detached from the losers, so the
        cancellations below cannot re-enter it; the winner is already resolved,
        so cancelling the whole list only reaches the losers. Cancel BEFORE
        resolving the result, so the losers' cancellation callbacks run first
        (Lwt's ordering). *)
     let (_ : unit -> unit) =
-      add_removable_waiter_to_each_of ps (fun r ->
+      add_removable_waiter_to_each_of sched ps (fun r ->
         List.iter (cancel_gen sched) ps;
         fill sched result r)
     in
@@ -776,7 +843,7 @@ let pick (ps : 'a t list) : 'a t =
    wakeup_paused,register_pause_notifier,abandon_paused}. *)
 let pause () : unit t =
   let sched = self_sched () in
-  let p = new_pending () in
+  let p = new_pending sched in
   sched.paused <- Public_handle.prj p :: sched.paused;
   sched.paused_n <- sched.paused_n + 1;
   (match sched.pause_notifier with Some f -> f sched.paused_n | None -> ());
@@ -871,7 +938,7 @@ let run (type a) (main : unit -> a t) : a =
       match (prj p).st with
       | Fulfilled v -> outcome := Some (Ok v)
       | Rejected e -> outcome := Some (Error e)
-      | Pending _ -> add_waiter p (fun r -> outcome := Some r))
+      | Pending _ -> add_waiter sched p (fun r -> outcome := Some r))
     | exception e when Exception_filter.run e ->
       raw_bt := Some (Printexc.get_raw_backtrace ());
       outcome := Some (Error e));
@@ -921,14 +988,16 @@ let u_of_t (p : 'a t) : 'a u = Public_handle.inj_u (prj p)
 
 (* [wait] promises are not cancelable; [task] promises are (Lwt's model). *)
 let wait () =
-  let p = new_pending () in
+  let sched = self_sched () in
+  let p = new_pending sched in
   (match (prj p).st with
   | Pending pe -> pe.cancel <- Not_cancelable
   | Fulfilled _ | Rejected _ -> ());
   (p, u_of_t p)
 
 let task () =
-  let p = new_pending () in
+  let sched = self_sched () in
+  let p = new_pending sched in
   (p, u_of_t p)
 
 (* Lwt's resolver semantics: resolving an already-resolved promise raises
@@ -1008,17 +1077,18 @@ let finalize f g =
    rejection they still wait for all, then reject with the {e first} rejection
    encountered (already-rejected ones in list order first), as Lwt. *)
 let join (ps : unit t list) : unit t =
+  let sched = self_sched () in
   match ps with
   | [] -> return_unit
   | _ ->
-    let result = new_pending () in
-    set_cancel_forward_list result ps;
+    let result = new_pending sched in
+    set_cancel_forward_list sched result ps;
     let remaining = ref (List.length ps) in
     let failure = ref None in
     let sched = self_sched () in
     List.iter
       (fun p ->
-        add_waiter p (fun r ->
+        add_waiter sched p (fun r ->
           (match r with
           | Error e -> if !failure = None then failure := Some e
           | Ok () -> ());
@@ -1031,11 +1101,12 @@ let join (ps : unit t list) : unit t =
     result
 
 let all (ps : 'a t list) : 'a list t =
+  let sched = self_sched () in
   match ps with
   | [] -> return []
   | _ ->
-    let result = new_pending () in
-    set_cancel_forward_list result ps;
+    let result = new_pending sched in
+    set_cancel_forward_list sched result ps;
     let n = List.length ps in
     let values = Array.make n None in
     let remaining = ref n in
@@ -1043,7 +1114,7 @@ let all (ps : 'a t list) : 'a list t =
     let sched = self_sched () in
     List.iteri
       (fun i p ->
-        add_waiter p (fun r ->
+        add_waiter sched p (fun r ->
           (match r with
           | Ok v -> values.(i) <- Some v
           | Error e -> if !failure = None then failure := Some e);
@@ -1083,12 +1154,12 @@ let nchoose (ps : 'a t list) : 'a list t =
   if any_resolved ps then (
     match nchoose_result ps with Ok vs -> return vs | Error e -> fail e)
   else begin
-    let result = new_pending () in
-    set_cancel_forward_list result ps;
+    let result = new_pending sched in
+    set_cancel_forward_list sched result ps;
     (* Fires once on the first resolution, snapshotting the fulfilled ones,
        and detaches from the still-pending promises. *)
     let (_ : unit -> unit) =
-      add_removable_waiter_to_each_of ps (fun _ ->
+      add_removable_waiter_to_each_of sched ps (fun _ ->
         fill sched result (nchoose_result ps))
     in
     result
@@ -1114,10 +1185,10 @@ let nchoose_split (type a) (ps : a t list) : (a list * a t list) t =
   if any_resolved ps then (
     match snapshot () with Ok x -> return x | Error e -> fail e)
   else begin
-    let result = new_pending () in
-    set_cancel_forward_list result ps;
+    let result = new_pending sched in
+    set_cancel_forward_list sched result ps;
     let (_ : unit -> unit) =
-      add_removable_waiter_to_each_of ps (fun _ ->
+      add_removable_waiter_to_each_of sched ps (fun _ ->
         fill sched result (snapshot ()))
     in
     result
@@ -1138,13 +1209,13 @@ let npick (ps : 'a t list) : 'a list t =
     match r with Ok vs -> return vs | Error e -> fail e
   end
   else begin
-    let result = new_pending () in
-    set_cancel_forward_list result ps;
+    let result = new_pending sched in
+    set_cancel_forward_list sched result ps;
     (* Detached from the losers before it runs, so [cancel_pending] cannot
        re-enter it. Snapshot before cancelling: the cancellations must not
        become the result. *)
     let (_ : unit -> unit) =
-      add_removable_waiter_to_each_of ps (fun _ ->
+      add_removable_waiter_to_each_of sched ps (fun _ ->
         let r = nchoose_result ps in
         cancel_pending ();
         fill sched result r)
@@ -1177,28 +1248,35 @@ let with_registration_storage f =
     sched.storage <- outer
 
 let on_any p f g =
+  let sched = self_sched () in
   let f = with_registration_storage f and g = with_registration_storage g in
-  add_waiter p (function Ok v -> f v | Error e -> g e)
+  add_waiter sched p (function Ok v -> f v | Error e -> g e)
 
 let on_success p f =
+  let sched = self_sched () in
   let f = with_registration_storage f in
-  add_waiter p (function Ok v -> f v | Error _ -> ())
+  add_waiter sched p (function Ok v -> f v | Error _ -> ())
 
 let on_failure p f =
+  let sched = self_sched () in
   let f = with_registration_storage f in
-  add_waiter p (function Ok _ -> () | Error e -> f e)
+  add_waiter sched p (function Ok _ -> () | Error e -> f e)
 
 let on_termination p f =
+  let sched = self_sched () in
   let f = with_registration_storage f in
-  add_waiter p (fun _ -> f ())
+  add_waiter sched p (fun _ -> f ())
 
 (* Runs [f] when the promise is rejected with [Canceled] — whether cancelled
    directly or through propagation. Cancel callbacks run {e before} ordinary
    waiters (Lwt's ordering guarantee); see [fill]. *)
 let on_cancel (type a) (p : a t) (f : unit -> unit) : unit =
+  let sched = self_sched () in
   let f = with_registration_storage f in
   match (prj p).st with
-  | Pending pe -> pe.cancel_waiters <- f :: pe.cancel_waiters
+  | Pending pe ->
+    check_owner sched pe;
+    pe.cancel_waiters <- f :: pe.cancel_waiters
   | Rejected Canceled -> f ()
   | Fulfilled _ | Rejected _ -> ()
 
@@ -1230,11 +1308,11 @@ let no_cancel (type a) (p : a t) : a t =
   match (prj p).st with
   | Fulfilled _ | Rejected _ -> p
   | Pending _ ->
-    let result = new_pending () in
+    let result = new_pending sched in
     (match (prj result).st with
     | Pending pe -> pe.cancel <- Not_cancelable
     | Fulfilled _ | Rejected _ -> ());
-    add_waiter p (fun r -> fill sched result r);
+    add_waiter sched p (fun r -> fill sched result r);
     result
 let protected (type a) (p : a t) : a t =
   let sched = self_sched () in
@@ -1245,12 +1323,12 @@ let protected (type a) (p : a t) : a t =
        cancelling the mirror detaches it from [p], so repeated
        [protected]+[cancel] against a long-lived [p] does not accumulate dead
        waiters. *)
-    let result = new_pending () in
+    let result = new_pending sched in
     let remove =
-      add_removable_waiter_to_each_of [ p ] (fun r ->
+      add_removable_waiter_to_each_of sched [ p ] (fun r ->
         fill sched result r)
     in
-    set_on_cancel result remove;
+    set_on_cancel sched result remove;
     result
 
 (* [wrap_in_cancelable p] mirrors [p] and is cancelable even if [p] is not:
@@ -1261,15 +1339,15 @@ let wrap_in_cancelable (type a) (p : a t) : a t =
   match (prj p).st with
   | Fulfilled _ | Rejected _ -> p
   | Pending _ ->
-    let result = new_pending () in
+    let result = new_pending sched in
     let remove =
-      add_removable_waiter_to_each_of [ p ] (fun r ->
+      add_removable_waiter_to_each_of sched [ p ] (fun r ->
         fill sched result r)
     in
     (* Cancel [p] first (if it is cancelable, its rejection flows into the
        mirror through the still-attached waiter, as before); then detach, so a
        non-cancelable long-lived [p] is not left holding a dead waiter. *)
-    set_on_cancel result (fun () ->
+    set_on_cancel sched result (fun () ->
       cancel p;
       remove ());
     result
