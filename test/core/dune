@@ -8,7 +8,8 @@
   test_lwt_dls
   test_lwt_dls_domains
   test_sched_domains
-  test_ownership)
+  test_ownership
+  test_browser_invariants)
  (libraries lwttester))
 
 ; The per-domain slot, single-domain half: builds everywhere, including 4.14.
@@ -38,6 +39,15 @@
  (modules test_sched_domains)
  (build_if
   (>= %{ocaml_version} "5.0"))
+ (libraries lwt))
+
+; The invariants js_of_ocaml depends on. Runs as an ordinary test everywhere; the
+; header says how to run it as the jsoo smoke test.
+
+(test
+ (name test_browser_invariants)
+ (package lwt)
+ (modules test_browser_invariants)
  (libraries lwt))
 
 ; The always-on ownership check, and what it must NOT reject. Needs a second
