@@ -1,8 +1,26 @@
 (test
  (name main)
  (package lwt)
- (modules :standard \ test_storage_domains)
+ (modules :standard \ test_storage_domains test_lwt_dls test_lwt_dls_domains)
  (libraries lwttester))
+
+; The per-domain slot, single-domain half: builds everywhere, including 4.14.
+
+(test
+ (name test_lwt_dls)
+ (package lwt)
+ (modules test_lwt_dls)
+ (libraries lwt))
+
+; The half that needs two domains.
+
+(test
+ (name test_lwt_dls_domains)
+ (package lwt)
+ (modules test_lwt_dls_domains)
+ (build_if
+  (>= %{ocaml_version} "5.0"))
+ (libraries lwt))
 
 ; Needs real parallelism, so it only builds on OCaml 5.
 

@@ -1,0 +1,27 @@
+(* This file is part of Lwt, released under the MIT license. See LICENSE.md for
+   details, or visit https://github.com/ocsigen/lwt/blob/master/LICENSE.md. *)
+
+(* The per-domain slot on its own, before anything in the core depends on it.
+
+   Two properties matter and only one of them is observable without domains: a
+   slot must behave as a cell for its owner, and two domains must see two
+   independent cells. The second half only builds from OCaml 5, so it lives in
+   its own executable, like the storage test. *)
+
+let check name b = if not b then (Printf.eprintf "FAILED: %s\n" name; exit 1)
+
+let () =
+  (* as a cell, for one domain *)
+  let k = Lwt_dls.new_key (fun () -> 41) in
+  check "initialiser" (Lwt_dls.get k = 41);
+  Lwt_dls.set k 42;
+  check "set then get" (Lwt_dls.get k = 42);
+  (* distinct slots do not alias *)
+  let k2 = Lwt_dls.new_key (fun () -> 0) in
+  Lwt_dls.set k2 7;
+  check "distinct slots" (Lwt_dls.get k = 42 && Lwt_dls.get k2 = 7);
+  (* a slot holding a mutable record: the shape the core actually uses *)
+  let r = Lwt_dls.new_key (fun () -> ref 0) in
+  (Lwt_dls.get r) := 5;
+  check "record in a slot" (!(Lwt_dls.get r) = 5);
+  print_endline "lwt_dls: ok"
