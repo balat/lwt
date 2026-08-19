@@ -52,15 +52,15 @@ module Storage = struct
   let get = Lwt.get
   let set k v =
     let open Lwt_storage in
-    current_storage := (modify_storage k (Some v) !current_storage)
+    set_current_storage (modify_storage k (Some v) (get_current_storage ()))
   let remove k =
     let open Lwt_storage in
-    current_storage := (modify_storage k None !current_storage)
+    set_current_storage (modify_storage k None (get_current_storage ()))
   let reset_to_empty () =
     let open Lwt_storage in
-    current_storage := empty_storage
-  let save_current () = !Lwt_storage.current_storage
-  let restore_current saved = Lwt_storage.current_storage := saved
+    set_current_storage empty_storage
+  let save_current () = Lwt_storage.get_current_storage ()
+  let restore_current saved = Lwt_storage.set_current_storage saved
 end
 
 (* part 3: handling effects *)

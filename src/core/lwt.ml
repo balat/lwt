@@ -38,6 +38,58 @@ module Lwt_sequence = Lwt_sequence
    {e invariant}. But the public type [+'a t] (below) must be {e covariant} to be
    a drop-in for [Lwt.t] (e.g. so that [int t :> [> ] t] and so that cohttp's
    [Cohttp.S.IO] functor, which requires [type +'a t], can be instantiated). *)
+(* ------------------------------------------------------------------ *)
+(* Scheduler state, declared first                                     *)
+(* ------------------------------------------------------------------ *)
+
+(* [storage] and the run queue are declared here, ahead of the promise types,
+   because the scheduler record below is mutually recursive with them: a promise's
+   waiters receive the scheduler, and the scheduler holds the queue of paused
+   promises. Neither of these two mentions promises, so lifting them costs
+   nothing. *)
+module Storage_map = Map.Make (Int)
+
+type storage = exn Storage_map.t
+
+(* A ready unit of work in the run queue. Each task carries the storage to
+   restore before it runs. *)
+type task = Thunk of storage * (unit -> unit)
+
+(* Growable ring buffer used as the run queue. Stdlib.Queue allocates a list
+   cell on every push; this allocates only when it has to grow. Capacity is kept
+   a power of two so indexing uses [land] instead of [mod]. A sentinel fills
+   freed slots so consumed continuations are not retained. *)
+module Run_queue = struct
+  let sentinel : task = Thunk (Storage_map.empty, ignore)
+
+  type t = { mutable a : task array; mutable head : int; mutable len : int }
+
+  let create () = { a = Array.make 16 sentinel; head = 0; len = 0 }
+  let is_empty q = q.len = 0
+
+  let grow q =
+    let cap = Array.length q.a in
+    let a' = Array.make (2 * cap) sentinel in
+    for i = 0 to q.len - 1 do
+      a'.(i) <- q.a.((q.head + i) land (cap - 1))
+    done;
+    q.a <- a';
+    q.head <- 0
+
+  let push q x =
+    if q.len = Array.length q.a then grow q;
+    q.a.((q.head + q.len) land (Array.length q.a - 1)) <- x;
+    q.len <- q.len + 1
+
+  (* Caller must ensure [not (is_empty q)]; avoids allocating an option. *)
+  let pop q =
+    let x = q.a.(q.head) in
+    q.a.(q.head) <- sentinel;
+    q.head <- (q.head + 1) land (Array.length q.a - 1);
+    q.len <- q.len - 1;
+    x
+end
+
 type 'a promise = { mutable st : 'a promise_state }
 
 and 'a promise_state =
@@ -47,7 +99,14 @@ and 'a promise_state =
 
 and 'a pending = {
   mutable waiters : (('a, exn) result -> unit) list;
-    (* Most-recently-added first; each waiter runs once and only enqueues. *)
+    (* Most-recently-added first; each waiter runs once and only enqueues.
+
+       A waiter RECEIVES the scheduler rather than capturing it. It could capture
+       it, since a promise's callbacks always run on the domain that owns it,
+       which is the domain that installed the waiter; but capturing costs one
+       word per waiter, measured at +5 words per suspended bind across the
+       combinators (study, section 13.4), and receiving costs nothing. It also
+       states the invariant in the type. *)
   mutable cancel_waiters : (unit -> unit) list;
     (* [on_cancel] callbacks; run BEFORE [waiters] when rejected with
        [Canceled] (Lwt's ordering guarantee). *)
@@ -73,8 +132,56 @@ and 'a pending = {
    - [Not_cancelable]: [wait]-created (and [no_cancel]) promises ignore [cancel]. *)
 and cancel_mode =
   | Cancel_self of (unit -> unit)
-  | Cancel_forward of (unit -> unit)
+  | Cancel_forward of (sched -> unit)
   | Not_cancelable
+
+(* The scheduler: all of the core's per-scheduler state in ONE record, so that a
+   hot path can obtain it once and then work on fields. Mutually recursive with
+   the promise types because [paused] holds promises and a waiter receives a
+   scheduler.
+
+   Why one record and not one slot per variable: section 13 of the study measured
+   a per-domain slot access at about 85 instructions, i.e. 5.5 % of a suspended
+   bind, so what matters is the NUMBER of accesses. One record reached once per
+   public entry point and then threaded is the shape that keeps that number at
+   one. Grouping itself is free, and in fact measured marginally faster than the
+   globals it replaces, because a threaded record spares the dereferences of
+   several distinct globals.
+
+   In this step the record is still a single global: making it per-domain is the
+   next commit, and it is a two-line change precisely because everything below is
+   already threaded. *)
+and sched = {
+  mutable storage : storage;
+    (* Fiber-local storage in effect, restored around every waiter and before
+       every task the run queue executes. *)
+  mutable nesting : int;
+    (* Depth of the resolution loop: Lwt's tail-call protection, and what
+       [wakeup_later] tests to decide whether to defer. *)
+  deferred : (unit -> unit) Queue.t;
+    (* Callbacks deferred past the nesting cap; drained when the outermost loop
+       exits. *)
+  queue : Run_queue.t;
+    (* Ready work: pauses, and the resumptions of direct-style layers. *)
+  mutable paused : unit promise list;
+  mutable paused_n : int;
+  mutable pause_notifier : (int -> unit) option;
+  on_reset : unit -> unit;
+    (* Back-end state to clear at the start of [run], e.g. an I/O readiness
+       table, which must not leak across independent scheduler runs.
+
+       NOT mutable, and always [ignore], which is faithful: on the lean core this
+       was a [ref] that nothing ever assigned and that the .mli did not expose,
+       so [run] has always called [ignore]. The hook is kept rather than deleted
+       because S2, which converts module initialisers into a per-loop setup and
+       teardown, is exactly what needs it; making it settable belongs there and
+       not here. *)
+  mutable idle : sched -> bool;
+    (* Blocks until external work may have arrived; [false] when there is
+       nothing left to wait for. [Lwt_main] installs its own, driving the
+       engine. It takes the scheduler so that serving pauses costs one lookup
+       per [run] rather than one per lap. *)
+}
 
 exception Canceled
 
@@ -157,10 +264,6 @@ let prj (p : 'a t) : 'a promise = underlying (Public_handle.prj p)
    The current storage is restored before every task the run queue executes (see
    [run_scheduler]) and around every waiter callback, so a value set with
    [with_value] survives suspensions. *)
-module Storage_map = Map.Make (Int)
-
-type storage = exn Storage_map.t
-
 type 'a key = {
   id : int;
   inject : 'a option -> exn;
@@ -182,7 +285,31 @@ let new_key (type a) () : a key =
   { id; inject = (fun v -> M.E v); project = (function M.E v -> v | _ -> None) }
 
 let empty_storage : storage = Storage_map.empty
-let current_storage = ref empty_storage
+
+(* [idle]'s real default, [core_idle], needs the whole resolution machinery and
+   is therefore defined far below; a scheduler record has to exist before that,
+   since [bind] and friends reach for one. Hence one forward cell, set once, and
+   read only on an idle lap. *)
+let default_idle : (sched -> bool) ref = ref (fun _ -> false)
+
+let new_sched () : sched =
+  {
+    storage = empty_storage;
+    nesting = 0;
+    deferred = Queue.create ();
+    queue = Run_queue.create ();
+    paused = [];
+    paused_n = 0;
+    pause_notifier = None;
+    on_reset = ignore;
+    idle = (fun s -> !default_idle s);
+  }
+
+(* S1 step 2: still ONE global, so this commit changes no behaviour. Step 3 puts
+   it in a per-domain slot, and that is a local change precisely because
+   everything below takes the record as an argument. *)
+let the_sched : sched = new_sched ()
+let[@inline] self_sched () = the_sched
 
 let get_from_storage key storage =
   match Storage_map.find_opt key.id storage with
@@ -194,17 +321,20 @@ let modify_storage key value storage =
   | Some _ -> Storage_map.add key.id (key.inject value) storage
   | None -> Storage_map.remove key.id storage
 
-let get key = get_from_storage key !current_storage
+let get key =
+  let sched = self_sched () in
+  get_from_storage key sched.storage
 
 let with_value key value f =
-  let saved = !current_storage in
-  current_storage := modify_storage key value saved;
+  let sched = self_sched () in
+  let saved = sched.storage in
+  sched.storage <- modify_storage key value saved;
   match f () with
   | r ->
-    current_storage := saved;
+    sched.storage <- saved;
     r
   | exception e ->
-    current_storage := saved;
+    sched.storage <- saved;
     raise e
 
 (* ------------------------------------------------------------------ *)
@@ -227,34 +357,33 @@ let with_value key value f =
    catch). *)
 
 let default_maximum_callback_nesting_depth = 42
-let current_callback_nesting_depth = ref 0
-let deferred_callbacks : (unit -> unit) Queue.t = Queue.create ()
 
 (* Runs the deferred callbacks; called at depth 1, so a [wakeup_later]
    performed by a deferred callback is itself deferred and picked up by the
    same drain. *)
-let drain_deferred () =
-  while not (Queue.is_empty deferred_callbacks) do
-    (Queue.pop deferred_callbacks) ()
+let drain_deferred (sched : sched) =
+  while not (Queue.is_empty sched.deferred) do
+    (Queue.pop sched.deferred) ()
   done
 
-let leave_resolution_loop (storage_snapshot : storage) : unit =
-  if !current_callback_nesting_depth = 1 then drain_deferred ();
-  decr current_callback_nesting_depth;
-  current_storage := storage_snapshot
+let leave_resolution_loop (sched : sched) (storage_snapshot : storage) : unit =
+  if sched.nesting = 1 then drain_deferred sched;
+  sched.nesting <- sched.nesting - 1;
+  sched.storage <- storage_snapshot
 
-let run_in_resolution_loop (f : unit -> unit) : unit =
-  incr current_callback_nesting_depth;
-  let storage_snapshot = !current_storage in
+let run_in_resolution_loop (sched : sched) (f : unit -> unit) : unit =
+  sched.nesting <- sched.nesting + 1;
+  let storage_snapshot = sched.storage in
   f ();
-  leave_resolution_loop storage_snapshot
+  leave_resolution_loop sched storage_snapshot
 
 (* Lwt.Private/abandon_wakeups: bail out of a resolution loop after an
    exception escaped it (https://github.com/ocsigen/lwt/issues/48). *)
 let abandon_resolution_loop () =
-  if !current_callback_nesting_depth <> 0 then begin
-    current_callback_nesting_depth := 1;
-    leave_resolution_loop empty_storage
+  let sched = self_sched () in
+  if sched.nesting <> 0 then begin
+    sched.nesting <- 1;
+    leave_resolution_loop sched empty_storage
   end
 
 (* ------------------------------------------------------------------ *)
@@ -284,22 +413,20 @@ let run_resolution_callbacks (type a) (pe : a pending) (r : (a, exn) result) :
   | Ok _ | Error _ -> ());
   List.iter (fun w -> w r) pe.waiters
 
-let fill_general (type a) ~allow_deferring ~maximum_callback_nesting_depth
-    (p : a t) (r : (a, exn) result) : unit =
+let fill_general (type a) (sched : sched) ~allow_deferring
+    ~maximum_callback_nesting_depth (p : a t) (r : (a, exn) result) : unit =
   let p = prj p in
   match p.st with
   | Pending pe ->
     p.st <- (match r with Ok v -> Fulfilled v | Error e -> Rejected e);
-    if
-      allow_deferring
-      && !current_callback_nesting_depth >= maximum_callback_nesting_depth
-    then Queue.push (fun () -> run_resolution_callbacks pe r) deferred_callbacks
-    else run_in_resolution_loop (fun () -> run_resolution_callbacks pe r)
+    if allow_deferring && sched.nesting >= maximum_callback_nesting_depth then
+      Queue.push (fun () -> run_resolution_callbacks pe r) sched.deferred
+    else run_in_resolution_loop sched (fun () -> run_resolution_callbacks pe r)
   | Fulfilled _ | Rejected _ -> ()
 
 (* Internal resolution: immediate up to the default nesting depth. *)
-let fill (type a) (p : a t) (r : (a, exn) result) : unit =
-  fill_general ~allow_deferring:true
+let fill (type a) (sched : sched) (p : a t) (r : (a, exn) result) : unit =
+  fill_general sched ~allow_deferring:true
     ~maximum_callback_nesting_depth:default_maximum_callback_nesting_depth p r
 
 let add_waiter (type a) (p : a t) (w : (a, exn) result -> unit) : unit =
@@ -313,77 +440,43 @@ let set_on_cancel (type a) (p : a t) (f : unit -> unit) : unit =
   | Pending pe -> pe.cancel <- Cancel_self f
   | Fulfilled _ | Rejected _ -> ()
 
-let cancel (type a) (p : a t) : unit =
+let cancel_gen (type a) (sched : sched) (p : a t) : unit =
   match (prj p).st with
   | Pending pe -> (
     match pe.cancel with
     | Not_cancelable -> ()
     | Cancel_self hook ->
       hook ();
-      fill p (Error Canceled)
-    | Cancel_forward fwd -> fwd ())
+      fill sched p (Error Canceled)
+    | Cancel_forward fwd -> fwd sched)
   | Fulfilled _ | Rejected _ -> ()
+
+(* [Lwt.cancel] is public and takes only the promise. *)
+let cancel (type a) (p : a t) : unit = cancel_gen (self_sched ()) p
 
 (* Mark [result] as forwarding cancellation to its current source [src] (no-op
    if [result] is no longer pending). Used by the derived combinators. *)
 let set_cancel_forward (type a b) (result : a t) (src : b t) : unit =
   match (prj result).st with
-  | Pending pe -> pe.cancel <- Cancel_forward (fun () -> cancel src)
+  | Pending pe -> pe.cancel <- Cancel_forward (fun sched -> cancel_gen sched src)
   | Fulfilled _ | Rejected _ -> ()
 
 (* Forward cancellation to a whole list of sources (Lwt's
    [propagate_cancel_to_several], used by choose/pick/join/all/both/nchoose). *)
 let set_cancel_forward_list (type a b) (result : a t) (ps : b t list) : unit =
   match (prj result).st with
-  | Pending pe -> pe.cancel <- Cancel_forward (fun () -> List.iter cancel ps)
+  | Pending pe ->
+    pe.cancel <- Cancel_forward (fun sched -> List.iter (cancel_gen sched) ps)
   | Fulfilled _ | Rejected _ -> ()
 
 (* ------------------------------------------------------------------ *)
 (* Scheduler state                                                    *)
 (* ------------------------------------------------------------------ *)
 
-(* A ready unit of work in the run queue. Each task carries the storage to
-   restore before it runs. *)
-type task = Thunk of storage * (unit -> unit)
 
-(* Growable ring buffer used as the run queue. Stdlib.Queue allocates a list
-   cell on every push; this allocates only when it has to grow. Capacity is kept
-   a power of two so indexing uses [land] instead of [mod]. A sentinel fills
-   freed slots so consumed continuations are not retained. *)
-module Run_queue = struct
-  let sentinel : task = Thunk (Storage_map.empty, ignore)
-
-  type t = { mutable a : task array; mutable head : int; mutable len : int }
-
-  let create () = { a = Array.make 16 sentinel; head = 0; len = 0 }
-  let is_empty q = q.len = 0
-
-  let grow q =
-    let cap = Array.length q.a in
-    let a' = Array.make (2 * cap) sentinel in
-    for i = 0 to q.len - 1 do
-      a'.(i) <- q.a.((q.head + i) land (cap - 1))
-    done;
-    q.a <- a';
-    q.head <- 0
-
-  let push q x =
-    if q.len = Array.length q.a then grow q;
-    q.a.((q.head + q.len) land (Array.length q.a - 1)) <- x;
-    q.len <- q.len + 1
-
-  (* Caller must ensure [not (is_empty q)]; avoids allocating an option. *)
-  let pop q =
-    let x = q.a.(q.head) in
-    q.a.(q.head) <- sentinel;
-    q.head <- (q.head + 1) land (Array.length q.a - 1);
-    q.len <- q.len - 1;
-    x
-end
-
-let run_queue : Run_queue.t = Run_queue.create ()
 let enqueue (f : unit -> unit) : unit =
-  Run_queue.push run_queue (Thunk (!current_storage, f))
+  let sched = self_sched () in
+  Run_queue.push sched.queue (Thunk (sched.storage, f))
 
 (* Shared [Ok ()] outcome: events and [pause] all resolve unit promises, so
    there is no need to allocate a fresh [Ok ()] each time. *)
@@ -434,11 +527,11 @@ let apply (f : 'a -> 'b t) (v : 'a) : 'b t =
    merge direction would do, the latter saved upstream only by Lwt_main's
    per-lap [poll] compressing the proxy chain — our scheduler serves pauses
    without polling the main promise). *)
-let forward (type a) (result : a t) (p' : a t) : unit =
+let forward (type a) (sched : sched) (result : a t) (p' : a t) : unit =
   let rp' = prj p' in
   match rp'.st with
-  | Fulfilled v' -> fill result (Ok v')
-  | Rejected e -> fill result (Error e)
+  | Fulfilled v' -> fill sched result (Ok v')
+  | Rejected e -> fill sched result (Error e)
   | Pending pe' -> (
     let r = prj result in
     if r == rp' then ()
@@ -454,7 +547,7 @@ let forward (type a) (result : a t) (p' : a t) : unit =
       | Fulfilled _ | Rejected _ ->
         (* [result] already resolved (it was cancelled): drop the link; a
            resolution of [p'] is then a no-op, as Lwt's. *)
-        add_waiter p' (fun r' -> fill result r'))
+        add_waiter p' (fun r' -> fill sched result r'))
 
 (* [bind] is non-blocking (like Lwt's): it does not suspend the caller, so a
    pending bind preserves Lwt's implicit concurrency — e.g.
@@ -472,14 +565,17 @@ let bind (type a b) (p : a t) (f : a -> b t) : b t =
   | Fulfilled v -> f v
   | Rejected e -> inj { st = Rejected e }
   | Pending _ ->
+    let sched = self_sched () in
     let result = new_pending () in
     set_cancel_forward result p;
-    let saved = !current_storage in
+    let saved = sched.storage in
     add_waiter p (fun r ->
-      let outer = !current_storage in
-      current_storage := saved;
-      (match r with Ok v -> forward result (apply f v) | Error e -> fill result (Error e));
-      current_storage := outer);
+      let outer = sched.storage in
+      sched.storage <- saved;
+      (match r with
+      | Ok v -> forward sched result (apply f v)
+      | Error e -> fill sched result (Error e));
+      sched.storage <- outer);
     result
 
 (* Unlike {!bind}, [map] captures a synchronous exception of [f] into a rejected
@@ -491,18 +587,19 @@ let map (type a b) (f : a -> b) (p : a t) : b t =
     try return (f v) with e when Exception_filter.run e -> inj { st = Rejected e })
   | Rejected e -> inj { st = Rejected e }
   | Pending _ ->
+    let sched = self_sched () in
     let result = new_pending () in
     set_cancel_forward result p;
-    let saved = !current_storage in
+    let saved = sched.storage in
     add_waiter p (fun r ->
-      let outer = !current_storage in
-      current_storage := saved;
+      let outer = sched.storage in
+      sched.storage <- saved;
       (match r with
       | Ok v -> (
-        try fill result (Ok (f v))
-        with e when Exception_filter.run e -> fill result (Error e))
-      | Error e -> fill result (Error e));
-      current_storage := outer);
+        try fill sched result (Ok (f v))
+        with e when Exception_filter.run e -> fill sched result (Error e))
+      | Error e -> fill sched result (Error e));
+      sched.storage <- outer);
     result
 
 let ( >>= ) = bind
@@ -519,14 +616,15 @@ let try_bind (f : unit -> 'a t) (g : 'a -> 'b t) (h : exn -> 'b t) : 'b t =
   | Fulfilled v -> g v
   | Rejected e -> h e
   | Pending _ ->
+    let sched = self_sched () in
     let result = new_pending () in
     set_cancel_forward result p;
-    let saved = !current_storage in
+    let saved = sched.storage in
     add_waiter p (fun r ->
-      let outer = !current_storage in
-      current_storage := saved;
-      forward result (match r with Ok v -> apply g v | Error e -> apply h e);
-      current_storage := outer);
+      let outer = sched.storage in
+      sched.storage <- saved;
+      forward sched result (match r with Ok v -> apply g v | Error e -> apply h e);
+      sched.storage <- outer);
     result
 
 let catch (f : unit -> 'a t) (h : exn -> 'a t) : 'a t = try_bind f return h
@@ -535,37 +633,38 @@ let catch (f : unit -> 'a t) (h : exn -> 'a t) : 'a t = try_bind f return h
    (the result stays pending until the other resolves), then rejects with the
    first rejection encountered. Callback-counting, like [join] below. *)
 let both (a : 'a t) (b : 'b t) : ('a * 'b) t =
+  let sched = self_sched () in
   let result = new_pending () in
   (match (prj result).st with
   | Pending pe ->
     pe.cancel <-
       Cancel_forward
-        (fun () ->
-          cancel a;
-          cancel b)
+        (fun sched ->
+          cancel_gen sched a;
+          cancel_gen sched b)
   | Fulfilled _ | Rejected _ -> ());
   let va = ref None
   and vb = ref None
   and failure = ref None
   and remaining = ref 2 in
-  let settle () =
+  let settle sched =
     decr remaining;
     if !remaining = 0 then
       match (!failure, !va, !vb) with
-      | Some e, _, _ -> fill result (Error e)
-      | None, Some x, Some y -> fill result (Ok (x, y))
+      | Some e, _, _ -> fill sched result (Error e)
+      | None, Some x, Some y -> fill sched result (Ok (x, y))
       | None, _, _ -> ()
   in
   add_waiter a (fun r ->
     (match r with
     | Ok x -> va := Some x
     | Error e -> if !failure = None then failure := Some e);
-    settle ());
+    settle sched);
   add_waiter b (fun r ->
     (match r with
     | Ok y -> vb := Some y
     | Error e -> if !failure = None then failure := Some e);
-    settle ());
+    settle sched);
   result
 
 (* Removable waiters (Lwt's "explicitly removable callbacks"). One shared cell
@@ -624,6 +723,7 @@ let select_resolved (ps : 'a t list) : 'a t option =
     | l -> Some (List.nth l (Random.int (List.length l))))
 
 let choose (ps : 'a t list) : 'a t =
+  let sched = self_sched () in
   if ps = [] then
     invalid_arg "Lwt.choose [] would return a promise that is pending forever";
   match select_resolved ps with
@@ -634,11 +734,13 @@ let choose (ps : 'a t list) : 'a t =
     (* The removable waiter fires once (first resolution wins) and detaches
        from the losers, so they don't retain a dead waiter. *)
     let (_ : unit -> unit) =
-      add_removable_waiter_to_each_of ps (fun r -> fill result r)
+      add_removable_waiter_to_each_of ps (fun r ->
+        fill sched result r)
     in
     result
 
 let pick (ps : 'a t list) : 'a t =
+  let sched = self_sched () in
   if ps = [] then
     invalid_arg "Lwt.pick [] would return a promise that is pending forever";
   match select_resolved ps with
@@ -655,8 +757,8 @@ let pick (ps : 'a t list) : 'a t =
        (Lwt's ordering). *)
     let (_ : unit -> unit) =
       add_removable_waiter_to_each_of ps (fun r ->
-        List.iter cancel ps;
-        fill result r)
+        List.iter (cancel_gen sched) ps;
+        fill sched result r)
     in
     result
 
@@ -668,30 +770,34 @@ let pick (ps : 'a t list) : 'a t =
    scheduler tick (or by an explicit [wakeup_paused], as Lwt_main does), with a
    count and an optional notifier — conformant with Lwt.{pause,paused_count,
    wakeup_paused,register_pause_notifier,abandon_paused}. *)
-let paused : unit t list ref = ref []
-let paused_n = ref 0
-let pause_notifier : (int -> unit) option ref = ref None
-
 let pause () : unit t =
+  let sched = self_sched () in
   let p = new_pending () in
-  paused := p :: !paused;
-  incr paused_n;
-  (match !pause_notifier with Some f -> f !paused_n | None -> ());
+  sched.paused <- Public_handle.prj p :: sched.paused;
+  sched.paused_n <- sched.paused_n + 1;
+  (match sched.pause_notifier with Some f -> f sched.paused_n | None -> ());
   p
 
-let paused_count () = !paused_n
+let paused_count () = (self_sched ()).paused_n
 
-let wakeup_paused () =
+(* The scheduler is passed in: this is on the pause-serving path, reached once
+   per lap from the idle hook, which already holds the record. *)
+let wakeup_paused_sched (sched : sched) =
   (* Snapshot first: a [pause] performed while waking lands in the next batch. *)
-  let ps = List.rev !paused in
-  paused := [];
-  paused_n := 0;
-  List.iter (fun p -> fill p ok_unit) ps
+  let ps = List.rev sched.paused in
+  sched.paused <- [];
+  sched.paused_n <- 0;
+  List.iter (fun p -> fill sched (inj p) ok_unit) ps
 
-let register_pause_notifier f = pause_notifier := Some f
+(* [Lwt.wakeup_paused] is public and takes no argument. *)
+let wakeup_paused () = wakeup_paused_sched (self_sched ())
+
+let register_pause_notifier f = (self_sched ()).pause_notifier <- Some f
+
 let abandon_paused () =
-  paused := [];
-  paused_n := 0
+  let sched = self_sched () in
+  sched.paused <- [];
+  sched.paused_n <- 0
 
 (* ------------------------------------------------------------------ *)
 (* The scheduler loop                                                 *)
@@ -709,37 +815,43 @@ let abandon_paused () =
    scheduler is done. Serving pauses one batch per lap (rather than draining
    every pause generation between laps) is what keeps a backend's engine
    iterations from starving under a sustained stream of pauses. *)
-let core_idle () : bool =
-  if !paused_n > 0 then begin wakeup_paused (); true end
+let core_idle (sched : sched) : bool =
+  if sched.paused_n > 0 then begin
+    wakeup_paused_sched sched;
+    true
+  end
   else false
 
-(* Run at the start of [run] to reset back-end state (e.g. the I/O readiness
-   table) that must not leak across independent scheduler runs. *)
-let on_reset : (unit -> unit) ref = ref ignore
+(* Close the forward reference opened next to [new_sched]: from here on a fresh
+   scheduler serves its own pauses. *)
+let () = default_idle := core_idle
 
-let idle_hook : (unit -> bool) ref = ref core_idle
-let set_idle (f : unit -> bool) : unit = idle_hook := f
+(* [Lwt.Private.scheduler_set_idle] keeps its historical [unit -> bool] shape,
+   so back ends are unaffected; the record is threaded on our side only. *)
+let set_idle (f : unit -> bool) : unit = (self_sched ()).idle <- fun _ -> f ()
 
-let rec run_scheduler () : unit =
-  if Run_queue.is_empty run_queue then begin
+let rec run_scheduler (sched : sched) : unit =
+  if Run_queue.is_empty sched.queue then begin
     (* Run queue drained: advance the world by one lap through the idle hook.
        The hook serves at most one paused batch (and, for a backend, one engine
        iteration) before returning here — so under a sustained stream of pauses
        the engine still runs once per batch instead of after the whole pause
        cascade settles. Returns [false] only when there is nothing left to do. *)
-    if !idle_hook () then run_scheduler ()
+    if sched.idle sched then run_scheduler sched
   end
   else begin
-    (match Run_queue.pop run_queue with
+    (match Run_queue.pop sched.queue with
     | Thunk (s, f) ->
-      current_storage := s;
+      sched.storage <- s;
       f ());
-    run_scheduler ()
+    run_scheduler sched
   end
 
 let run (type a) (main : unit -> a t) : a =
-  !on_reset ();
-  current_storage := empty_storage;
+  (* ONE lookup for the whole run: everything below is threaded. *)
+  let sched = self_sched () in
+  sched.on_reset ();
+  sched.storage <- empty_storage;
   let outcome = ref None in
   (* When [main ()] itself raises synchronously, capture its raw backtrace at
      the boundary so we can re-raise it faithfully below with
@@ -759,7 +871,7 @@ let run (type a) (main : unit -> a t) : a =
     | exception e when Exception_filter.run e ->
       raw_bt := Some (Printexc.get_raw_backtrace ());
       outcome := Some (Error e));
-  run_scheduler ();
+  run_scheduler sched;
   match !outcome with
   | Some (Ok v) -> v
   | Some (Error e) ->
@@ -826,9 +938,8 @@ let wakeup_named (fname : string) (u : 'a u) (r : ('a, exn) result) : unit =
   match (prj p).st with
   | Pending _ ->
     (* [wakeup] never defers: callbacks run now whatever the nesting. *)
-    fill_general ~allow_deferring:false
-      ~maximum_callback_nesting_depth:default_maximum_callback_nesting_depth p
-      r
+    fill_general (self_sched ()) ~allow_deferring:false
+      ~maximum_callback_nesting_depth:default_maximum_callback_nesting_depth p r
   | Rejected Canceled -> ()
   | Fulfilled _ | Rejected _ -> invalid_arg fname
 
@@ -839,7 +950,8 @@ let wakeup_later_named (fname : string) (u : 'a u) (r : ('a, exn) result) :
   let p = t_of_u u in
   match (prj p).st with
   | Pending _ ->
-    fill_general ~allow_deferring:true ~maximum_callback_nesting_depth:1 p r
+    fill_general (self_sched ()) ~allow_deferring:true
+      ~maximum_callback_nesting_depth:1 p r
   | Rejected Canceled -> ()
   | Fulfilled _ | Rejected _ -> invalid_arg fname
 
@@ -899,6 +1011,7 @@ let join (ps : unit t list) : unit t =
     set_cancel_forward_list result ps;
     let remaining = ref (List.length ps) in
     let failure = ref None in
+    let sched = self_sched () in
     List.iter
       (fun p ->
         add_waiter p (fun r ->
@@ -908,8 +1021,8 @@ let join (ps : unit t list) : unit t =
           decr remaining;
           if !remaining = 0 then
             match !failure with
-            | None -> fill result (Ok ())
-            | Some e -> fill result (Error e)))
+            | None -> fill sched result (Ok ())
+            | Some e -> fill sched result (Error e)))
       ps;
     result
 
@@ -923,6 +1036,7 @@ let all (ps : 'a t list) : 'a list t =
     let values = Array.make n None in
     let remaining = ref n in
     let failure = ref None in
+    let sched = self_sched () in
     List.iteri
       (fun i p ->
         add_waiter p (fun r ->
@@ -934,8 +1048,9 @@ let all (ps : 'a t list) : 'a list t =
             match !failure with
             | None ->
               (* Every slot is [Some] once [remaining] is 0 with no failure. *)
-              fill result (Ok (Array.to_list values |> List.filter_map Fun.id))
-            | Some e -> fill result (Error e)))
+              fill sched result
+                (Ok (Array.to_list values |> List.filter_map Fun.id))
+            | Some e -> fill sched result (Error e)))
       ps;
     result
 
@@ -958,6 +1073,7 @@ let any_resolved ps =
     ps
 
 let nchoose (ps : 'a t list) : 'a list t =
+  let sched = self_sched () in
   if ps = [] then
     invalid_arg "Lwt.nchoose [] would return a promise that is pending forever";
   if any_resolved ps then (
@@ -969,13 +1085,14 @@ let nchoose (ps : 'a t list) : 'a list t =
        and detaches from the still-pending promises. *)
     let (_ : unit -> unit) =
       add_removable_waiter_to_each_of ps (fun _ ->
-        fill result (nchoose_result ps))
+        fill sched result (nchoose_result ps))
     in
     result
   end
 
 (* Like [nchoose], but also returns the promises still pending at that point. *)
 let nchoose_split (type a) (ps : a t list) : (a list * a t list) t =
+  let sched = self_sched () in
   if ps = [] then
     invalid_arg
       "Lwt.nchoose_split [] would return a promise that is pending forever";
@@ -996,12 +1113,14 @@ let nchoose_split (type a) (ps : a t list) : (a list * a t list) t =
     let result = new_pending () in
     set_cancel_forward_list result ps;
     let (_ : unit -> unit) =
-      add_removable_waiter_to_each_of ps (fun _ -> fill result (snapshot ()))
+      add_removable_waiter_to_each_of ps (fun _ ->
+        fill sched result (snapshot ()))
     in
     result
   end
 
 let npick (ps : 'a t list) : 'a list t =
+  let sched = self_sched () in
   if ps = [] then
     invalid_arg "Lwt.npick [] would return a promise that is pending forever";
   let cancel_pending () =
@@ -1024,7 +1143,7 @@ let npick (ps : 'a t list) : 'a list t =
       add_removable_waiter_to_each_of ps (fun _ ->
         let r = nchoose_result ps in
         cancel_pending ();
-        fill result r)
+        fill sched result r)
     in
     result
   end
@@ -1045,12 +1164,13 @@ let hooked f x =
 
 (* Wrap a one-argument callback so it restores the registration-time storage. *)
 let with_registration_storage f =
-  let saved = !current_storage in
+  let sched = self_sched () in
+  let saved = sched.storage in
   fun x ->
-    let outer = !current_storage in
-    current_storage := saved;
+    let outer = sched.storage in
+    sched.storage <- saved;
     hooked f x;
-    current_storage := outer
+    sched.storage <- outer
 
 let on_any p f g =
   let f = with_registration_storage f and g = with_registration_storage g in
@@ -1102,6 +1222,7 @@ let ignore_result p =
 (* [no_cancel p] mirrors [p] but ignores [cancel]; [protected p] mirrors [p]
    and is cancelable without affecting [p] (cancelling rejects the mirror only). *)
 let no_cancel (type a) (p : a t) : a t =
+  let sched = self_sched () in
   match (prj p).st with
   | Fulfilled _ | Rejected _ -> p
   | Pending _ ->
@@ -1109,9 +1230,10 @@ let no_cancel (type a) (p : a t) : a t =
     (match (prj result).st with
     | Pending pe -> pe.cancel <- Not_cancelable
     | Fulfilled _ | Rejected _ -> ());
-    add_waiter p (fun r -> fill result r);
+    add_waiter p (fun r -> fill sched result r);
     result
 let protected (type a) (p : a t) : a t =
+  let sched = self_sched () in
   match (prj p).st with
   | Fulfilled _ | Rejected _ -> p
   | Pending _ ->
@@ -1120,7 +1242,10 @@ let protected (type a) (p : a t) : a t =
        [protected]+[cancel] against a long-lived [p] does not accumulate dead
        waiters. *)
     let result = new_pending () in
-    let remove = add_removable_waiter_to_each_of [ p ] (fun r -> fill result r) in
+    let remove =
+      add_removable_waiter_to_each_of [ p ] (fun r ->
+        fill sched result r)
+    in
     set_on_cancel result remove;
     result
 
@@ -1128,11 +1253,15 @@ let protected (type a) (p : a t) : a t =
    cancelling first forwards to [p] (no-op if [p] is not cancelable — its
    rejection, if any, flows into the mirror), then rejects the mirror. *)
 let wrap_in_cancelable (type a) (p : a t) : a t =
+  let sched = self_sched () in
   match (prj p).st with
   | Fulfilled _ | Rejected _ -> p
   | Pending _ ->
     let result = new_pending () in
-    let remove = add_removable_waiter_to_each_of [ p ] (fun r -> fill result r) in
+    let remove =
+      add_removable_waiter_to_each_of [ p ] (fun r ->
+        fill sched result r)
+    in
     (* Cancel [p] first (if it is cancelable, its rejection flows into the
        mirror through the still-attached waiter, as before); then detach, so a
        non-cancelable long-lived [p] is not left holding a dead waiter. *)
@@ -1227,7 +1356,12 @@ module Private = struct
     let get_from_storage = get_from_storage
     let modify_storage = modify_storage
     let empty_storage = empty_storage
-    let current_storage = current_storage
+
+    (* Was [val current_storage : storage ref]. A [ref] VALUE cannot survive
+       per-domain scheduler state: whoever read it would keep the cell of the
+       domain that loaded the module, for good. See the audit, section 2.1. *)
+    let get_current_storage () = (self_sched ()).storage
+    let set_current_storage s = (self_sched ()).storage <- s
   end
 
   let tracing_context : string key = new_key ()
@@ -1236,7 +1370,7 @@ module Private = struct
      the run queue and installs the engine-blocking idle hook through these. *)
   let scheduler_run = run
   let scheduler_set_idle = set_idle
-  let scheduler_queue_is_empty () = Run_queue.is_empty run_queue
+  let scheduler_queue_is_empty () = Run_queue.is_empty (self_sched ()).queue
   let scheduler_enqueue = enqueue
 end
 
