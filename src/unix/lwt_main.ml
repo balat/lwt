@@ -126,7 +126,7 @@ let run p =
   | None -> ()
   end;
 
-  Lazy.force Lwt_unix.sigchld_handler_installer;
+  Lwt_unix.install_sigchld_handler ();
 
   match run p with
   | result ->
