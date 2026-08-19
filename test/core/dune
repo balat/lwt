@@ -1,7 +1,13 @@
 (test
  (name main)
  (package lwt)
- (modules :standard \ test_storage_domains test_lwt_dls test_lwt_dls_domains)
+ (modules
+  :standard
+  \
+  test_storage_domains
+  test_lwt_dls
+  test_lwt_dls_domains
+  test_sched_domains)
  (libraries lwttester))
 
 ; The per-domain slot, single-domain half: builds everywhere, including 4.14.
@@ -18,6 +24,17 @@
  (name test_lwt_dls_domains)
  (package lwt)
  (modules test_lwt_dls_domains)
+ (build_if
+  (>= %{ocaml_version} "5.0"))
+ (libraries lwt))
+
+; The core scheduler is per domain: two domains each drive their own run queue,
+; pause list and fiber-local storage. Needs two domains, hence OCaml 5.
+
+(test
+ (name test_sched_domains)
+ (package lwt)
+ (modules test_sched_domains)
  (build_if
   (>= %{ocaml_version} "5.0"))
  (libraries lwt))
