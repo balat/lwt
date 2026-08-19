@@ -15,7 +15,20 @@
    set_engine
    domain_exit_hooks
    domain_engines
-   domain_channels)))
+   domain_channels
+   domain_unix_policy)))
+
+; Jobs, signals and child waiting go through the process-wide notification file
+; descriptor, so they belong to the domain that initialised Lwt_unix. Needs a
+; second domain, hence OCaml 5.
+
+(test
+ (name domain_unix_policy)
+ (package lwt)
+ (modules domain_unix_policy)
+ (build_if
+  (>= %{ocaml_version} "5.0"))
+ (libraries lwt.unix))
 
 ; The table of open output channels is per domain: [flush_all] flushes the
 ; calling domain's channels, and each domain flushes its own when it ends. Needs
