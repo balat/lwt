@@ -305,11 +305,15 @@ let new_sched () : sched =
     idle = (fun s -> !default_idle s);
   }
 
-(* S1 step 2: still ONE global, so this commit changes no behaviour. Step 3 puts
-   it in a per-domain slot, and that is a local change precisely because
-   everything below takes the record as an argument. *)
-let the_sched : sched = new_sched ()
-let[@inline] self_sched () = the_sched
+(* S1 step 3: the record moves into a per-domain slot. This is the whole of the
+   de-globalisation, and it is three lines, because step 2 already threaded the
+   record through everything below: a hot path obtains it once at a public entry
+   point and then works on fields.
+
+   [Lwt_dls] is [Domain.DLS] on OCaml 5 and a plain cell on 4.14, so this
+   degrades to exactly the previous global there, and under js_of_ocaml. *)
+let sched_slot : sched Lwt_dls.t = Lwt_dls.new_key new_sched
+let[@inline] self_sched () = Lwt_dls.get sched_slot
 
 let get_from_storage key storage =
   match Storage_map.find_opt key.id storage with
