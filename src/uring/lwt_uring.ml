@@ -105,13 +105,40 @@ let cancel ring job =
 (* ---- multishot accept ---- *)
 
 (* Set to [false] when the kernel rejects a multishot accept (EINVAL: Linux
-   < 5.19): the back end then declines and Lwt_unix uses its readiness path. *)
-let multishot_supported = ref true
+   < 5.19): the back end then declines and Lwt_unix uses its readiness path.
 
-(* One stream per listening descriptor, created at the first hooked accept and
-   torn down when the engine is destroyed (or on accept error). *)
-let accept_streams : (Unix.file_descr, accept_stream) Hashtbl.t =
-  Hashtbl.create 8
+   PROCESS-WIDE, and rightly so: it records what the kernel supports, and there
+   is one kernel. Atomic because any domain's completion handler may be the one
+   that discovers it. *)
+let multishot_supported = Atomic.make true
+
+(* PER DOMAIN, both of them, in one slot.
+
+   An engine belongs to a domain, so its ring does too, and the completion-based
+   I/O must submit to the ring that ITS domain's [iter] reaps: a shared pointer
+   would send one domain's submissions into another domain's ring, where a
+   completion would wake a promise that domain does not own. The accept streams
+   follow the ring, holding as they do the queues of pending acceptors, which are
+   promises of the domain that called accept.
+
+   One slot for the two, per the S2 rule that a module takes one slot, and every
+   function below reads it at most once. That read is a few instructions against
+   an io_uring submission of a few microseconds.
+
+   [ring] is set when an engine is created and cleared when it is destroyed,
+   using physical equality so that replacing one uring engine with another keeps
+   the pointer on the live ring. *)
+[@@@alert "-lwt_internal"]
+
+type uring_state = {
+  mutable ring : req U.t option;
+  accept_streams : (Unix.file_descr, accept_stream) Hashtbl.t;
+}
+
+let state_slot : uring_state Lwt_dls.t =
+  Lwt_dls.new_key (fun () -> { ring = None; accept_streams = Hashtbl.create 8 })
+
+let[@inline] self_state () = Lwt_dls.get state_slot
 
 let arm_accept ring str =
   str.armed <-
@@ -144,15 +171,15 @@ let reject_acceptors str exn =
     str.acceptors;
   Queue.clear str.acceptors
 
-let teardown_accept_streams () =
+let teardown_accept_streams st =
   Hashtbl.iter
     (fun _ str ->
       Queue.iter (fun fd -> try Unix.close fd with _ -> ()) str.accepted;
       Queue.clear str.accepted;
       reject_acceptors str Lwt.Canceled;
       str.armed <- None)
-    accept_streams;
-  Hashtbl.reset accept_streams
+    st.accept_streams;
+  Hashtbl.reset st.accept_streams
 
 let dispatch ring result more data =
   match data with
@@ -172,13 +199,14 @@ let dispatch ring result more data =
       if tr.repeat && tr.t_active then submit_timer ring tr
     end
   | Accept str ->
+    let st = self_state () in
     if not more then str.armed <- None;
     (* The stream is live iff it is still the table entry for its descriptor
        (physical equality: after a close the number may already name a new
        listener with its own stream). Late completions for a dead stream must
        not deliver or re-arm. *)
     let live =
-      match Hashtbl.find_opt accept_streams str.ls_fd with
+      match Hashtbl.find_opt st.accept_streams str.ls_fd with
       | Some s -> s == str
       | None -> false
     in
@@ -196,30 +224,24 @@ let dispatch ring result more data =
             && live
     then begin
       let error = U.error_of_errno result in
-      if error = Unix.EINVAL then multishot_supported := false;
-      Hashtbl.remove accept_streams str.ls_fd;
+      if error = Unix.EINVAL then Atomic.set multishot_supported false;
+      Hashtbl.remove st.accept_streams str.ls_fd;
       reject_acceptors str (Unix.Unix_error (error, "accept", ""))
     end
-
-(* The ring of the currently-installed io_uring engine, if any. It is used by
-   the completion-based I/O of {!Io}, which must submit to the same ring that the
-   engine's [iter] reaps. Set when an engine is created, cleared when it is
-   destroyed (using physical equality so that replacing one uring engine with
-   another keeps the pointer on the live ring). *)
-let the_ring : req U.t option ref = ref None
 
 class uring ?(queue_depth = 256) () = object
   inherit Lwt_engine.abstract
 
   val ring : req U.t = U.create ~queue_depth ()
 
-  initializer the_ring := Some ring
+  initializer (self_state ()).ring <- Some ring
 
   method id = Engine_id__uring
 
   method private cleanup =
-    (match !the_ring with Some r when r == ring -> the_ring := None | _ -> ());
-    teardown_accept_streams ();
+    let st = self_state () in
+    (match st.ring with Some r when r == ring -> st.ring <- None | _ -> ());
+    teardown_accept_streams st;
     U.exit ring
 
   method private register_readable fd f =
@@ -269,10 +291,12 @@ class uring ?(queue_depth = 256) () = object
 end
 
 let get_ring () =
-  match !the_ring with
+  match (self_state ()).ring with
   | Some r -> r
   | None ->
-    failwith "Lwt_uring.Io: no io_uring engine installed (use Lwt_uring.set)"
+    failwith
+      "Lwt_uring.Io: no io_uring engine installed on this domain (use \
+       Lwt_uring.set)"
 
 (* Offset [-1] tells io_uring to use the descriptor's current position, like
    [read(2)]/[write(2)] — used for seekable files. *)
@@ -284,8 +308,7 @@ let current_offset = Optint.Int63.minus_one
    bounce-buffer blit of the bytes read path) so no extra promise is allocated
    on the per-operation hot path. Cancelling the promise cancels the in-flight
    submission. *)
-let submit_io op_name post make =
-  let ring = get_ring () in
+let submit_io ring op_name post make =
   let waiter, wakener = Lwt.task () in
   let job = ref None in
   let handler result =
@@ -343,32 +366,38 @@ module Io = struct
      (which uses [recv]/[send]). *)
   let read fd buf pos len =
     let cs = Cstruct.create_unsafe len in
-    submit_io "read"
+    submit_io (get_ring ()) "read"
       (fun n -> Cstruct.blit_to_bytes cs 0 buf pos n; n)
       (fun ring data -> U.read ring ~file_offset:current_offset fd cs data)
 
   let write fd buf pos len =
     let cs = Cstruct.create_unsafe len in
     Cstruct.blit_from_bytes buf pos cs 0 len;
-    submit_io "write" int_result (fun ring data ->
+    submit_io (get_ring ()) "write" int_result (fun ring data ->
       U.write ring ~file_offset:current_offset fd cs data)
 
   let read_bigarray fd buf pos len =
     let cs = Cstruct.of_bigarray ~off:pos ~len buf in
-    submit_io "read" int_result (fun ring data ->
+    submit_io (get_ring ()) "read" int_result (fun ring data ->
       U.read ring ~file_offset:current_offset fd cs data)
 
   let write_bigarray fd buf pos len =
     let cs = Cstruct.of_bigarray ~off:pos ~len buf in
-    submit_io "write" int_result (fun ring data ->
+    submit_io (get_ring ()) "write" int_result (fun ring data ->
       U.write ring ~file_offset:current_offset fd cs data)
 end
 
 (* Transparent routing of Lwt_unix.{read,write,…} through io_uring. The backend
-   self-gates on [the_ring]: it takes over only while a uring engine is
-   installed, and declines (so Lwt_unix uses its default path) otherwise. It is
-   installed once, when this module is linked; with no uring engine current it
-   has no effect. The operation is chosen per descriptor kind (see {!read_op}),
+   self-gates on the CALLING DOMAIN's ring: it takes over only while that domain
+   has a uring engine installed, and declines (so Lwt_unix uses its default path)
+   otherwise. It is installed once, when this module is linked; with no uring
+   engine current it has no effect.
+
+   That gate is also why the table itself stays process-wide, in one shared
+   [Lwt_unix] cell, rather than becoming per domain: each entry already asks the
+   caller's domain whether it has a ring, so a process where one domain runs
+   io_uring and another runs select needs nothing more, and the [Lwt_unix] read
+   and write paths keep reading one immutable global instead of a slot. The operation is chosen per descriptor kind (see {!read_op}),
    so sockets, files and pipes are each handled correctly. *)
 
 (* Possible improvement: the [bytes] read/write below allocate a fresh off-heap
@@ -383,52 +412,52 @@ end
    ([submit_io]'s [post]), so a read costs one promise, not two. *)
 let completion_backend : Lwt_unix.completion_io =
   let read ch buf pos len =
-    match !the_ring with
+    match (self_state ()).ring with
     | None -> None
-    | Some _ ->
+    | Some ring ->
       let fd = Lwt_unix.unix_file_descr ch and kind = Lwt_unix.fd_kind ch in
       let cs = Cstruct.create_unsafe len in
       Some
-        (submit_io "read"
+        (submit_io ring "read"
            (fun n -> Cstruct.blit_to_bytes cs 0 buf pos n; n)
            (read_op kind fd cs))
   in
   let write ch buf pos len =
-    match !the_ring with
+    match (self_state ()).ring with
     | None -> None
-    | Some _ ->
+    | Some ring ->
       let fd = Lwt_unix.unix_file_descr ch and kind = Lwt_unix.fd_kind ch in
       let cs = Cstruct.create_unsafe len in
       Cstruct.blit_from_bytes buf pos cs 0 len;
-      Some (submit_io "write" int_result (write_op kind fd cs))
+      Some (submit_io ring "write" int_result (write_op kind fd cs))
   in
   let read_bigarray ch buf pos len =
-    match !the_ring with
+    match (self_state ()).ring with
     | None -> None
-    | Some _ ->
+    | Some ring ->
       let fd = Lwt_unix.unix_file_descr ch and kind = Lwt_unix.fd_kind ch in
       let cs = Cstruct.of_bigarray ~off:pos ~len buf in
-      Some (submit_io "read" int_result (read_op kind fd cs))
+      Some (submit_io ring "read" int_result (read_op kind fd cs))
   in
   let write_bigarray ch buf pos len =
-    match !the_ring with
+    match (self_state ()).ring with
     | None -> None
-    | Some _ ->
+    | Some ring ->
       let fd = Lwt_unix.unix_file_descr ch and kind = Lwt_unix.fd_kind ch in
       let cs = Cstruct.of_bigarray ~off:pos ~len buf in
-      Some (submit_io "write" int_result (write_op kind fd cs))
+      Some (submit_io ring "write" int_result (write_op kind fd cs))
   in
   (* Completion-based [connect]: submit IORING_OP_CONNECT and resolve when the
      connection completes (result 0) or fails (negative errno, mapped by
      [submit_io]). The descriptor is the user's own socket — no fd is created, so
      no flag policy is involved. *)
   let connect ch addr =
-    match !the_ring with
+    match (self_state ()).ring with
     | None -> None
-    | Some _ ->
+    | Some ring ->
       let fd = Lwt_unix.unix_file_descr ch in
       Some
-        (submit_io "connect" unit_result (fun ring data ->
+        (submit_io ring "connect" unit_result (fun ring data ->
            U.connect ring fd addr data))
   in
   (* [accept] uses a MULTISHOT accept (IORING_OP_ACCEPT +
@@ -441,14 +470,15 @@ let completion_backend : Lwt_unix.completion_io =
      multishot support the first completion is EINVAL: the back end then
      declines for good and Lwt_unix falls back to its readiness path. *)
   let accept ch =
-    match !the_ring with
+    let st = self_state () in
+    match st.ring with
     | None -> None
     | Some ring ->
-      if not !multishot_supported then None
+      if not (Atomic.get multishot_supported) then None
       else begin
         let fd = Lwt_unix.unix_file_descr ch in
         let str =
-          match Hashtbl.find_opt accept_streams fd with
+          match Hashtbl.find_opt st.accept_streams fd with
           | Some str -> str
           | None ->
             let str =
@@ -459,7 +489,7 @@ let completion_backend : Lwt_unix.completion_io =
                 acceptors = Queue.create ();
               }
             in
-            Hashtbl.add accept_streams fd str;
+            Hashtbl.add st.accept_streams fd str;
             str
         in
         if str.armed = None then arm_accept ring str;
@@ -485,11 +515,12 @@ let completion_backend : Lwt_unix.completion_io =
      accepting after the close), and the table entry would shadow a later
      descriptor reusing the same number. *)
   let on_close fd =
-    match Hashtbl.find_opt accept_streams fd with
+    let st = self_state () in
+    match Hashtbl.find_opt st.accept_streams fd with
     | None -> ()
     | Some str ->
-      Hashtbl.remove accept_streams fd;
-      (match !the_ring, str.armed with
+      Hashtbl.remove st.accept_streams fd;
+      (match st.ring, str.armed with
       | Some ring, Some job ->
         str.armed <- None;
         cancel ring job

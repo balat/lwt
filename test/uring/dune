@@ -1,3 +1,17 @@
+; A ring belongs to an engine and an engine to a domain. Checks the mixed
+; process: one domain on io_uring, another on the default engine. Needs a second
+; domain, hence OCaml 5.
+
+(test
+ (name domain_rings)
+ (package lwt_uring)
+ (modules domain_rings)
+ (enabled_if
+  (= %{system} linux))
+ (build_if
+  (>= %{ocaml_version} "5.0"))
+ (libraries lwt.unix lwt_uring unix))
+
 (test
  (name test_lwt_uring)
  (package lwt_uring)
