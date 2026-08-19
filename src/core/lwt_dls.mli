@@ -1,8 +1,9 @@
 (* This file is part of Lwt, released under the MIT license. See LICENSE.md for
    details, or visit https://github.com/ocsigen/lwt/blob/master/LICENSE.md. *)
 
-(** A per-domain slot, and the only place where the core knows that domains
-    exist.
+(** The per-domain layer: a slot, and the little else the Lwt packages need to
+    know that domains exist. Deliberately the ONLY place with that knowledge, so
+    that the OCaml 4.14 floor and js_of_ocaml are handled once.
 
     Internal to the Lwt packages. The [lwt] library is [wrapped false], so this
     module is importable from anywhere and no wrapping hides it; the alert on its
@@ -30,3 +31,14 @@ val get : 'a t -> 'a
 
 val set : 'a t -> 'a -> unit
   [@@alert lwt_internal "Lwt_dls is internal to the Lwt packages, keep away."]
+
+val is_main_domain : unit -> bool
+  [@@alert lwt_internal "Lwt_dls is internal to the Lwt packages, keep away."]
+(** Always [true] on 4.14, where there is one domain and it is the main one. *)
+
+val at_domain_exit : (unit -> unit) -> unit
+  [@@alert lwt_internal "Lwt_dls is internal to the Lwt packages, keep away."]
+(** [at_domain_exit f] runs [f] when the CURRENT domain exits. On the main domain
+    that is at process exit, and it fires BEFORE every [Stdlib.at_exit] callback,
+    which is why a caller wanting the historical interleaving must keep using
+    [Stdlib.at_exit] for the main domain. On 4.14 it is [Stdlib.at_exit]. *)

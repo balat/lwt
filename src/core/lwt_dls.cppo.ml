@@ -11,6 +11,8 @@ let new_key init = Domain.DLS.new_key init
    [maybe_grow]), so at least spare the wrapper's own frame. *)
 let[@inline] get k = Domain.DLS.get k
 let[@inline] set k v = Domain.DLS.set k v
+let is_main_domain () = Domain.is_main_domain ()
+let at_domain_exit f = Domain.at_exit f
 
 #else
 
@@ -21,5 +23,11 @@ type 'a t = 'a ref
 let new_key init = ref (init ())
 let[@inline] get k = !k
 let[@inline] set k v = k := v
+
+(* One domain, and it is the main one. [at_domain_exit] is therefore never the
+   right hook here, but it is defined rather than omitted so callers need no
+   version test of their own; [Stdlib.at_exit] is its faithful equivalent. *)
+let is_main_domain () = true
+let at_domain_exit f = Stdlib.at_exit f
 
 #endif
