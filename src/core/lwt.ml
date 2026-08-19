@@ -130,38 +130,66 @@ let prj (p : 'a t) : 'a promise = underlying (Public_handle.prj p)
 (* Fiber-local storage (Lwt.key)                                      *)
 (* ------------------------------------------------------------------ *)
 
-(* Same trick as Lwt (no Obj.magic): each key owns a typed scratch cell, and the
-   storage maps a key id to a "refresh" closure that writes the stored value
-   into that cell. The current storage is restored before every task the run
-   queue executes (see [run_scheduler]) and around every waiter callback, so a
-   value set with [with_value] survives suspensions. *)
+(* The storage is heterogeneous: it maps keys of unrelated types to their own
+   values. Lwt obtains that without [Obj.magic] by giving each key a typed
+   scratch CELL and storing, in the map, a closure that writes the value into
+   that cell; [get] then calls the closure and reads the cell back.
+
+   That trick is not thread-safe, and not for a subtle reason: the cell lives in
+   the key, and a key is a single process-wide value (typically created once, at
+   module initialisation). Two systhreads, and later two domains holding
+   perfectly isolated storages, read and write the SAME cell, so one can observe
+   the other's value, or [None].
+
+   We use a sound universal type instead: each key owns a fresh exception
+   CONSTRUCTOR, created with it, and the storage maps ids to [exn]. Injecting is
+   applying the constructor, projecting is matching on it, and what one key
+   injected can never be projected by another. No shared mutable state is left,
+   this stays free of [Obj.magic], and it works on the OCaml 4.14 floor (unlike
+   a [Type.Id]-based heterogeneous map, which needs 5.1).
+
+   The constructor carries the ['a option], not the ['a]: a lookup then returns
+   the option that was stored instead of building a fresh one, so it allocates
+   nothing beyond what [Storage_map.find_opt] does, as before. Measured, per
+   operation: this scheme allocates 9 words where the closure allocated 11 to
+   store a binding, and 2 words in both schemes to read one back.
+
+   The current storage is restored before every task the run queue executes (see
+   [run_scheduler]) and around every waiter callback, so a value set with
+   [with_value] survives suspensions. *)
 module Storage_map = Map.Make (Int)
 
-type storage = (unit -> unit) Storage_map.t
-type 'a key = { id : int; mutable value : 'a option }
+type storage = exn Storage_map.t
+
+type 'a key = {
+  id : int;
+  inject : 'a option -> exn;
+  project : exn -> 'a option;
+    (* [project (inject v) = v], and [project] applied to any other key's
+       injection is [None], the constructor being fresh per key. *)
+}
 
 let next_key_id = ref 0
 
-let new_key () =
+let new_key (type a) () : a key =
+  let module M = struct
+    exception E of a option
+  end in
   let id = !next_key_id in
   incr next_key_id;
-  { id; value = None }
+  { id; inject = (fun v -> M.E v); project = (function M.E v -> v | _ -> None) }
 
 let empty_storage : storage = Storage_map.empty
 let current_storage = ref empty_storage
 
 let get_from_storage key storage =
   match Storage_map.find_opt key.id storage with
-  | Some refresh ->
-    refresh ();
-    let value = key.value in
-    key.value <- None;
-    value
+  | Some e -> key.project e
   | None -> None
 
 let modify_storage key value storage =
   match value with
-  | Some _ -> Storage_map.add key.id (fun () -> key.value <- value) storage
+  | Some _ -> Storage_map.add key.id (key.inject value) storage
   | None -> Storage_map.remove key.id storage
 
 let get key = get_from_storage key !current_storage
