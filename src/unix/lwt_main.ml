@@ -17,8 +17,47 @@ module Lwt_sequence = Lwt_sequence
 
 open Lwt.Infix
 
-let enter_iter_hooks = Lwt_sequence.create ()
-let leave_iter_hooks = Lwt_sequence.create ()
+(* PER DOMAIN. Iteration hooks belong to a loop, not to a process: an enter hook
+   is called around one engine iteration, and with N loops there are N engines.
+   Exit hooks belong to a loop too, since running one means running an Lwt loop,
+   which must happen on the domain that owns the promises involved.
+
+   One slot holding the three, per the rule of the S2 log: a module takes one
+   slot, not one per variable.
+
+   The slot's initialiser has a deliberate side effect: on a domain that is NOT
+   the main one it registers, through [Lwt_dls.at_domain_exit], the runner that
+   drains that domain's exit hooks when the domain terminates. Doing it here
+   rather than in [run] means a domain that registers a hook and never calls
+   [run] still gets it drained. The main domain keeps the historical
+   [Stdlib.at_exit] registered below, and this is not a detail: [Domain.at_exit]
+   fires BEFORE every [Stdlib.at_exit] callback, so moving the main domain over
+   would run Lwt's hooks, [Lwt_io]'s [flush_all] among them, before a user's own
+   [Stdlib.at_exit] handler rather than after it, silently dropping whatever that
+   handler wrote to an Lwt channel. *)
+type hooks = {
+  enter_iter : (unit -> unit) Lwt_sequence.t;
+  leave_iter : (unit -> unit) Lwt_sequence.t;
+  exits : (unit -> unit Lwt.t) Lwt_sequence.t;
+}
+
+let drain_exit_hooks = ref (fun () -> ())
+
+[@@@alert "-lwt_internal"]
+
+let hooks : hooks Lwt_dls.t =
+  Lwt_dls.new_key (fun () ->
+    if not (Lwt_dls.is_main_domain ()) then
+      Lwt_dls.at_domain_exit (fun () -> !drain_exit_hooks ());
+    {
+      enter_iter = Lwt_sequence.create ();
+      leave_iter = Lwt_sequence.create ();
+      exits = Lwt_sequence.create ();
+    })
+
+let enter_iter_hooks () = (Lwt_dls.get hooks).enter_iter
+let leave_iter_hooks () = (Lwt_dls.get hooks).leave_iter
+let exit_hooks () = (Lwt_dls.get hooks).exits
 
 let yield = Lwt.pause
 
@@ -40,7 +79,7 @@ let run (type a) (p : a Lwt.t) : a =
     if not (Lwt.is_sleeping p) then false
     else begin
       (* Call enter hooks. *)
-      Lwt_sequence.iter_l (fun f -> f ()) enter_iter_hooks;
+      Lwt_sequence.iter_l (fun f -> f ()) (enter_iter_hooks ());
 
       (* Do the main loop call. Block only if nothing became ready meanwhile:
          the enter hooks may have resolved promises (e.g. Lwt_direct pumps its
@@ -57,7 +96,7 @@ let run (type a) (p : a Lwt.t) : a =
       Lwt.wakeup_paused ();
 
       (* Call leave hooks. *)
-      Lwt_sequence.iter_l (fun f -> f ()) leave_iter_hooks;
+      Lwt_sequence.iter_l (fun f -> f ()) (leave_iter_hooks ());
 
       true
     end
@@ -136,10 +175,8 @@ let run p =
     finished ();
     raise exn
 
-let exit_hooks = Lwt_sequence.create ()
-
 let rec call_hooks () =
-  match Lwt_sequence.take_opt_l exit_hooks with
+  match Lwt_sequence.take_opt_l (exit_hooks ()) with
   | None ->
     Lwt.return_unit
   | Some f ->
@@ -148,15 +185,19 @@ let rec call_hooks () =
       (fun _  -> Lwt.return_unit) >>= fun () ->
     call_hooks ()
 
-let () =
-  at_exit (fun () ->
-    if not (Lwt_sequence.is_empty exit_hooks) then begin
-      Lwt.abandon_wakeups ();
-      finished ();
-      run (call_hooks ())
-    end)
+(* Drains THIS domain's exit hooks. Used by the main domain's [Stdlib.at_exit]
+   below and, for every other domain, by the [Lwt_dls.at_domain_exit] the hooks
+   slot registers. *)
+let drain () =
+  if not (Lwt_sequence.is_empty (exit_hooks ())) then begin
+    Lwt.abandon_wakeups ();
+    finished ();
+    run (call_hooks ())
+  end
 
-let at_exit f = ignore (Lwt_sequence.add_l f exit_hooks)
+let () = drain_exit_hooks := drain
+let () = at_exit drain
+let at_exit f = ignore (Lwt_sequence.add_l f (exit_hooks ()))
 
 module type Hooks =
 sig
@@ -172,7 +213,10 @@ end
 module type Hook_sequence =
 sig
   type 'return_value kind
-  val sequence : (unit -> unit kind) Lwt_sequence.t
+
+  (* A FUNCTION, not a value: the sequence is per domain, so it must be looked up
+     when the hook is added rather than captured when the functor is applied. *)
+  val sequence : unit -> (unit -> unit kind) Lwt_sequence.t
 end
 
 module Wrap_hooks (Sequence : Hook_sequence) =
@@ -181,18 +225,18 @@ struct
   type hook = (unit -> unit Sequence.kind) Lwt_sequence.node
 
   let add_first hook_fn =
-    let hook_node = Lwt_sequence.add_l hook_fn Sequence.sequence in
+    let hook_node = Lwt_sequence.add_l hook_fn (Sequence.sequence ()) in
     hook_node
 
   let add_last hook_fn =
-    let hook_node = Lwt_sequence.add_r hook_fn Sequence.sequence in
+    let hook_node = Lwt_sequence.add_r hook_fn (Sequence.sequence ()) in
     hook_node
 
   let remove hook_node =
     Lwt_sequence.remove hook_node
 
   let remove_all () =
-    Lwt_sequence.iter_node_l Lwt_sequence.remove Sequence.sequence
+    Lwt_sequence.iter_node_l Lwt_sequence.remove (Sequence.sequence ())
 end
 
 module Enter_iter_hooks =
