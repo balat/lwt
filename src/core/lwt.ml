@@ -430,13 +430,26 @@ exception Foreign_promise
    - NOT checked because the promise is provably ours: [wait] and [no_cancel]
      set [Not_cancelable] on a promise [new_pending] has just created for us,
      so the owner is this scheduler by construction.
-   - NOT checked, and it is the one known hole: the path compression in
-     [underlying], [pe.link <- Some root]. It is a mutation performed on a READ
-     path, and [underlying] receives no scheduler, so checking it would cost a
-     per-domain lookup on every projection, which is precisely what this design
-     avoids. The study anticipated it (only compress when the owner matches);
-     resolving it is a decision recorded in the S1 log, not something to settle
-     silently here.
+   - NOT checked, DELIBERATELY, and this is the one place where a foreign write
+     can happen: the path compression in [underlying], [pe.link <- Some root].
+     It is a mutation on a READ path, and [underlying] receives no scheduler, so
+     checking it would cost a per-domain lookup on every projection, which is
+     what this whole design exists to avoid. It is reachable in exactly the case
+     the interface says is allowed: sharing a RESOLVED promise, whose cell may be
+     a forwarded one whose root is resolved.
+
+     It is benign, and by construction rather than by luck. The write happens
+     only when the chain is longer than one hop, and [root] is the chain's unique
+     terminal cell, so two domains compressing the same chain write [Some root]
+     for the SAME root. A reader therefore sees either the old link or a new one,
+     and both traversals reach the same cell: no interleaving can produce a wrong
+     answer, and there is no update whose loss would matter. It is the classic
+     racy-memoisation pattern, and OCaml 5 guarantees a non-atomic pointer read
+     yields a value that was actually written, never a torn one.
+
+     What it does cost is one entry in the TSan suppression file, since TSan will
+     report it and will be right to: it is a data race, just a harmless one.
+     Recorded for S6 rather than papered over.
 
    Reads are deliberately not checked: a resolved promise is immutable, so a
    foreign read cannot corrupt anything, and whether a foreign read of a pending
