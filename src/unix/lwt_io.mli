@@ -179,7 +179,12 @@ val flush : output_channel -> unit Lwt.t
   (** [flush oc] performs all pending writes on [oc] *)
 
 val flush_all : unit -> unit Lwt.t
-  (** [flush_all ()] flushes all open output channels *)
+  (** [flush_all ()] flushes all output channels opened by the calling domain.
+
+      A channel belongs to the domain that created it, so this does not, and
+      cannot, flush channels created on another domain: flushing one runs Lwt
+      operations on it, which only its owner may do. Each domain flushes its own
+      channels when it terminates. *)
 
 val buffer_size : 'a channel -> int
   (** Returns the size of the internal buffer. *)
