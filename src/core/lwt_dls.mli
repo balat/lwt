@@ -38,18 +38,18 @@ val is_main_domain : unit -> bool
 
 type token = private int
 (** The identity of a domain, as something to compare. It is the domain's
-    identifier, which is cheap: reading a slot instead costs 64 instructions
-    against 9, measured, and the domain-affine containers compare one per
-    operation, down to one per buffered character.
+    identifier, which is both exact and cheap: [Domain.self ()] is documented as
+    unique among all domains a program ever creates, and reading a per-domain slot
+    instead would cost 64 instructions against 9, measured, on a comparison the
+    domain-affine containers make once per operation and, in [Lwt_io], once per
+    buffered character.
 
-    The price is that identifiers are RECYCLED when a domain terminates, so a
-    container created by a domain that has since died can be taken for its own by
-    a later domain that inherited the identifier. That is a missed violation,
-    never a false one, and it needs the owner to be dead.
+    Not [Domain.self_index], which is a slot number and IS reused after a domain
+    terminates.
 
     This is what the domain-affine CONTAINERS are stamped with. Promises carry the
-    core's own scheduler record instead, which is exact and costs nothing extra
-    there, the record being in hand already. *)
+    core's own scheduler record instead, which costs nothing extra there, the
+    record being in hand already. *)
 
 val self_token : unit -> token
   [@@alert lwt_internal "Lwt_dls is internal to the Lwt packages, keep away."]

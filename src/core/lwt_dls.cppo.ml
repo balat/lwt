@@ -19,13 +19,12 @@ let at_domain_exit f = Domain.at_exit f
    [Domain.self ()] plus an integer comparison costs 9. On the buffered-character
    path of [Lwt_io] the slot version more than doubled the cost of a character.
 
-   What it gives up, stated plainly: identifiers are RECYCLED when a domain
-   terminates, so a container created by a domain that has since died could be
-   taken for its own by a later domain that inherited the identifier. That is a
-   missed violation, never a false one, it needs the owner to be dead, and the
-   promise check is unaffected since it compares scheduler records rather than
-   identifiers. Sixty-four instructions per buffered character is not worth that
-   corner. *)
+   And it gives up nothing, which is worth stating because it is easy to assume
+   otherwise: [Domain.self ()] is documented as "an identifier unique among all
+   domains ever created by the program" (it is [Domain.self_index] that is reused
+   after a domain terminates, and its own documentation points here for identity).
+   Measured too: twenty sequential spawn-and-join give 1 to 20, never a repeat. So
+   the comparison is exact, not approximate. *)
 type token = int
 
 let[@inline] self_token () = (Domain.self () :> int)
