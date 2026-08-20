@@ -30,7 +30,7 @@ val available : unit -> bool
 (** [available ()] is [true] if an io_uring ring can be created on this system
     (a recent enough Linux kernel). It never raises. *)
 
-val set : ?queue_depth:int -> unit -> unit
+val set : ?queue_depth:int -> ?deferred:bool -> unit -> unit
 (** [set ?queue_depth ()] installs a fresh io_uring engine as the current Lwt
     engine, transferring the events registered on the previous engine (see
     {!Lwt_engine.set}).
@@ -42,7 +42,21 @@ val set : ?queue_depth:int -> unit -> unit
       full it is flushed and the submission retried, and the kernel backlogs
       completions if the completion queue overflows. A larger value batches more
       registrations per system call at the cost of more locked memory (very
-      large values can fail with [ENOMEM]). Defaults to [256]. *)
+      large values can fail with [ENOMEM]). Defaults to [256].
+    @param deferred
+      whether to ask the kernel for [SINGLE_ISSUER] and [DEFER_TASKRUN]. A
+      per-domain ring is what makes the first legitimate: one loop, on one system
+      thread, owns the ring. Defaults to [false], and falls back silently to a
+      plain ring on a kernel older than 6.0.
+
+      Off by default on two grounds. Measured here, twice, with both
+      configurations interleaved in one process, they bought nothing: -1.7% on a
+      sequential ping-pong and +3.6% on a 50-connection keep-alive load, both
+      inside the noise. And DEFER_TASKRUN has a condition attached: the kernel runs
+      completion work when the ring is entered ASKING FOR EVENTS, which this engine
+      only does when it blocks, so a loop that never goes idle could starve its own
+      I/O. Turning them on for good means entering with GETEVENTS on every
+      iteration, and measuring that somewhere quieter. *)
 
 (** {2 The engine class} *)
 
@@ -52,7 +66,7 @@ type Lwt_engine.engine_id += Engine_id__uring
     when the engine is {{!Lwt_engine.abstract.destroy} destroyed}. Raises
     {!Lwt_sys.Not_available} (wrapping the underlying error) if io_uring is not
     available on this system. *)
-class uring : ?queue_depth:int -> unit -> object
+class uring : ?queue_depth:int -> ?deferred:bool -> unit -> object
   inherit Lwt_engine.t
 end
 
