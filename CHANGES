@@ -2,21 +2,66 @@
 
 ====== Additions ======
 
-  * The Lwt core (module Lwt) is reimplemented over OCaml 5 effects, behind
-    the unchanged lwt.mli: existing code, including the ppx and Lwt_react,
-    runs unchanged (the whole historical test suite passes identically).
-    Promises have no proxy indirection on the common paths, which makes bind
-    chains substantially faster (resolved binds ~2x, suspended bind chains up
-    to ~15x, with 2-3x fewer allocations); tail-recursive bind loops remain
-    O(1) in live memory. Lwt_main.run drives the core's run-queue scheduler,
-    which is also the substrate for direct-style layers. Requires OCaml >= 5.
+  * The Lwt core (module Lwt) is reimplemented behind the unchanged lwt.mli:
+    existing code, including the ppx and Lwt_react, runs unchanged (the whole
+    historical test suite passes identically). A promise is now a flat mutable
+    cell with a flat list of waiters, with no proxy machinery and no callback
+    trees. A bind on an already-resolved promise is a plain application and
+    allocates nothing, so it is about twice as fast, with 25 words down to 9;
+    tail-recursive bind loops remain O(1) in live memory; and callbacks are
+    still resolved synchronously at the wakeup, which is what js_of_ocaml
+    depends on. The waiters that Lwt.choose and Lwt.pick attach are removable,
+    which stops them accumulating on a long-lived promise: worth 8-15% on an
+    in-process cohttp benchmark, with flat memory under load. Lwt_main.run
+    drives a run-queue scheduler that lives in the core and is also the
+    substrate for direct-style layers. The core uses no OCaml 5 effects, and
+    the floor stays at OCaml 4.14.
+
+    In the other direction, a suspended bind costs about 3% more in a
+    microbenchmark, and realistic HTTP saturation measures within 1-3% of the
+    previous core: the core is not where an application's time goes.
+
+  * Several Lwt loops in one program, one per domain, and therefore several
+    cores. Each loop has its own scheduler and run queue, engine, timer wheel,
+    jobs, signal subscriptions, registry of open channels and pool of preemptive
+    threads; nothing is shared unless the program shares it. A second loop is
+    started by calling Lwt_main.run on a spawned domain (the rule against nested
+    calls is now per domain).
+
+    A promise belongs to the loop that created it, and so does a file
+    descriptor, a channel, an Lwt_mutex.t, an Lwt_condition.t, an Lwt_mvar.t, an
+    Lwt_stream.t, an Lwt_pool.t and an Lwt_timeout.t. Using one from another
+    domain raises rather than corrupting it quietly: Lwt.Foreign_promise for a
+    pending promise, Invalid_argument naming the module and function for a
+    container. The checks are always on, in every build; they cost nothing
+    measurable on the resolved-bind path.
+
+    The shape to reach for first needs no communication at all: one domain per
+    core, each with its own listening socket on the same port through
+    SO_REUSEPORT. See "Several loops, one per domain" in the manual, which has
+    the recipe in full, the mistakes that are easy to make, and what is still
+    restricted (fork, the standard channels, Lwt_preemptive's process-wide
+    bounds).
+
+  * lwt_multicore: a new optional package (OCaml >= 5) for the cases where work
+    does have to cross a domain boundary: run_on, a shared value with await and
+    resolve, adopt for a foreign promise, and Mutex, Semaphore, Condition,
+    Stream, Service and Pool. Every operation returns an ordinary local promise,
+    resolved by the calling loop: data crosses, Lwt values do not. It is a
+    separate package so that its saturn dependency stays out of lwt, whose
+    OCaml 4.14 floor and js_of_ocaml support are unaffected.
 
   * lwt_uring: a new optional, Linux-only package providing an io_uring-based
     Lwt_engine and completion-based I/O. Installing it ([Lwt_uring.set ()])
     transparently routes Lwt_unix read/write — including the bigarray path used
     by Lwt_io, and therefore libraries built on it — through io_uring (recv/send
     for sockets, positioned read/write for files), as well as connect, so
-    existing code is accelerated with no source change.
+    existing code is accelerated with no source change. There is one ring per
+    domain, with its own accept streams, so Lwt_uring.set is a per-loop decision
+    and a program may run io_uring on one loop and select on another.
+    SINGLE_ISSUER and DEFER_TASKRUN are offered by [Lwt_uring.set ?deferred] and
+    left off by default: measured twice, they bought nothing here, and
+    DEFER_TASKRUN needs an engine that always enters the ring asking for events.
 
   * Lwt_unix.set_completion_io and Lwt_unix.fd_kind: hooks allowing a
     completion-based I/O backend (such as lwt_uring) to take over read/write and
