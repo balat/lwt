@@ -190,6 +190,53 @@ let suite = suite "ppx" [
       let%lwt { a = _; _ } : M.t = Lwt.return { M.a = 0; b = 0 } in
       Lwt.return_true
     )[@ocaml.warning "-34-69"] ;
+  (* What the ppx's [add_loc] is for. Each ppx bind that a rejection crosses
+     re-raises at that source line, which APPENDS a "Re-raised at" frame, so a
+     backtrace shows the chain of locations the exception travelled through
+     instead of nothing. Nested functions, deliberately: a rejection propagates
+     out through one bind per level, which is what builds the chain. A flat
+     sequence of binds in one body would only ever cross the first.
+
+     Discriminating: with the core ignoring [add_loc], this count is zero. *)
+  test "backtrace: let%lwt reconstructs the chain"
+    (fun () ->
+      let recorded = Printexc.backtrace_status () in
+      Printexc.record_backtrace true;
+      let start, wake = Lwt.wait () in
+      let level3 () =
+        let%lwt () = start in
+        Lwt.return_unit
+      in
+      let level2 () =
+        let%lwt () = level3 () in
+        Lwt.return_unit
+      in
+      let level1 () =
+        let%lwt () = level2 () in
+        Lwt.return_unit
+      in
+      let count needle haystack =
+        let n = String.length needle and l = String.length haystack in
+        let rec go i acc =
+          if i + n > l then acc
+          else if String.sub haystack i n = needle then go (i + n) (acc + 1)
+          else go (i + 1) acc
+        in
+        go 0 0
+      in
+      let frames = ref 0 in
+      let chain = level1 () in
+      Lwt.wakeup_later_exn wake Exit;
+      Lwt.bind
+        (Lwt.catch
+           (fun () -> chain)
+           (fun _ ->
+             frames := count "Re-raised at" (Printexc.get_backtrace ());
+             Lwt.return_unit))
+        (fun () ->
+          if not recorded then Printexc.record_backtrace false;
+          Lwt.return (!frames >= 2)));
+
   test "record-field-infer-brckt"
     (fun () ->
       let module M = struct type t = { a : int; b : int } end in
