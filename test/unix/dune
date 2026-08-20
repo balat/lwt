@@ -28,7 +28,19 @@
    bench_reuseport
    domain_soak
    domain_exit_main
-   domain_wakeup_stress)))
+   domain_wakeup_stress
+   domain_shared_resolved)))
+
+; What the ownership check protects inside a RESOLVED promise, and what it does
+; not. Needs a second domain, hence OCaml 5.
+
+(test
+ (name domain_shared_resolved)
+ (package lwt)
+ (modules domain_shared_resolved)
+ (build_if
+  (>= %{ocaml_version} "5.0"))
+ (libraries lwt.unix))
 
 ; The wake-up protocol under load: many senders, one draining loop, nothing lost.
 ; Needs real domains, hence OCaml 5.
