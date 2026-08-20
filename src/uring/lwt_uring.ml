@@ -122,8 +122,10 @@ let multishot_supported = Atomic.make true
    promises of the domain that called accept.
 
    One slot for the two, per the S2 rule that a module takes one slot, and every
-   function below reads it at most once. That read is a few instructions against
-   an io_uring submission of a few microseconds.
+   function below reads it at most once. Measured, that read is 64 instructions,
+   which is more than it sounds and still nothing against an io_uring submission
+   and completion of some microseconds; the same 64 is why the ownership check on
+   containers asks the domain for its identifier instead of reading a slot.
 
    [ring] is set when an engine is created and cleared when it is destroyed,
    using physical equality so that replacing one uring engine with another keeps
