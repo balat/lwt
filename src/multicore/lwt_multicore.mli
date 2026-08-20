@@ -113,3 +113,31 @@ val cancel : 'a t -> unit
 val is_pending : 'a t -> bool
 (** Whether [t] has yet to be resolved. A snapshot, and the answer may already be
     stale when it reaches you: useful for reporting, never for deciding. *)
+
+(** {2 Adopting a foreign promise} *)
+
+exception Cannot_adopt
+(** Raised by {!adopt} when the promise's owning loop cannot be reached: either
+    its domain has terminated, or it never took a handle with {!self}. A loop that
+    may be adopted from must have called {!self} once; any loop that takes part in
+    this module's traffic has. *)
+
+val adopt : 'a Lwt.t -> 'a Lwt.t
+(** [adopt p] is a LOCAL promise that follows [p], which may belong to another
+    domain. After it, plain {!Lwt.bind} works as usual.
+
+    This is the explicit escape hatch for a promise you cannot change the making
+    of: one created by a library on the domain that initialised it, typically.
+    Waiting on it directly would raise {!Lwt.Foreign_promise}, and rightly so,
+    since attaching a callback to a foreign pending promise is what corrupts its
+    owner's waiter list.
+
+    What it does instead is ask the OWNER to attach the callback, on its own
+    domain, and hand the outcome over as data. So it costs one round trip, and it
+    requires the owner's loop to be running: a promise whose owner has stopped
+    running a loop will never resolve here either.
+
+    Returns [p] itself when it is already resolved, or already ours: both are
+    correct and free.
+
+    @raise Cannot_adopt if the owning loop cannot be reached. *)

@@ -1,8 +1,12 @@
 (* This file is part of Lwt, released under the MIT license. See LICENSE.md for
    details, or visit https://github.com/ocsigen/lwt/blob/master/LICENSE.md. *)
 
-(* This module is part of the Lwt packages, so it may use the per-domain layer. *)
+(* This module is part of the Lwt packages, so it may use the per-domain layer.
+   It is also a legitimate user of [Lwt.Private]: adopting a foreign promise means
+   asking its owner to attach the callback, which requires knowing who the owner
+   is, and the core is the only thing that knows. *)
 [@@@alert "-lwt_internal"]
+[@@@alert "-trespassing"]
 
 (* MULTI-PRODUCER, SINGLE-CONSUMER, which is exactly the shape: any domain posts,
    the owning loop drains. Saturn's queue is lock-free and verified upstream, and
@@ -11,6 +15,9 @@
 module Inbox = Saturn.Single_consumer_queue
 
 type loop = {
+  (* Which domain this loop belongs to, so that a promise owned by that domain
+     can be routed to it. *)
+  dom : int;
   inbox : (unit -> unit) Inbox.t;
   (* Wakes this loop. A notification id names the channel of the domain that
      created it, so sending it from anywhere wakes the right loop; that machinery
@@ -33,17 +40,44 @@ let drain inbox =
   in
   go ()
 
+(* EVERY LOOP THAT HAS A HANDLE, by domain. Shared, hence the mutex, and consulted
+   only by [adopt], which is the one thing that has to find a loop it was not
+   given. A loop registers itself when its handle is created and deregisters when
+   its domain exits. *)
+let registry : (int, loop) Hashtbl.t = Hashtbl.create 8
+let registry_mutex = Mutex.create ()
+
+let register l =
+  Mutex.lock registry_mutex;
+  Hashtbl.replace registry l.dom l;
+  Mutex.unlock registry_mutex
+
+let deregister dom =
+  Mutex.lock registry_mutex;
+  Hashtbl.remove registry dom;
+  Mutex.unlock registry_mutex
+
+let registered dom =
+  Mutex.lock registry_mutex;
+  let l = Hashtbl.find_opt registry dom in
+  Mutex.unlock registry_mutex;
+  l
+
 let self_slot : loop Lwt_dls.t =
   Lwt_dls.new_key (fun () ->
+    let dom = (Domain.self () :> int) in
     let inbox = Inbox.create () in
     let notification = Lwt_unix.make_notification (fun () -> drain inbox) in
+    let l = { dom; inbox; notification } in
+    register l;
     (* Closing the inbox is what makes a later [run_on] fail instead of dropping
        work silently. The notification goes too, so the id stops naming a live
-       handler. *)
+       handler, and the registry entry with it. *)
     Lwt_dls.at_domain_exit (fun () ->
       Inbox.close inbox;
-      Lwt_unix.stop_notification notification);
-    { inbox; notification })
+      Lwt_unix.stop_notification notification;
+      deregister dom);
+    l)
 
 let self () = Lwt_dls.get self_slot
 
@@ -175,3 +209,38 @@ let await t =
        and the other waiters alone. *)
     Lwt.on_cancel promise (fun () -> withdraw t w);
     promise
+
+(* +-----------------------------------------------------------------+
+   | Adopting a foreign promise                                      |
+   +-----------------------------------------------------------------+ *)
+
+exception Cannot_adopt
+
+let adopt (p : 'a Lwt.t) : 'a Lwt.t =
+  match Lwt.Private.promise_owner_domain p with
+  (* Already resolved, so owned by nobody and readable from anywhere. *)
+  | None -> p
+  | Some owner ->
+    if owner = (Domain.self () :> int) then
+      (* Ours already. Adopting it would be a needless round trip, and returning
+         it unchanged is what the caller means. *)
+      p
+    else begin
+      match registered owner with
+      | None -> raise Cannot_adopt
+      | Some owner_loop ->
+        let shared = create () in
+        (* The callback is attached BY THE OWNER, on its own domain: attaching it
+           ourselves is precisely what the ownership check forbids, and is the
+           reason this function exists. If the promise resolves before the thunk
+           runs, [on_any] fires at once, which is the same outcome. *)
+        (match
+           run_on owner_loop (fun () ->
+             Lwt.on_any p
+               (fun v -> resolve shared v)
+               (fun e -> reject shared e))
+         with
+         | () -> ()
+         | exception Loop_terminated -> raise Cannot_adopt);
+        await shared
+    end
