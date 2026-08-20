@@ -226,7 +226,11 @@ val fork : unit -> int
       - Calling [Lwt_unix.fork] can result in the child process being in a
         corrupted state if any thread has been started. Lwt starts threads when
         [Lwt_preemptive.detach] is called. Lwt implicitly starts threads to
-        perform blocking I/O unless the {!async_method} is set to [Async_none]. *)
+        perform blocking I/O unless the {!async_method} is set to [Async_none].
+      - It must be called on the domain that initialised this module, and raises
+        [Failure] elsewhere. It also reinitialises that domain's notification
+        channel and abandons its jobs, so calling it from another domain would
+        leave both this domain and that one in a state neither expects. *)
 
 type process_status =
     Unix.process_status =
