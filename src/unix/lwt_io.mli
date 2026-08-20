@@ -38,7 +38,15 @@ exception Channel_closed of string
 (** {2 Types} *)
 
 type 'mode channel
-  (** Type of buffered byte channels *)
+  (** Type of buffered byte channels.
+
+      A channel belongs to the domain that created it: it is a mutable buffer
+      plus a lock built out of Lwt promises, and its operations run on the
+      domain whose loop owns those promises. Using a channel from another domain
+      raises [Invalid_argument] rather than corrupting the buffer. {!stdout},
+      {!stderr} and {!stdin} are created when this module is initialised, so they
+      belong to that domain; another domain writing to standard output makes its
+      own channel over the same descriptor with {!of_fd}. *)
 
 type input
   (** Input mode *)

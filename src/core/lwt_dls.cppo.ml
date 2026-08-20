@@ -50,7 +50,9 @@ let[@inline] self_token () = the_token
 let[@inline never] foreign name =
   invalid_arg
     (name
-    ^ ": this value belongs to another domain. An Lwt container that holds        waiters lives on one domain, the one whose loop runs its callbacks")
+    ^ ": belongs to another domain. An Lwt value that holds waiters, "
+    ^ "or that does I/O, lives on the domain that created it, the one whose "
+    ^ "loop runs its callbacks")
 
 let[@inline] check_owner name owner =
   if owner != self_token () then foreign name
