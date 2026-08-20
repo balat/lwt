@@ -3,7 +3,13 @@
 
 
 
-(** Process management *)
+(** Process management
+
+    On Unix, spawning goes through {!Lwt_unix.fork}, so it inherits that
+    function's restriction: it must happen on the domain that initialised
+    {!Lwt_unix}, the runtime not supporting a fork while several domains run.
+    Everything else here, including waiting for the process, works on any
+    domain. *)
 
 (** This module allows you to spawn processes and communicate with them.
 
