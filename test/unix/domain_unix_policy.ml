@@ -68,15 +68,25 @@ let () =
   Lwt_main.run (Lwt_unix.sleep 0.05);
   check "a notification sent from another domain fires on the owner" !fired;
 
+  (* The other direction, and it is the part that changed when every loop got its
+     own channel: a notification created on another domain belongs to THAT
+     domain's channel, so it fires there, on the domain that created it, and not
+     here. The other domain therefore has to run its own loop to see it. *)
+  let fired_here = ref false in
   let fired_there = ref false in
-  let n2 =
-    on_other_domain (fun () ->
-      Lwt_unix.make_notification ~once:true (fun () -> fired_there := true))
-  in
-  Lwt_unix.send_notification n2;
-  Lwt_main.run (Lwt_unix.sleep 0.05);
-  check "a notification created on another domain fires on the owner"
-    !fired_there;
+  check "a notification fires on the domain that created it"
+    (on_other_domain (fun () ->
+       let n = Lwt_unix.make_notification ~once:true (fun () ->
+         fired_there := true)
+       in
+       let mine = Lwt_unix.make_notification ~once:true (fun () ->
+         fired_here := true)
+       in
+       ignore mine;
+       Lwt_unix.send_notification n;
+       Lwt_main.run (Lwt_unix.sleep 0.05);
+       !fired_there));
+  check "and it did not fire here" (not !fired_here);
 
   (* And the owner itself is unaffected. *)
   check "the owner still runs jobs"
