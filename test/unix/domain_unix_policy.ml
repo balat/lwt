@@ -1,16 +1,16 @@
 (* This file is part of Lwt, released under the MIT license. See LICENSE.md for
    details, or visit https://github.com/ocsigen/lwt/blob/master/LICENSE.md. *)
 
-(* Jobs, signal handlers and child waiting all go through one process-wide
-   notification file descriptor, whose event is registered on the engine of the
-   domain that initialised [Lwt_unix]. Completions therefore run on that domain
-   whoever submitted the work, so those three families of operation belong to it.
+(* Which operations belong to which domain, in both directions.
 
-   What this checks is the policy, in both directions: they fail explicitly
-   elsewhere rather than silently waking a foreign promise, while what does NOT
-   depend on the descriptor keeps working on any domain -- running a loop with
-   timers, and creating and sending a notification, which is the documented way
-   to wake Lwt from another thread and now from another domain.
+   Since every loop has its own notification channel, JOBS are no longer among
+   the restricted ones: a job submitted anywhere completes on the loop that
+   submitted it. That is checked here with the real thing, a file opened and read
+   on a spawned domain, since opening a file IS a job.
+
+   Signal handlers and child waiting are still wired to the domain that
+   initialised the module, and still fail explicitly elsewhere rather than
+   silently waking a foreign promise or hanging.
 
    Needs a second domain, hence OCaml 5. *)
 
@@ -43,18 +43,36 @@ let () =
 
   let on_other_domain f = Domain.join (Domain.spawn f) in
 
-  (* Refused off the owner. *)
-  check "a job is refused on another domain"
-    (on_other_domain (fun () -> refused (fun () -> Lwt_unix.stat "/")));
+  (* Jobs, which used to be refused here, now work. *)
+  check "another domain runs a job"
+    (on_other_domain (fun () ->
+       match Lwt_main.run (Lwt_unix.stat "/") with
+       | st -> st.Unix.st_kind = Unix.S_DIR
+       | exception _ -> false));
+
+  (* And the whole of it: a file opened, read and closed on another domain, which
+     is three jobs and the exit criterion of this phase. *)
+  check "another domain opens, reads and closes a file"
+    (on_other_domain (fun () ->
+       match
+         Lwt_main.run
+           (Lwt.bind
+              (Lwt_unix.openfile "/etc/hostname" [ Unix.O_RDONLY ] 0)
+              (fun fd ->
+                let buf = Bytes.create 16 in
+                Lwt.bind (Lwt_unix.read fd buf 0 16) (fun n ->
+                  Lwt.bind (Lwt_unix.close fd) (fun () -> Lwt.return n))))
+       with
+       | n -> n > 0
+       | exception _ -> false));
+
+  (* Still refused off the owner. *)
   check "a signal handler is refused on another domain"
     (on_other_domain (fun () ->
        refused (fun () -> Lwt_unix.on_signal Sys.sigusr1 (fun _ -> ()))));
   check "waiting for a child is refused on another domain"
     (on_other_domain (fun () ->
        refused (fun () -> Lwt_main.run (Lwt_unix.waitpid [] child))));
-  check "cancelling jobs is refused on another domain"
-    (on_other_domain (fun () -> refused Lwt_unix.cancel_jobs));
-
   (* Allowed off the owner: a loop with timers, and the notification API. *)
   check "a loop with timers still runs on another domain"
     (on_other_domain (fun () ->
