@@ -23,7 +23,55 @@
     lazy clonable stream is not what one wants across a domain boundary, and a
     shared pool of Lwt resources is not merely hard but wrong, since a connection
     belongs to the loop that opened it. Give each loop its own pool and bound the
-    total with a {!Semaphore}. *)
+    total with a {!Semaphore}.
+
+    {2 What crosses, and what does not}
+
+    Data crosses. Ownership can be handed over. Lwt values do not.
+
+    So: send strings, records, immutable structures, or a resource you are done
+    with. Do not send a promise, a {!Lwt_io.channel}, a {!Lwt_unix.file_descr}, a
+    {!Lwt_mutex.t}, an {!Lwt_stream.t} or an {!Lwt_pool.t}: each belongs to the
+    loop that made it, and using one elsewhere raises rather than corrupting
+    quietly. For a promise you did not make and cannot change, there is
+    {!adopt}.
+
+    Nothing in the types enforces this. It is the one place in this design where a
+    reader has to be told; everywhere else the ownership check does the telling, at
+    run time and in every build.
+
+    {2 A program with several loops, in full}
+
+    One domain per core, each with its own listening socket and its own loop, is
+    the shape that needs no communication at all and is worth reaching for first.
+    When work does have to move, it looks like this:
+
+    {[
+      (* A pool of domains for the expensive part. *)
+      let pool = Lwt_multicore.Pool.create ()
+
+      (* One domain owning a resource, asked for things by everyone else. *)
+      let cache =
+        Lwt_multicore.Service.create (fun key ->
+          match Hashtbl.find_opt table key with
+          | Some v -> Lwt.return v
+          | None ->
+            let v = compute key in
+            Hashtbl.add table key v;
+            Lwt.return v)
+
+      (* And a request handler, running on whichever loop accepted it, which reads
+         like ordinary Lwt. *)
+      let handle request =
+        let* key = parse request in
+        let* value = Lwt_multicore.Service.call cache key in
+        let* digest = Lwt_multicore.Pool.detach pool hash value in
+        respond digest
+    ]}
+
+    Every promise there is local; what crosses is a key, a value and a digest.
+    The two lines that say "another domain is involved" are the types of [pool]
+    and [cache]. *)
 
 (** {2 Loops} *)
 
