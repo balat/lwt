@@ -615,3 +615,109 @@ module Stream = struct
           | exception Loop_terminated -> ())
       !room
 end
+
+(* +-----------------------------------------------------------------+
+   | A domain that serves requests                                   |
+   +-----------------------------------------------------------------+ *)
+
+(* Aliases, so that the submodules below can name the shared value and make one
+   while defining a [create] of their own. *)
+type 'a shared = 'a t
+
+let new_shared = create
+
+module Service = struct
+  type ('req, 'res) t = {
+    requests : ('req * 'res shared) Stream.t;
+    stopped : unit shared;
+    domain : unit Domain.t;
+  }
+
+  let create ?(capacity = 64) handler =
+    let requests = Stream.create ~capacity in
+    let stopped = new_shared () in
+    let domain =
+      Domain.spawn (fun () ->
+        Lwt_main.run
+          (let rec serve () =
+             Lwt.bind (Stream.take requests) (function
+               | None -> Lwt.return_unit
+               | Some (req, reply) ->
+                 (* Each request is served to completion before the next is
+                    taken: a service is one loop, and concurrency between
+                    requests is the caller's business, obtained by having several
+                    services or by the handler returning early. *)
+                 Lwt.bind
+                   (Lwt.catch
+                      (fun () -> Lwt.bind (handler req) (fun res ->
+                         resolve reply res; Lwt.return_unit))
+                      (fun exn -> reject reply exn; Lwt.return_unit))
+                   serve)
+           in
+           serve ());
+        (* Announced before this domain exits, so that [shutdown] can wait for the
+           work to be finished rather than for the domain to be reaped. *)
+        resolve stopped ())
+    in
+    { requests; stopped; domain }
+
+  let call t req =
+    let reply = new_shared () in
+    Lwt.bind (Stream.push t.requests (req, reply)) (fun () -> await reply)
+
+  let shutdown t =
+    Stream.close t.requests;
+    Lwt.bind (await t.stopped) (fun () ->
+      (* The service has finished its work by now, so this is short. It is done
+         at all so that no domain is left unreaped. *)
+      Domain.join t.domain;
+      Lwt.return_unit)
+end
+
+(* +-----------------------------------------------------------------+
+   | Running work on another domain                                  |
+   +-----------------------------------------------------------------+ *)
+
+(* A pool of services, each on its own domain, all serving the same thing: a
+   thunk. That is all [detach] needs, and building it on [Service] rather than on
+   anything new is the point: if the service pattern is right, the offload is
+   twenty lines.
+
+   Round-robin rather than least-loaded, deliberately: choosing by load would mean
+   reading every service's queue length across domains on every call, which costs
+   more than it saves for work whose whole premise is that it is expensive. *)
+module Pool = struct
+  type t = {
+    workers : (unit -> unit, unit) Service.t array;
+    next : int Atomic.t;
+  }
+
+  let create ?capacity ?count () =
+    let count =
+      match count with
+      | Some n when n > 0 -> n
+      | Some _ -> invalid_arg "Lwt_multicore.Pool.create"
+      | None -> max 1 (Domain.recommended_domain_count () - 1)
+    in
+    { workers =
+        Array.init count (fun _ ->
+          Service.create ?capacity (fun thunk -> thunk (); Lwt.return_unit));
+      next = Atomic.make 0 }
+
+  let size t = Array.length t.workers
+
+  let detach t f x =
+    let result = new_shared () in
+    let i = Atomic.fetch_and_add t.next 1 mod Array.length t.workers in
+    let thunk () =
+      (* Runs on the worker's domain. The result travels as data; [resolve] is
+         callable from anywhere. *)
+      match f x with
+      | v -> resolve result v
+      | exception exn -> reject result exn
+    in
+    Lwt.bind (Service.call t.workers.(i) thunk) (fun () -> await result)
+
+  let shutdown t =
+    Lwt.join (Array.to_list (Array.map Service.shutdown t.workers))
+end

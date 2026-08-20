@@ -269,3 +269,68 @@ module Stream : sig
   val is_closed : 'a t -> bool
   (** A snapshot. *)
 end
+
+module Service : sig
+  (** A DOMAIN THAT SERVES REQUESTS, which is the shape most uses of this module
+      end up wanting: one domain owning some state or some resources, and other
+      loops asking it for things.
+
+      It is a channel and a shared value put together, and it is written here so
+      that everyone does not write it slightly differently. *)
+
+  type ('req, 'res) t
+
+  val create :
+    ?capacity:int -> ('req -> 'res Lwt.t) -> ('req, 'res) t
+  (** [create handler] spawns a domain running its own loop, serving requests with
+      [handler]. [capacity] bounds the request channel, so a caller that gets too
+      far ahead waits: that back-pressure is deliberate, and defaults to 64.
+
+      Requests are served ONE AT A TIME, in order. A service is one loop, so
+      concurrency between requests is the caller's to arrange, by running several
+      services or by having the handler return before its work is finished. *)
+
+  val call : ('req, 'res) t -> 'req -> 'res Lwt.t
+  (** [call t req] asks the service and waits for its answer, as a local promise.
+      An exception raised by the handler comes back as a rejection, on this side.
+      Callable from any domain. *)
+
+  val shutdown : ('req, 'res) t -> unit Lwt.t
+  (** Closes the request channel, waits for the service to finish what it has, and
+      reaps its domain. Calls already in flight are answered; calls made
+      afterwards are rejected with {!Stream.Closed}. *)
+end
+
+module Pool : sig
+  (** Running work on ANOTHER DOMAIN, which is what to reach for when the work is
+      CPU-bound: unlike {!Lwt_preemptive.detach}, which hands work to a system
+      thread of the same domain and therefore does not escape the runtime lock,
+      this runs it in parallel.
+
+      It is a pool of {!Service}s, and deliberately nothing more. *)
+
+  type t
+
+  val create : ?capacity:int -> ?count:int -> unit -> t
+  (** [create ()] spawns [count] domains, defaulting to one fewer than
+      {!Domain.recommended_domain_count}, on the assumption that the calling
+      domain is doing something too. [capacity] bounds each worker's queue. *)
+
+  val detach : t -> ('a -> 'b) -> 'a -> 'b Lwt.t
+  (** [detach t f x] runs [f x] on one of the pool's domains and gives back the
+      result as a local promise. An exception becomes a rejection.
+
+      [f] runs on another domain, so what it may touch is what any other domain
+      may: not the caller's promises, not the caller's channels, mutexes, streams
+      or descriptors. Pass it data, get data back. The ownership check will say so
+      if this is got wrong, which is the point of it being always on.
+
+      Work is handed round-robin, and a caller waits when the chosen worker's queue
+      is full: that back-pressure is what keeps a producer from filling memory with
+      pending work. *)
+
+  val size : t -> int
+
+  val shutdown : t -> unit Lwt.t
+  (** Closes every worker and waits for them, as {!Service.shutdown} does. *)
+end

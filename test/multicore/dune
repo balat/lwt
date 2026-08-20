@@ -40,3 +40,11 @@
  (build_if
   (>= %{ocaml_version} "5.0"))
  (libraries lwt.unix lwt_multicore))
+
+(test
+ (name service)
+ (package lwt_multicore)
+ (modules service)
+ (build_if
+  (>= %{ocaml_version} "5.0"))
+ (libraries lwt.unix lwt_multicore))
