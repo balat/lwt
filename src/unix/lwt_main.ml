@@ -39,6 +39,20 @@ type hooks = {
   enter_iter : (unit -> unit) Lwt_sequence.t;
   leave_iter : (unit -> unit) Lwt_sequence.t;
   exits : (unit -> unit Lwt.t) Lwt_sequence.t;
+
+  (* PER DOMAIN, and this is what lets N loops run at once. The flag detects a
+     NESTED [run], which is a per-domain notion: a second domain entering [run]
+     is not nesting, it is the whole point. It was process-wide, so it made the
+     second domain fail with "nested calls are not allowed"; and a domain
+     draining its exit hooks cleared the flag of a domain still inside [run].
+
+     Its mutex stays, and is per domain too: it guards against two SYSTEM THREADS
+     of this domain racing between the read and the write, which is what the
+     process-wide mutex did. It is taken once per [run], so its cost is nothing.
+     Both live in the hooks record rather than in slots of their own, per the
+     one-slot rule. *)
+  mutable running : [ `No | `From_somewhere | `From of string ];
+  running_mutex : Mutex.t;
 }
 
 let drain_exit_hooks = ref (fun () -> ())
@@ -53,6 +67,8 @@ let hooks : hooks Lwt_dls.t =
       enter_iter = Lwt_sequence.create ();
       leave_iter = Lwt_sequence.create ();
       exits = Lwt_sequence.create ();
+      running = `No;
+      running_mutex = Mutex.create ();
     })
 
 let enter_iter_hooks () = (Lwt_dls.get hooks).enter_iter
@@ -109,21 +125,21 @@ let run (type a) (p : a Lwt.t) : a =
       Lwt.Private.scheduler_set_idle idle;
       Lwt.Private.scheduler_run (fun () -> p))
 
-let run_already_called = ref `No
-let run_already_called_mutex = Mutex.create ()
-
 let finished () =
-  Mutex.lock run_already_called_mutex;
-  run_already_called := `No;
-  Mutex.unlock run_already_called_mutex
+  let h = Lwt_dls.get hooks in
+  Mutex.lock h.running_mutex;
+  h.running <- `No;
+  Mutex.unlock h.running_mutex
 
 let run p =
   (* Fail in case a call to Lwt_main.run is nested under another invocation of
-     Lwt_main.run. *)
-  Mutex.lock run_already_called_mutex;
+     Lwt_main.run ON THIS DOMAIN. Another domain running its own loop is not a
+     nested call. *)
+  let h = Lwt_dls.get hooks in
+  Mutex.lock h.running_mutex;
 
   let error_message_if_call_is_nested =
-    match !run_already_called with
+    match h.running with
     (* `From is effectively disabled for the time being, because there is a bug,
        present in all versions of OCaml supported by Lwt, where, with the
        bytecode runtime, if one changes the working directory and then attempts
@@ -154,11 +170,11 @@ let run p =
         else *)
           `From_somewhere
       in
-      run_already_called := called_from;
+      h.running <- called_from;
       None
   in
 
-  Mutex.unlock run_already_called_mutex;
+  Mutex.unlock h.running_mutex;
 
   begin match error_message_if_call_is_nested with
   | Some message -> failwith message
@@ -188,7 +204,8 @@ let rec call_hooks () =
 
 (* Drains THIS domain's exit hooks. Used by the main domain's [Stdlib.at_exit]
    below and, for every other domain, by the [Lwt_dls.at_domain_exit] the hooks
-   slot registers. *)
+   slot registers. The [finished ()] it calls now clears only this domain's flag,
+   so a domain leaving while another is inside [run] no longer disturbs it. *)
 let drain () =
   if not (Lwt_sequence.is_empty (exit_hooks ())) then begin
     Lwt.abandon_wakeups ();
