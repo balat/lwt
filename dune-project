@@ -93,6 +93,15 @@
  (depends
   (ocaml (>= 5.0))
   base-unix
+  ; This library uses Lwt.Private and Lwt_dls, which are internal and under an
+  ; alert, so it is LOCKSTEP with lwt and (>= 6) understates that: opam may pick
+  ; an lwt whose internals have moved, and the user meets it as a compilation
+  ; error rather than a solver message. The constraint that says it is
+  ; (lwt (= :version)), which needs the packages in this repository to carry ONE
+  ; version; today they carry four different ones (lwt 6.1.1, the satellites
+  ; 6.0.0), so writing it would make this package uninstallable. Same for
+  ; lwt_direct and lwt_uring, which use Lwt.Private and Lwt_dls too. To settle at
+  ; release time, with the versions.
   (lwt (>= 6))
   (saturn (>= 1.0))))
 
