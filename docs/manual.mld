@@ -626,7 +626,120 @@ let () = Lwt_main.run (Lwt_io.printl "Hello, world!")
 ]}
 
   Note that you must not make nested calls to [Lwt_main.run]. It
-  cannot be used anywhere else to get the result of a promise.
+  cannot be used anywhere else to get the result of a promise. The restriction is
+  per domain: one loop per domain, and as many domains as you like, which is the
+  subject of the next section.
+
+{1:several_loops Several loops, one per domain }
+
+  An Lwt program may run several loops at once, one per OCaml domain, and use
+  several cores that way. The loops are independent: each has its own scheduler and
+  run queue, its own engine, its own timer wheel, its own jobs and signal
+  subscriptions, its own registry of open channels, and its own pool of preemptive
+  threads. Nothing is shared between them unless you share it deliberately.
+
+  A second loop is started by spawning a domain and running a loop in it:
+
+{[
+let () =
+  let worker = Domain.spawn (fun () -> Lwt_main.run (work ())) in
+  Lwt_main.run (main ());
+  Domain.join worker
+]}
+
+{2 What belongs to a loop }
+
+  A promise belongs to the loop that created it, and so does anything holding Lwt
+  state: a file descriptor, a channel, an [Lwt_mutex.t], an [Lwt_condition.t], an
+  [Lwt_mvar.t], an [Lwt_stream.t], an [Lwt_pool.t], an [Lwt_timeout.t].
+
+  Using one of those from another domain does not corrupt it quietly. It raises:
+
+{ul
+  {- touching a {e pending} promise of another loop raises
+     [Lwt.Foreign_promise];}
+  {- using a container of another loop raises [Invalid_argument], naming the
+     module and the function.}}
+
+  These checks are always on, in every build, because a check that is only in a
+  debug build is not there when it is needed. On the hot path, a [bind] on an
+  already-resolved promise, they cost nothing measurable; on a suspended [bind]
+  they are about 2% of a microbenchmark, which is within the noise of an
+  end-to-end measurement.
+
+  A {e resolved} promise crosses freely, and so does plain data. What a resolved
+  promise {e carries} is another matter: if it carries one of the containers
+  above, the promise crosses but using the container does not, and you will get the
+  [Invalid_argument] above at the point of use.
+
+{2 One listener per domain, on the same port }
+
+  The shape to reach for first needs no communication at all: one domain per core,
+  each with its own listening socket on the {e same} port, through [SO_REUSEPORT].
+  The kernel spreads incoming connections over the listeners, so nothing is shared
+  and nothing has to be synchronised.
+
+{[
+let listener port =
+  let fd = Lwt_unix.socket PF_INET SOCK_STREAM 0 in
+  (* before the bind, not after *)
+  Lwt_unix.setsockopt fd SO_REUSEPORT true;
+  Lwt_unix.setsockopt fd SO_REUSEADDR true;
+  Lwt_unix.bind fd (ADDR_INET (Unix.inet_addr_loopback, port));
+  Lwt_unix.listen fd 128;
+  fd
+
+let serve port =
+  (* Each domain makes its OWN listener: a descriptor belongs to its loop. *)
+  Lwt_main.run
+    (let fd = listener port in
+     let rec loop () =
+       let* client, _ = Lwt_unix.accept fd in
+       Lwt.async (fun () -> handle client);
+       loop ()
+     in
+     loop ())
+
+let () =
+  let domains = List.init 3 (fun _ -> Domain.spawn (fun () -> serve 8080)) in
+  serve 8080;
+  List.iter Domain.join domains
+]}
+
+  Two things are easy to get wrong:
+
+{ul
+  {- [SO_REUSEPORT] must be set {e before} the [bind]. After it, it is too late.}
+  {- A listening socket cannot be shared between domains. Each domain opens its
+     own, on the same port; a descriptor belongs to the loop that created it, and
+     Lwt will say so.}}
+
+  On one six-core machine this scaled from about 73 000 requests per second with
+  one domain to about 143 000 with two, measured with an external load generator.
+  Numbers on your machine will differ; the point is that two loops use two cores.
+
+{2 Making loops talk }
+
+  When work does have to cross a domain boundary, the [lwt_multicore] package
+  provides the primitives for it: a shared value, a mutex, a semaphore, a
+  condition, a bounded stream, a service owning a resource, and a pool of domains
+  for CPU-bound work. Its documentation is the [Lwt_multicore] module of that
+  package, and the rule it is built around is that {e data} crosses while {e Lwt
+  values} do not.
+
+{2 What is still restricted }
+
+{ul
+  {- [Lwt_unix.fork], and therefore [Lwt_process], must be called from the domain
+     that initialised [Lwt_unix]: the OCaml runtime does not support forking with
+     several domains running.}
+  {- [Lwt_io.stdout], [stderr] and [stdin] belong to the domain that initialised
+     the module. Another domain that writes to standard output should make its own
+     channel over the descriptor.}
+  {- [Lwt_preemptive]'s bounds are process-wide settings applied per loop, so a
+     program with several loops gets more threads than the same program with one.}
+  {- Two loops both waiting for {e any} child race for whichever exits first,
+     which is what waiting for any child means.}}
 
 {1 The [lwt.unix] library }
 
@@ -803,6 +916,11 @@ let () =
   The module {!Lwt_domain} from the [lwt_domain] package provides all the
   necessary helpers to achieve this. It is based on the [Domainslib] library
   and uses similar concepts (such as tasks and pools).
+
+  [Lwt_multicore.Pool] from the [lwt_multicore] package does the same job for a
+  program that already runs {{!several_loops}several Lwt loops}: the
+  domains it detaches to are Lwt loops themselves, so the detached work may do I/O
+  and use Lwt, which a [Domainslib] task may not.
 
   First, you need to create a task pool:
 
