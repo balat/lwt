@@ -54,3 +54,124 @@ let run_on loop f =
   (* Outside the push, and after it: the notification is a system call, and the
      work must be visible before the wake-up that announces it. *)
   Lwt_unix.send_notification loop.notification
+
+(* +-----------------------------------------------------------------+
+   | A value several loops can wait for                              |
+   +-----------------------------------------------------------------+ *)
+
+(* THE INVARIANT OF THIS MODULE, and the reason it is safe: a waiter's promise is
+   never touched from anywhere but its own domain. It is STORED here, which is
+   plain data, and it is RESOLVED inside a thunk that [run_on] runs on its own
+   loop. The ownership check of the core is what enforces that rather than this
+   comment; it would raise if we got it wrong.
+
+   The mutex protects two fields and nothing else. Every critical section below is
+   a test and an assignment: no Lwt operation, no system call, no allocation, per
+   the rule the plan sets for these locks. Waking the waiters happens outside. *)
+
+type 'a state = Pending | Fulfilled of 'a | Rejected of exn
+
+type 'a waiter = {
+  w_loop : loop;
+  w_promise : 'a Lwt.t;
+  w_resolver : 'a Lwt.u;
+}
+
+type 'a t = {
+  mutex : Mutex.t;
+  mutable state : 'a state;
+  mutable waiters : 'a waiter list;
+}
+
+let create () = { mutex = Mutex.create (); state = Pending; waiters = [] }
+
+let is_pending t =
+  Mutex.lock t.mutex;
+  let pending = match t.state with Pending -> true | _ -> false in
+  Mutex.unlock t.mutex;
+  pending
+
+(* Runs on the waiter's own domain, so it may resolve the waiter's promise. The
+   promise may have been cancelled meanwhile, hence the test, which is Lwt's own
+   idiom for a resolver that may have been raced. *)
+let deliver w result =
+  if Lwt.is_sleeping w.w_promise then
+    match result with
+    | Ok v -> Lwt.wakeup w.w_resolver v
+    | Error e -> Lwt.wakeup_exn w.w_resolver e
+
+let wake_all waiters result =
+  (* Read once: [self ()] is a slot lookup, and this loop is the same for every
+     waiter in the list. *)
+  let here = self () in
+  List.iter
+    (fun w ->
+      if w.w_loop == here then
+        (* Our own waiter, so resolve it now rather than posting to ourselves.
+           That is not only cheaper, it is the right semantics: [Lwt.wakeup]
+           resolves synchronously, and a [resolve] that quietly became
+           asynchronous for the local case would be a trap. *)
+        deliver w result
+      else
+        (* A waiter whose loop has gone is skipped: it is not the resolver's
+           business that someone has terminated, and that loop's promise died
+           with its domain. *)
+        match run_on w.w_loop (fun () -> deliver w result) with
+        | () -> ()
+        | exception Loop_terminated -> ())
+    waiters
+
+(* Settles [t], or reports that it was settled already. Returns the waiters to
+   wake, so that the waking is done by the caller, outside the lock. *)
+let settle t state =
+  Mutex.lock t.mutex;
+  match t.state with
+  | Pending ->
+    t.state <- state;
+    let waiters = t.waiters in
+    t.waiters <- [];
+    Mutex.unlock t.mutex;
+    Some waiters
+  | Fulfilled _ | Rejected _ ->
+    Mutex.unlock t.mutex;
+    None
+
+let resolve t v =
+  match settle t (Fulfilled v) with
+  | Some waiters -> wake_all waiters (Ok v)
+  | None -> invalid_arg "Lwt_multicore.resolve"
+
+let reject t e =
+  match settle t (Rejected e) with
+  | Some waiters -> wake_all waiters (Error e)
+  | None -> invalid_arg "Lwt_multicore.reject"
+
+let cancel t =
+  match settle t (Rejected Lwt.Canceled) with
+  | Some waiters -> wake_all waiters (Error Lwt.Canceled)
+  | None -> ()
+
+let withdraw t w =
+  Mutex.lock t.mutex;
+  t.waiters <- List.filter (fun w' -> w' != w) t.waiters;
+  Mutex.unlock t.mutex
+
+let await t =
+  (* Built BEFORE the lock is taken: a promise is an allocation and an Lwt
+     operation, and neither belongs in a critical section shared with other
+     domains. If [t] turns out to be settled, this promise is simply resolved at
+     once. *)
+  let promise, resolver = Lwt.task () in
+  let w = { w_loop = self (); w_promise = promise; w_resolver = resolver } in
+  Mutex.lock t.mutex;
+  let state = t.state in
+  (match state with Pending -> t.waiters <- w :: t.waiters | _ -> ());
+  Mutex.unlock t.mutex;
+  match state with
+  | Fulfilled v -> Lwt.wakeup resolver v; promise
+  | Rejected e -> Lwt.wakeup_exn resolver e; promise
+  | Pending ->
+    (* Cancelling the local promise withdraws this loop's interest and leaves [t]
+       and the other waiters alone. *)
+    Lwt.on_cancel promise (fun () -> withdraw t w);
+    promise

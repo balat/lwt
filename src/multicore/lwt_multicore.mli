@@ -59,3 +59,57 @@ val run_on : loop -> (unit -> unit) -> unit
     close from here: the work is then simply not done, and a caller who needs to
     know that should use the higher-level primitives, which reject their promise
     in that case. *)
+
+(** {2 A value several loops can wait for} *)
+
+type 'a t
+(** A one-shot value that any domain may resolve and any number of loops may wait
+    for. This is the answer to "get a result from another domain".
+
+    It is shared data, so what travels through it must be safe to share: plain
+    values, immutable structures, or ownership handed over for good. Do not send a
+    mutable structure you keep using, and do not send an Lwt promise or any of the
+    domain-affine containers ({!Lwt_io.channel}, {!Lwt_unix.file_descr},
+    {!Lwt_mutex.t} and the rest); those belong to the loop that made them, and the
+    ownership check will say so. Nothing in the type prevents it; this is the one
+    place where a reader has to be told rather than checked. *)
+
+val create : unit -> 'a t
+(** A value nobody has resolved yet. *)
+
+val await : 'a t -> 'a Lwt.t
+(** [await t] is an ORDINARY LOCAL PROMISE of the calling loop, fulfilled when
+    [t] is resolved, rejected when it is rejected. Several loops may await the
+    same [t], and each gets its own promise, resolved on its own domain.
+
+    The promise is cancellable: cancelling it withdraws this loop's interest and
+    rejects the promise with {!Lwt.Canceled}, leaving [t] and the other waiters
+    alone. *)
+
+val resolve : 'a t -> 'a -> unit
+(** [resolve t v] fulfils [t] and wakes every loop waiting for it, each on its own
+    domain. Callable from any domain and any thread.
+
+    If the calling loop is itself waiting, its own promise is resolved
+    SYNCHRONOUSLY, as {!Lwt.wakeup} does, rather than being posted back to
+    itself. Other loops are woken through their inbox and see it on their next
+    lap.
+
+    A waiter whose domain has terminated is skipped, rather than being an error
+    for the resolver: it is not the resolver's business that someone has gone.
+
+    @raise Invalid_argument if [t] is already resolved, as {!Lwt.wakeup} does. *)
+
+val reject : 'a t -> exn -> unit
+(** Like {!resolve}, with a rejection.
+
+    @raise Invalid_argument if [t] is already resolved. *)
+
+val cancel : 'a t -> unit
+(** [cancel t] rejects [t] with {!Lwt.Canceled} if it is still pending, and does
+    nothing otherwise. Unlike {!reject} it never raises, which is what makes it
+    usable to broadcast a shutdown from anywhere. *)
+
+val is_pending : 'a t -> bool
+(** Whether [t] has yet to be resolved. A snapshot, and the answer may already be
+    stale when it reaches you: useful for reporting, never for deciding. *)
