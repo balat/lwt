@@ -22,7 +22,19 @@
    domain_two_loops
    domain_upstream_scenarios
    domain_notifications
-   domain_signals)))
+   domain_signals
+   domain_gc)))
+
+; Lwt_gc's deferred function runs on the loop that registered it, and one whose
+; domain has gone is dropped. Needs a second domain, hence OCaml 5.
+
+(test
+ (name domain_gc)
+ (package lwt)
+ (modules domain_gc)
+ (build_if
+  (>= %{ocaml_version} "5.0"))
+ (libraries lwt.unix))
 
 ; A signal reaches every loop that subscribed to it, each on its own channel.
 ; Needs a second domain, hence OCaml 5.
