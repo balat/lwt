@@ -44,6 +44,14 @@ open Lwt.Infix
    which is every existing program, it reads [true] and nothing changes. *)
 [@@@alert "-lwt_internal"]
 
+(* Builds the lock that guards the channel table, where the platform has no static
+   initialiser for it (Windows). Called ONCE, here, at module initialisation: that
+   runs on the main domain at program startup, before any other domain exists, which
+   is what makes it race-free. Doing it lazily on first use is what TSan caught. *)
+external init_notifications : unit -> unit = "lwt_unix_init_notifications"
+
+let () = init_notifications ()
+
 external new_notification_channel : unit -> Unix.file_descr * int
   = "lwt_unix_new_notification_channel"
 
