@@ -1,0 +1,11 @@
+; Communication between Lwt loops running on different domains. A separate opam
+; package so that the Saturn dependency stays out of `lwt`, whose OCaml 4.14 floor
+; and js_of_ocaml support must not be touched by it.
+
+(library
+ (name lwt_multicore)
+ (public_name lwt_multicore)
+ (synopsis "Communication primitives between Lwt loops on several domains")
+ (enabled_if
+  (>= %{ocaml_version} "5.0"))
+ (libraries lwt.unix saturn))
