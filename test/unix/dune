@@ -27,7 +27,19 @@
    domain_reuseport
    bench_reuseport
    domain_soak
-   domain_exit_main)))
+   domain_exit_main
+   domain_wakeup_stress)))
+
+; The wake-up protocol under load: many senders, one draining loop, nothing lost.
+; Needs real domains, hence OCaml 5.
+
+(test
+ (name domain_wakeup_stress)
+ (package lwt)
+ (modules domain_wakeup_stress)
+ (build_if
+  (>= %{ocaml_version} "5.0"))
+ (libraries lwt.unix threads.posix))
 
 ; The main domain's exit hooks can still run jobs. A program, not an assertion: if
 ; it exits, it passed. Builds everywhere, since it needs no second domain.
