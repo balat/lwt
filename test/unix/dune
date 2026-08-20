@@ -20,7 +20,19 @@
    domain_timeouts
    domain_io_affinity
    domain_two_loops
-   domain_upstream_scenarios)))
+   domain_upstream_scenarios
+   domain_notifications)))
+
+; Every loop has its own notification channel, and an id carries the channel it
+; belongs to. Needs a second domain, hence OCaml 5.
+
+(test
+ (name domain_notifications)
+ (package lwt)
+ (modules domain_notifications)
+ (build_if
+  (>= %{ocaml_version} "5.0"))
+ (libraries lwt.unix))
 
 ; Upstream's five multidomain scenarios from the reverted 6.0.0-beta00, and what
 ; this design does with them: refuse each at a named point. Needs a second
