@@ -115,29 +115,42 @@ let notif_slot : notif Lwt_dls.t =
   Lwt_dls.new_key (fun () ->
     let fd, chan = new_notification_channel () in
     let event = Lwt_engine.on_readable fd (fun _ -> !drain_notifications chan) in
-    (* Retire the channel with the domain. The event must be stopped first: the
-       engine must not be left watching a closed descriptor.
+    (* Retire the channel with the domain, but NOT on the main one, and that
+       exception is the whole subtlety.
 
-       ORDER. [Domain.at_exit] is LIFO, so what is registered LAST runs FIRST.
-       [Lwt_main]'s exit-hook drain runs a loop, and an exit hook may well need a
-       job (closing an [Lwt_io] channel does), so the drain must happen while this
-       channel still lives. That is why [Lwt_main]'s hooks slot calls
-       {!ensure_channel} before registering its own drain: this registration then
-       comes first and therefore runs last.
+       ORDER, on a spawned domain. [Domain.at_exit] is LIFO, so what is registered
+       LAST runs FIRST. [Lwt_main]'s exit-hook drain runs a loop, and an exit hook
+       may well need a job (flushing an [Lwt_io] channel does), so the drain must
+       happen while this channel still lives. That is why [Lwt_main]'s hooks slot
+       calls {!ensure_channel} before registering its own drain: this registration
+       then comes first and therefore runs last.
+
+       ON THE MAIN DOMAIN that reasoning breaks, and retiring anything here is a
+       BUG. The main domain's drain is a [Stdlib.at_exit], deliberately, so that
+       Lwt's exit hooks keep running after a user's own handlers; and every
+       [Domain.at_exit] fires BEFORE any [Stdlib.at_exit]. So retiring the channel
+       here would leave the drain running without one, and the first exit hook that
+       needs a job would hang the process at exit. That is not a corner case: the
+       hook in question is [Lwt_io]'s [flush_all], so any program that wrote to
+       Lwt_io.stdout and did not flush by hand would hang. Found by the soak of S6.
+
+       Nothing is lost by skipping it: the process is ending, and the kernel closes
+       descriptors better than we do.
 
        A job still in flight when this runs is safe rather than merely unlikely:
        the channel struct is never freed, only returned to a free list, and the
        generation in its ids means a late completion is dropped instead of waking
        whoever takes the slot next. Nobody is waiting for it either way, the
        domain being gone. *)
-    Lwt_dls.at_domain_exit (fun () ->
-      (* Unsubscribe from every signal this loop subscribed to, FIRST. Otherwise
-         the process-wide handler stays installed for a loop that no longer
-         exists, and the signal keeps being swallowed: a program whose last
-         subscriber died would stop dying on SIGTERM. *)
-      !drop_signal_subscriptions ();
-      Lwt_engine.stop_event event;
-      free_notification_channel chan);
+    if not (Lwt_dls.is_main_domain ()) then
+      Lwt_dls.at_domain_exit (fun () ->
+        (* Unsubscribe from every signal this loop subscribed to, FIRST.
+           Otherwise the process-wide handler stays installed for a loop that no
+           longer exists, and the signal keeps being swallowed: a program whose
+           last subscriber died would stop dying on SIGTERM. *)
+        !drop_signal_subscriptions ();
+        Lwt_engine.stop_event event;
+        free_notification_channel chan);
     { chan;
       event;
       jobs = Lwt_sequence.create ();
