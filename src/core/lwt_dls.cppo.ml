@@ -3,14 +3,68 @@
 
 #if OCAML_VERSION >= (5, 0, 0)
 
-type 'a t = 'a Domain.DLS.key
+(* SPIKE, REJECTED, KEPT FOR THE RECORD. One array per key, indexed by the
+   domain's slot index, so the fast path is a load, a C call and a compare rather
+   than [Domain.DLS.get]'s 57 instructions. Measured at 26.
 
-let new_key init = Domain.DLS.new_key init
+   DELIBERATELY INCOMPLETE, which is half of why it was rejected: a domain's slot
+   index is REUSED once it terminates, and this prototype does not clear the
+   entry, so a fresh domain inheriting an index would inherit a dead domain's
+   scheduler. Making it correct needs an at_exit clear per key and domain, whose
+   ordering against Lwt_main's own exit drain then has to be reasoned about, plus
+   a global registry of keys. About 120 lines of delicate machinery for the eight
+   instructions between this and the 9-instruction floor.
 
-(* [Domain.DLS.get] is not inlinable (it goes through the recursive
-   [maybe_grow]), so at least spare the wrapper's own frame. *)
-let[@inline] get k = Domain.DLS.get k
-let[@inline] set k v = Domain.DLS.set k v
+   Growth is under a mutex and published through an Atomic; an entry is only ever
+   written by its own domain. *)
+type 'a t = { slots : Obj.t array Atomic.t; init : unit -> 'a }
+
+let none : Obj.t = Obj.repr (ref 0)
+
+let new_key init = { slots = Atomic.make (Array.make 8 none); init }
+
+let grow_mutex = Mutex.create ()
+
+let ensure k i =
+  let st = Atomic.get k.slots in
+  if i < Array.length st then st
+  else begin
+    Mutex.lock grow_mutex;
+    let st = Atomic.get k.slots in
+    let st =
+      if i < Array.length st then st
+      else begin
+        let n = ref (Array.length st) in
+        while i >= !n do n := 2 * !n done;
+        let st' = Array.make !n none in
+        Array.blit st 0 st' 0 (Array.length st);
+        Atomic.set k.slots st';
+        st'
+      end
+    in
+    Mutex.unlock grow_mutex;
+    st
+  end
+
+let[@inline never] slow k i =
+  let st = ensure k i in
+  let v = Obj.repr (k.init ()) in
+  Array.unsafe_set st i v;
+  (Obj.obj v : 'a)
+
+let[@inline] get (k : 'a t) : 'a =
+  let st = Atomic.get k.slots in
+  let i = Domain.self_index () in
+  if i < Array.length st then begin
+    let v = Array.unsafe_get st i in
+    if v != none then (Obj.obj v : 'a) else slow k i
+  end
+  else slow k i
+
+let[@inline] set k v =
+  let i = Domain.self_index () in
+  let st = ensure k i in
+  Array.unsafe_set st i (Obj.repr v)
 let is_main_domain () = Domain.is_main_domain ()
 let at_domain_exit f = Domain.at_exit f
 
