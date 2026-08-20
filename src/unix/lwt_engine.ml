@@ -448,9 +448,28 @@ end
 
 let current : t Lwt_dls.t =
   Lwt_dls.new_key (fun () ->
-    if Lwt_config._HAVE_LIBEV && Lwt_config.libev_default then
-      (new libev () :> t)
-    else (new select :> t))
+    let engine =
+      if Lwt_config._HAVE_LIBEV && Lwt_config.libev_default then
+        (new libev () :> t)
+      else (new select :> t)
+    in
+    (* Destroy it with the domain, or its descriptor leaks: a libev loop owns an
+       epoll descriptor, so one accumulated per domain. Found by the soak of S6,
+       which is the only kind of test that can find it.
+
+       Not on the main domain, and for the reason [Lwt_unix] records at its own
+       retirement: there the exit-hook drain is a [Stdlib.at_exit], and every
+       [Domain.at_exit] fires before it, so destroying the engine here would leave
+       the drain with no engine to run its loop on. The process is ending anyway.
+
+       On a spawned domain the order comes out right by construction, and it is
+       worth saying how: this slot is initialised from [Lwt_unix]'s channel slot,
+       which [Lwt_main] itself forces before registering the drain. LIFO then gives
+       drain, then channel, then engine, which is the order in which they stop
+       being needed. *)
+    if not (Lwt_dls.is_main_domain ()) then
+      Lwt_dls.at_domain_exit (fun () -> engine#destroy);
+    engine)
 
 let get () = Lwt_dls.get current
 

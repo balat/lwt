@@ -25,7 +25,29 @@
    domain_signals
    domain_gc
    domain_reuseport
-   bench_reuseport)))
+   bench_reuseport
+   domain_soak
+   domain_exit_main)))
+
+; The main domain's exit hooks can still run jobs. A program, not an assertion: if
+; it exits, it passed. Builds everywhere, since it needs no second domain.
+
+(test
+ (name domain_exit_main)
+ (package lwt)
+ (modules domain_exit_main)
+ (libraries lwt.unix))
+
+; Soak: domains spawned and let die in a loop, checking that descriptors and
+; threads do not accumulate. Short by default, LWT_SOAK_SECONDS to lengthen.
+
+(test
+ (name domain_soak)
+ (package lwt)
+ (modules domain_soak)
+ (build_if
+  (>= %{ocaml_version} "5.0"))
+ (libraries lwt.unix))
 
 ; The scaling benchmark for the server recipe. An executable, not a test: it needs
 ; an external load generator.
