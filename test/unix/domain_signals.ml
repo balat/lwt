@@ -73,5 +73,37 @@ let () =
   check "and the departed loops did not receive anything"
     (not (Atomic.get got_b));
 
+  (* A departed loop's subscription must go with it, and the process-wide handler
+     with the last of them. Otherwise the signal keeps being swallowed by a
+     handler nobody listens to, which is not a leak you notice until a program
+     stops dying on SIGTERM.
+
+     Checked from the outside, because that is the only place it shows: a child
+     process subscribes on a spawned domain, lets that domain die, then sends
+     itself SIGUSR1. With the subscription dropped, the default action applies and
+     the child is killed by the signal. With it left behind, the child survives
+     and exits 0. *)
+  if Array.length Sys.argv > 1 && Sys.argv.(1) = "orphan-subscription" then begin
+    Domain.join
+      (Domain.spawn (fun () ->
+         ignore (Lwt_unix.on_signal Sys.sigusr1 (fun _ -> ()));
+         (* Run a lap so the subscription is certainly in place. *)
+         Lwt_main.run (Lwt_unix.sleep 0.01)));
+    Unix.kill (Unix.getpid ()) Sys.sigusr1;
+    (* If we are still here, the handler outlived its loop. *)
+    Unix.sleepf 0.5;
+    exit 0
+  end;
+  let child =
+    Unix.create_process Sys.executable_name
+      [| Sys.executable_name; "orphan-subscription" |]
+      Unix.stdin Unix.stdout Unix.stderr
+  in
+  let _, status = Unix.waitpid [] child in
+  check "a departed loop's signal subscription goes with it"
+    (match status with
+     | Unix.WSIGNALED n -> n = Sys.sigusr1
+     | Unix.WEXITED _ | Unix.WSTOPPED _ -> false);
+
   if !failures > 0 then exit 1;
   print_endline "signals reach every subscribed loop: ok"
