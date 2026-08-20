@@ -351,6 +351,12 @@ type file_descr = {
   hooks_writable : (unit -> unit) Lwt_sequence.t;
   (* Hooks to call when the file descriptor becomes writable. *)
 
+  owner : Lwt_dls.token;
+  (* DOMAIN-AFFINE. The wrapper carries readiness events registered on ITS
+     domain's engine, and hook sequences whose callbacks run there, so it belongs
+     to the domain that created it. Checked in [check_descriptor], which every
+     operation already calls, so the cost is one slot read per syscall. *)
+
   mutable io_kind : Unix.file_kind option;
   (* Cached [Unix.fstat] kind of the descriptor, computed lazily by {!fd_kind}.
      Used by a completion-based I/O backend (e.g. io_uring) to pick the right
@@ -421,9 +427,11 @@ let mk_ch ?blocking ?(set_flags=true) fd = {
   hooks_readable = Lwt_sequence.create ();
   hooks_writable = Lwt_sequence.create ();
   io_kind = None;
+  owner = Lwt_dls.self_token ();
 }
 
 let check_descriptor ch =
+  Lwt_dls.check_owner "Lwt_unix file descriptor" ch.owner;
   match ch.state with
   | Opened ->
     ()
@@ -496,6 +504,7 @@ let clear_events ch =
   end
 
 let abort ch e =
+  Lwt_dls.check_owner "Lwt_unix.abort" ch.owner;
   if ch.state <> Closed then begin
     set_state ch (Aborted e);
     clear_events ch
@@ -694,6 +703,7 @@ external close_job : Unix.file_descr -> unit job = "lwt_unix_close_job"
 let completion_close_hook : (Unix.file_descr -> unit) ref = ref ignore
 
 let close ch =
+  Lwt_dls.check_owner "Lwt_unix.close" ch.owner;
   if ch.state = Closed then check_descriptor ch;
   set_state ch Closed;
   clear_events ch;
@@ -1391,6 +1401,9 @@ let dup ?cloexec ch =
     hooks_readable = Lwt_sequence.create ();
     hooks_writable = Lwt_sequence.create ();
     io_kind = None;
+    (* [check_descriptor] above already established that we own [ch], so the
+       duplicate is ours too. *)
+    owner = ch.owner;
   }
 
 let dup2 ?cloexec ch1 ch2 =

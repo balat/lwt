@@ -17,7 +17,19 @@
    domain_engines
    domain_channels
    domain_unix_policy
-   domain_timeouts)))
+   domain_timeouts
+   domain_io_affinity)))
+
+; Descriptors and channels belong to the domain that created them, including on
+; the single-character fast paths. Needs a second domain, hence OCaml 5.
+
+(test
+ (name domain_io_affinity)
+ (package lwt)
+ (modules domain_io_affinity)
+ (build_if
+  (>= %{ocaml_version} "5.0"))
+ (libraries lwt.unix))
 
 ; Each domain runs its own timer wheel, while the preemptive thread pool stays
 ; shared and detaching belongs to the notification owner. Needs a second domain,

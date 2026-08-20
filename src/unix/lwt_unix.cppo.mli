@@ -102,7 +102,14 @@ type file_descr
 
       - {b opened}, in which case it is fully usable
       - {b closed} or {b aborted}, in which case it is no longer
-      usable *)
+      usable
+
+      A {b file descriptor} belongs to the domain that created it. It carries
+      readiness events registered on that domain's engine and hooks whose
+      callbacks run there, so using it from another domain raises
+      [Invalid_argument]. A second domain wanting the same underlying descriptor
+      makes its own wrapper with {!of_unix_file_descr}; {!stdin}, {!stdout} and
+      {!stderr} belong to the domain that initialised this module. *)
 
 (** State of a {b file descriptor} *)
 type state =

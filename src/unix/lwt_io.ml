@@ -12,6 +12,10 @@ module Lwt_sequence = Lwt_sequence
 
 open Lwt.Infix
 
+(* This module is one of the few that may use the per-domain layer: its channels
+   are domain-affine and its registry of open channels is per domain. *)
+[@@@alert "-lwt_internal"]
+
 exception Channel_closed of string
 
 (* Minimum size for buffers: *)
@@ -79,6 +83,13 @@ and 'mode channel = {
 }
 
 and 'mode _channel = {
+  owner : Lwt_dls.token;
+  (* DOMAIN-AFFINE. A channel is a mutable buffer plus a lock built out of Lwt
+     promises, so it belongs to the domain that created it. The owner sits on the
+     REAL channel and not on the wrapper, since [atomic] builds temporary
+     wrappers over the same channel. Checked in [primitive] and [atomic], the two
+     locking wrappers every operation goes through, in [abort], and in the
+     single-character fast paths, which bypass [primitive] by design. *)
   mutable buffer : Lwt_bytes.t;
   mutable length : int;
 
@@ -356,7 +367,9 @@ let unlock : type m. m channel -> unit = fun wrapper -> match wrapper.state with
     assert false
 
 (* Wrap primitives into atomic io operations: *)
-let primitive f wrapper = match wrapper.state with
+let primitive f wrapper =
+  Lwt_dls.check_owner "Lwt_io channel" wrapper.channel.owner;
+  match wrapper.state with
   | Idle ->
     wrapper.state <- Busy_primitive;
     Lwt.finalize
@@ -395,7 +408,9 @@ let primitive f wrapper = match wrapper.state with
     Lwt.fail (invalid_channel wrapper.channel)
 
 (* Wrap a sequence of io operations into an atomic operation: *)
-let atomic f wrapper = match wrapper.state with
+let atomic f wrapper =
+  Lwt_dls.check_owner "Lwt_io channel" wrapper.channel.owner;
+  match wrapper.state with
   | Idle ->
     let tmp_wrapper = { state = Idle;
                         channel = wrapper.channel;
@@ -442,7 +457,9 @@ let atomic f wrapper = match wrapper.state with
   | Invalid ->
     Lwt.fail (invalid_channel wrapper.channel)
 
-let rec abort wrapper = match wrapper.state with
+let rec abort wrapper =
+  Lwt_dls.check_owner "Lwt_io.abort" wrapper.channel.owner;
+  match wrapper.state with
   | Busy_atomic tmp_wrapper ->
     (* Close the depest opened wrapper: *)
     abort tmp_wrapper
@@ -509,7 +526,6 @@ let flush_registry registry =
    and drop what they wrote. The domain the guard actually excludes is the one
    that initialises this module, and the test is [is_main_domain] so that the
    registration happens exactly once in either case. *)
-[@@@alert "-lwt_internal"]
 
 let outputs : Outputs.t Lwt_dls.t =
   Lwt_dls.new_key (fun () ->
@@ -547,6 +563,7 @@ let make :
   in
   let abort_waiter, abort_wakener = Lwt.wait () in
   let rec ch = {
+    owner = Lwt_dls.self_token ();
     buffer = buffer;
     length = size;
     ptr = 0;
@@ -581,6 +598,7 @@ let of_bytes (type m) ~(mode : m mode) bytes =
   let length = Lwt_bytes.length bytes in
   let abort_waiter, abort_wakener = Lwt.wait () in
   let rec ch = {
+    owner = Lwt_dls.self_token ();
     buffer = bytes;
     length = length;
     ptr = 0;
@@ -1208,6 +1226,7 @@ end
 
 let read_char wrapper =
   let channel = wrapper.channel in
+  Lwt_dls.check_owner "Lwt_io channel" channel.owner;
   let ptr = channel.ptr in
   (* Speed-up in case a character is available in the buffer. It
      increases performances by 10x. *)
@@ -1219,6 +1238,7 @@ let read_char wrapper =
 
 let read_char_opt wrapper =
   let channel = wrapper.channel in
+  Lwt_dls.check_owner "Lwt_io channel" channel.owner;
   let ptr = channel.ptr in
   if wrapper.state = Idle && ptr < channel.max then begin
     channel.ptr <- ptr + 1;
@@ -1254,6 +1274,7 @@ let flush oc = primitive Primitives.flush oc
 
 let write_char wrapper x =
   let channel = wrapper.channel in
+  Lwt_dls.check_owner "Lwt_io channel" channel.owner;
   let ptr = channel.ptr in
   if wrapper.state = Idle && ptr < channel.max then begin
     channel.ptr <- ptr + 1;
@@ -1443,10 +1464,7 @@ let with_file ?buffer ?flags ?perm ~mode filename f =
    domains drawing temporary file names concurrently were racing on it before
    any of this. One state per domain removes both, and self-initialisation makes
    the states independent. *)
-[@@@alert "-lwt_internal"]
 
-(* The per-domain slot is internal to the Lwt packages; this module is one of
-   the two that may use it. *)
 let prng : Random.State.t Lwt_dls.t =
   Lwt_dls.new_key (fun () -> Random.State.make_self_init ())
 
