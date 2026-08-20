@@ -141,3 +141,84 @@ val adopt : 'a Lwt.t -> 'a Lwt.t
     correct and free.
 
     @raise Cannot_adopt if the owning loop cannot be reached. *)
+
+(** {2 Mutual exclusion, conditions, counting}
+
+    These are the shared counterparts of {!Lwt_mutex}, {!Lwt_condition} and a
+    counting semaphore. Their operations return ordinary local promises, so code
+    using them reads like ordinary Lwt; what tells you the value is shared is its
+    type.
+
+    Use them for what crosses a domain boundary, and keep {!Lwt_mutex} and
+    friends for what does not: they are cheaper, and being domain-local is checked
+    for you. *)
+
+module Mutex : sig
+  type t
+  (** A mutex several loops can contend for. Unlike {!Lwt_mutex.t}, which belongs
+      to one loop and refuses any other, this one is meant to be shared. *)
+
+  val create : unit -> t
+
+  val lock : t -> unit Lwt.t
+  (** Waits until the mutex is free and takes it. The promise is local and
+      cancellable: cancelling it withdraws the request, and if the mutex had
+      already been handed over in the meantime, it is passed on to the next
+      waiter rather than lost. *)
+
+  val unlock : t -> unit
+  (** Releases the mutex, handing it directly to the first waiting loop if there
+      is one, so that no third party can jump the queue. Does nothing if the mutex
+      is not held. Callable from any domain, and not only from the one that
+      locked: that is a discipline for the caller, as in {!Lwt_mutex}. *)
+
+  val with_lock : t -> (unit -> 'a Lwt.t) -> 'a Lwt.t
+  (** [with_lock t f] locks, runs [f], and unlocks whatever [f] does, including
+      raising or being cancelled. *)
+
+  val is_locked : t -> bool
+  (** A snapshot, useful for reporting and never for deciding. *)
+end
+
+module Semaphore : sig
+  type t
+  (** A counting semaphore, which is the right way to BOUND A GLOBAL RESOURCE
+      across loops: give each loop its own pool of connections and let a shared
+      semaphore cap the total. A shared pool of Lwt resources would not be merely
+      hard, it would be wrong, a connection belonging to the loop that opened
+      it. *)
+
+  val create : int -> t
+  (** [create n] starts with [n] units available. *)
+
+  val available : t -> int
+  (** A snapshot. *)
+
+  val acquire : t -> unit Lwt.t
+  (** Takes one unit, waiting if none is free. Cancellable, with the same
+      hand-on-if-already-served guarantee as {!Mutex.lock}. *)
+
+  val release : t -> unit
+  (** Returns one unit, handing it to the first waiting loop if there is one. *)
+
+  val with_resource : t -> (unit -> 'a Lwt.t) -> 'a Lwt.t
+  (** Acquires, runs, releases whatever happens. *)
+end
+
+module Condition : sig
+  type 'a t
+  (** A condition variable carrying a value, as {!Lwt_condition} does. *)
+
+  val create : unit -> 'a t
+
+  val wait : ?mutex:Mutex.t -> 'a t -> 'a Lwt.t
+  (** Waits for a signal. If [mutex] is given it is unlocked while waiting and
+      locked again afterwards, the discipline {!Lwt_condition.wait} follows. *)
+
+  val signal : 'a t -> 'a -> unit
+  (** Wakes ONE waiting loop, if any. A value nobody is waiting for is dropped,
+      as in {!Lwt_condition}. *)
+
+  val broadcast : 'a t -> 'a -> unit
+  (** Wakes every waiting loop, each on its own domain. *)
+end
