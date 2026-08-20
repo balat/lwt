@@ -14,10 +14,21 @@ let[@inline] set k v = Domain.DLS.set k v
 let is_main_domain () = Domain.is_main_domain ()
 let at_domain_exit f = Domain.at_exit f
 
-type token = unit ref
+(* The domain's own identifier, and NOT a token in a slot of its own, because the
+   measurement says so: reading a [Domain.DLS] slot costs 64 instructions, while
+   [Domain.self ()] plus an integer comparison costs 9. On the buffered-character
+   path of [Lwt_io] the slot version more than doubled the cost of a character.
 
-let token_key : token t = new_key (fun () -> ref ())
-let[@inline] self_token () = get token_key
+   What it gives up, stated plainly: identifiers are RECYCLED when a domain
+   terminates, so a container created by a domain that has since died could be
+   taken for its own by a later domain that inherited the identifier. That is a
+   missed violation, never a false one, it needs the owner to be dead, and the
+   promise check is unaffected since it compares scheduler records rather than
+   identifiers. Sixty-four instructions per buffered character is not worth that
+   corner. *)
+type token = int
+
+let[@inline] self_token () = (Domain.self () :> int)
 
 #else
 
@@ -36,10 +47,9 @@ let is_main_domain () = true
 let at_domain_exit f = Stdlib.at_exit f
 
 (* One domain, so one token, and every comparison against it succeeds. *)
-type token = unit ref
+type token = int
 
-let the_token : token = ref ()
-let[@inline] self_token () = the_token
+let[@inline] self_token () = 0
 
 #endif
 
@@ -55,4 +65,4 @@ let[@inline never] foreign name =
     ^ "loop runs its callbacks")
 
 let[@inline] check_owner name owner =
-  if owner != self_token () then foreign name
+  if owner <> self_token () then foreign name

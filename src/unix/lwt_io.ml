@@ -1226,7 +1226,9 @@ end
 
 let read_char wrapper =
   let channel = wrapper.channel in
-  Lwt_dls.check_owner "Lwt_io channel" channel.owner;
+  (* Comparison written out rather than [check_owner]: on this path the call
+     costs more than the check. *)
+  if channel.owner <> Lwt_dls.self_token () then Lwt_dls.foreign "Lwt_io channel";
   let ptr = channel.ptr in
   (* Speed-up in case a character is available in the buffer. It
      increases performances by 10x. *)
@@ -1238,7 +1240,9 @@ let read_char wrapper =
 
 let read_char_opt wrapper =
   let channel = wrapper.channel in
-  Lwt_dls.check_owner "Lwt_io channel" channel.owner;
+  (* Comparison written out rather than [check_owner]: on this path the call
+     costs more than the check. *)
+  if channel.owner <> Lwt_dls.self_token () then Lwt_dls.foreign "Lwt_io channel";
   let ptr = channel.ptr in
   if wrapper.state = Idle && ptr < channel.max then begin
     channel.ptr <- ptr + 1;
@@ -1274,7 +1278,9 @@ let flush oc = primitive Primitives.flush oc
 
 let write_char wrapper x =
   let channel = wrapper.channel in
-  Lwt_dls.check_owner "Lwt_io channel" channel.owner;
+  (* Comparison written out rather than [check_owner]: on this path the call
+     costs more than the check. *)
+  if channel.owner <> Lwt_dls.self_token () then Lwt_dls.foreign "Lwt_io channel";
   let ptr = channel.ptr in
   if wrapper.state = Idle && ptr < channel.max then begin
     channel.ptr <- ptr + 1;
