@@ -291,31 +291,34 @@ let adopt (p : 'a Lwt.t) : 'a Lwt.t =
    terminates. That is what the [~on_dead] argument of [wake] is for, and it is
    the only subtle thing in these hundred lines. *)
 
-(* A first-in, first-out queue of waiters, kept as a list pair. Short by nature:
-   these are domain boundaries, not hot paths. *)
-type 'a queue = { mutable front : 'a waiter list; mutable back : 'a waiter list }
+(* A first-in, first-out queue kept as a pair of lists. Short by nature: these are
+   domain boundaries, not hot paths. Holds waiters below, and stream items too. *)
+type 'a queue = { mutable front : 'a list; mutable back : 'a list }
 
 let queue_create () = { front = []; back = [] }
-let queue_push q w = q.back <- w :: q.back
+let queue_push q x = q.back <- x :: q.back
+let queue_push_front q x = q.front <- x :: q.front
+let queue_length q = List.length q.front + List.length q.back
 
 let rec queue_pop q =
   match q.front with
-  | w :: rest -> q.front <- rest; Some w
+  | x :: rest -> q.front <- rest; Some x
   | [] -> (
     match q.back with
     | [] -> None
     | back -> q.front <- List.rev back; q.back <- []; queue_pop q)
 
-(* Drops a waiter that has been withdrawn. O(n), on a queue that is short. *)
-let queue_remove q w =
-  q.front <- List.filter (fun w' -> w' != w) q.front;
-  q.back <- List.filter (fun w' -> w' != w) q.back
+(* Drops an element that has been withdrawn, by identity. O(n), on a queue that is
+   short. *)
+let queue_remove q x =
+  q.front <- List.filter (fun y -> y != x) q.front;
+  q.back <- List.filter (fun y -> y != x) q.back
 
 module Mutex = struct
   type t = {
     guard : Stdlib.Mutex.t;
     mutable held : bool;
-    waiters : unit queue;
+    waiters : unit waiter queue;
   }
 
   let create () =
@@ -375,7 +378,7 @@ module Semaphore = struct
   type t = {
     guard : Stdlib.Mutex.t;
     mutable count : int;
-    waiters : unit queue;
+    waiters : unit waiter queue;
   }
 
   let create count =
@@ -422,7 +425,7 @@ module Semaphore = struct
 end
 
 module Condition = struct
-  type 'a t = { guard : Stdlib.Mutex.t; waiters : 'a queue }
+  type 'a t = { guard : Stdlib.Mutex.t; waiters : 'a waiter queue }
 
   let create () = { guard = Stdlib.Mutex.create (); waiters = queue_create () }
 
@@ -463,4 +466,152 @@ module Condition = struct
     Lwt.finalize
       (fun () -> w.w_promise)
       (fun () -> match mutex with Some m -> Mutex.lock m | None -> Lwt.return_unit)
+end
+
+module Stream = struct
+  exception Closed
+
+  type 'a t = {
+    guard : Stdlib.Mutex.t;
+    capacity : int;
+    items : 'a queue;
+    (* Loops waiting to take. Each expects an option, [None] meaning "closed and
+       drained", so that a consumer learns the end rather than waiting for it. *)
+    takers : 'a option waiter queue;
+    (* Loops waiting for room. They carry nothing: a woken pusher retries, which
+       is what keeps cancellation from having to give a value back. *)
+    room : unit waiter queue;
+    mutable closed : bool;
+  }
+
+  let create ~capacity =
+    if capacity < 1 then invalid_arg "Lwt_multicore.Stream.create";
+    { guard = Stdlib.Mutex.create ();
+      capacity;
+      items = queue_create ();
+      takers = queue_create ();
+      room = queue_create ();
+      closed = false }
+
+  let length t =
+    Stdlib.Mutex.lock t.guard;
+    let n = queue_length t.items in
+    Stdlib.Mutex.unlock t.guard;
+    n
+
+  let is_closed t =
+    Stdlib.Mutex.lock t.guard;
+    let closed = t.closed in
+    Stdlib.Mutex.unlock t.guard;
+    closed
+
+  (* Hands [v] to a waiting taker, or stores it. Also the path taken when a taker
+     that had been given [v] turns out to have been cancelled: the value comes
+     back rather than being lost, and goes to the FRONT so that order is kept. *)
+  let rec deposit t v =
+    Stdlib.Mutex.lock t.guard;
+    match queue_pop t.takers with
+    | Some w ->
+      Stdlib.Mutex.unlock t.guard;
+      wake w (Some v) ~on_dead:(fun () -> deposit t v)
+    | None ->
+      queue_push_front t.items v;
+      Stdlib.Mutex.unlock t.guard
+
+  (* One unit of room has appeared: let the first waiting pusher retry. *)
+  let rec offer_room t =
+    Stdlib.Mutex.lock t.guard;
+    match queue_pop t.room with
+    | None -> Stdlib.Mutex.unlock t.guard
+    | Some w ->
+      Stdlib.Mutex.unlock t.guard;
+      wake w () ~on_dead:(fun () -> offer_room t)
+
+  let rec push t v =
+    let w = new_waiter () in
+    Stdlib.Mutex.lock t.guard;
+    if t.closed then begin
+      Stdlib.Mutex.unlock t.guard;
+      Lwt.fail Closed
+    end
+    else
+      match queue_pop t.takers with
+      | Some taker ->
+        (* Straight to a waiting consumer, without touching the buffer. *)
+        Stdlib.Mutex.unlock t.guard;
+        wake taker (Some v) ~on_dead:(fun () -> deposit t v);
+        Lwt.return_unit
+      | None ->
+        if queue_length t.items < t.capacity then begin
+          queue_push t.items v;
+          Stdlib.Mutex.unlock t.guard;
+          Lwt.return_unit
+        end
+        else begin
+          (* Full: this is the back-pressure. Wait for room and RETRY rather than
+             leaving the value with the queue, which is what makes cancelling a
+             push harmless: nothing has been handed over. *)
+          queue_push t.room w;
+          Stdlib.Mutex.unlock t.guard;
+          Lwt.on_cancel w.w_promise (fun () ->
+            Stdlib.Mutex.lock t.guard;
+            queue_remove t.room w;
+            Stdlib.Mutex.unlock t.guard);
+          Lwt.bind w.w_promise (fun () -> push t v)
+        end
+
+  let take t =
+    let w = new_waiter () in
+    Stdlib.Mutex.lock t.guard;
+    match queue_pop t.items with
+    | Some v ->
+      Stdlib.Mutex.unlock t.guard;
+      (* Taking freed a slot, so a blocked producer may go. *)
+      offer_room t;
+      Lwt.return (Some v)
+    | None ->
+      if t.closed then begin
+        Stdlib.Mutex.unlock t.guard;
+        Lwt.return_none
+      end
+      else begin
+        queue_push t.takers w;
+        Stdlib.Mutex.unlock t.guard;
+        Lwt.on_cancel w.w_promise (fun () ->
+          Stdlib.Mutex.lock t.guard;
+          queue_remove t.takers w;
+          Stdlib.Mutex.unlock t.guard);
+        w.w_promise
+      end
+
+  let close t =
+    Stdlib.Mutex.lock t.guard;
+    let takers = ref [] and room = ref [] in
+    if not t.closed then begin
+      t.closed <- true;
+      let rec drain q acc =
+        match queue_pop q with Some w -> drain q (w :: acc) | None -> acc
+      in
+      takers := drain t.takers [];
+      room := drain t.room []
+    end;
+    Stdlib.Mutex.unlock t.guard;
+    (* Consumers learn the end; producers waiting for room learn there will be
+       none, since pushing to a closed stream fails. *)
+    List.iter (fun w -> wake w None ~on_dead:(fun () -> ())) !takers;
+    (* A producer waiting for room is REJECTED rather than woken: there will be no
+       room, and retrying would only find the stream closed. [wake] carries a
+       value, so this one is spelled out. *)
+    let reject_producer w =
+      if Lwt.is_sleeping w.w_promise then Lwt.wakeup_exn w.w_resolver Closed
+    in
+    let here = self () in
+    List.iter
+      (fun w ->
+        if w.w_loop == here then reject_producer w
+        else
+          match run_on w.w_loop (fun () -> reject_producer w) with
+          | () -> ()
+          | exception Loop_terminated -> ())
+      !room
 end
