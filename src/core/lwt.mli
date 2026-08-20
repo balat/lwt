@@ -2040,19 +2040,24 @@ module Exception_filter: sig
       immediately. *)
   type t
 
-  (** [handle_all] is the default filter. With it the all the exceptions
-      (including [Out_of_memory] and [Stack_overflow]) can be handled: caught
-      and transformed into rejected promises. *)
+  (** [handle_all] is a filter with which all exceptions (including
+      [Out_of_memory] and [Stack_overflow]) can be handled: caught and
+      transformed into rejected promises. It was the default up to Lwt 5, and
+      restoring it takes one line:
+      [Lwt.Exception_filter.set Lwt.Exception_filter.handle_all]. *)
   val handle_all : t
 
   (** [handle_all_except_runtime] is a filter which lets the OCaml runtime
       exceptions ([Out_of_memory] and [Stack_overflow]) go through all the Lwt
       abstractions and bubble all the way out of the call to [Lwt_main.run].
 
-      Note that if you set this handler, then the runtime exceptions leave the
-      Lwt internal state inconsistent. For this reason, you will not be able to
-      call [Lwt_main.run] again after such an exception has escaped
-      [Lwt_main.run]. *)
+      This is the default since Lwt 6: a runtime exception turned into a rejected
+      promise is a program continuing on a heap it has already exhausted, which
+      is worse than stopping.
+
+      Note that with this filter the runtime exceptions leave the Lwt internal
+      state inconsistent. For this reason, you will not be able to call
+      [Lwt_main.run] again after such an exception has escaped [Lwt_main.run]. *)
   val handle_all_except_runtime : t
 
   (** [set] sets the given exception filter globally. You should call this
