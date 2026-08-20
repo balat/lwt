@@ -1419,13 +1419,75 @@ let wrap7 f =
 
 external reraise : exn -> 'a = "%reraise"
 
-(* The tracing/backtrace variants take location metadata (name, line, an
-   exception-rewriting function) and otherwise delegate to the plain
-   combinators: this core does not maintain Lwt's backtraces. *)
-let backtrace_bind _name _line _add_loc p f = bind p f
-let backtrace_catch _name _line _add_loc f h = catch f h
-let backtrace_finalize _name _line _add_loc f g = finalize f g
-let backtrace_try_bind _name _line _add_loc f g h = try_bind f g h
+(* The tracing/backtrace variants, called only by the ppx.
+
+   [add_loc] is the ppx's [fun exn -> try Lwt.reraise exn with exn -> exn], built
+   at the source location of the [let%lwt], so applying it appends a "Re-raised at"
+   frame naming that line. Applied at every rejection that crosses a ppx bind, it
+   RECONSTRUCTS the chain of source locations an exception travelled through, which
+   is the whole reason these four functions exist. Lwt has done this since the
+   backtrace workaround was introduced, and a ppx user who loses it drops to the
+   backtrace of a bare [>>=], which shows nothing of his own code.
+
+   Where [add_loc] goes is Lwt's choice, mirrored here rather than tidied: on a
+   rejection produced or propagated by these combinators, and on a synchronous
+   exception raised by a continuation. NOT on the fulfilled paths, which stay the
+   plain fast path of [bind], so the cost of this on a program that is not raising
+   is nil.
+
+   [_name] and [_line] are the runtime-events metadata, which this core does not
+   emit; that is a separate gap, recorded as such. *)
+
+(* [apply], with the location function applied to a synchronous exception. *)
+let apply_loc add_loc (f : 'a -> 'b t) (v : 'a) : 'b t =
+  try f v with e when Exception_filter.run e -> inj { st = Rejected (add_loc e) }
+
+let backtrace_bind (type a b) _name _line add_loc (p : a t) (f : a -> b t) : b t =
+  match (prj p).st with
+  | Fulfilled v -> f v
+  | Rejected e -> inj { st = Rejected (add_loc e) }
+  | Pending pe ->
+    let sched = owner_sched pe in
+    let result = new_pending sched in
+    set_cancel_forward sched result p;
+    let saved = sched.storage in
+    add_waiter sched p (fun r ->
+      let outer = sched.storage in
+      sched.storage <- saved;
+      (match r with
+      | Ok v -> forward sched result (apply_loc add_loc f v)
+      | Error e -> fill sched result (Error (add_loc e)));
+      sched.storage <- outer);
+    result
+
+let backtrace_try_bind _name _line add_loc (f : unit -> 'a t) (g : 'a -> 'b t)
+    (h : exn -> 'b t) : 'b t =
+  let p = try f () with e when Exception_filter.run e -> inj { st = Rejected e } in
+  match (prj p).st with
+  | Fulfilled v -> g v
+  | Rejected e -> h (add_loc e)
+  | Pending pe ->
+    let sched = owner_sched pe in
+    let result = new_pending sched in
+    set_cancel_forward sched result p;
+    let saved = sched.storage in
+    add_waiter sched p (fun r ->
+      let outer = sched.storage in
+      sched.storage <- saved;
+      forward sched result
+        (match r with
+        | Ok v -> apply_loc add_loc g v
+        | Error e -> apply_loc add_loc h e);
+      sched.storage <- outer);
+    result
+
+let backtrace_catch name line add_loc f h =
+  backtrace_try_bind name line add_loc f return h
+
+let backtrace_finalize name line add_loc f g =
+  backtrace_try_bind name line add_loc f
+    (fun x -> bind (g ()) (fun () -> return x))
+    (fun e -> bind (g ()) (fun () -> fail (add_loc e)))
 
 module Let_syntax = struct
   module Let_syntax = struct
