@@ -513,11 +513,24 @@ CAMLprim value lwt_unix_socketpair_stub(value cloexec, value domain, value type,
    an id left over from a loop that has gone is recognised and dropped rather than
    waking whoever inherited the slot. */
 
+/* Must fit in LWT_NOTIFICATION_INDEX_BITS below. */
 #define LWT_NOTIFICATION_CHANNELS 256
 
-/* An OCaml int has 63 bits: 8 of index, 8 of generation, 47 of local id. */
-#define LWT_NOTIFICATION_LOCAL_BITS 47
+/* The layout of an id, derived from the word size rather than assumed.
+   An OCaml int has one bit fewer than the word: 63 on a 64-bit platform, 31 on a
+   32-bit one. Index and generation keep their widths, and the local counter takes
+   what is left: 47 bits normally, 15 bits on a 32-bit platform, which still allows
+   32768 notifications outstanding at once, well past any real use.
+
+   Written this way because the constant 47 was WRONG on a 32-bit platform: a shift
+   that wide is undefined behaviour on a 32-bit word, and the repository's CI has a
+   32-bit job that would have run it. Found by reading that CI matrix during S6. */
+#define LWT_NOTIFICATION_ID_BITS ((int)(sizeof(intnat) * 8 - 1))
+#define LWT_NOTIFICATION_INDEX_BITS 8
 #define LWT_NOTIFICATION_GEN_BITS 8
+#define LWT_NOTIFICATION_LOCAL_BITS                                     \
+  (LWT_NOTIFICATION_ID_BITS - LWT_NOTIFICATION_INDEX_BITS -             \
+   LWT_NOTIFICATION_GEN_BITS)
 #define LWT_NOTIFICATION_LOCAL_MASK ((((intnat)1) << LWT_NOTIFICATION_LOCAL_BITS) - 1)
 #define LWT_NOTIFICATION_GEN_MASK ((((intnat)1) << LWT_NOTIFICATION_GEN_BITS) - 1)
 #define LWT_NOTIFICATION_INDEX(id) \
