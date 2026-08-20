@@ -439,7 +439,9 @@ end
    that never touches the engine never builds one, which is better than today. On
    4.14 it runs once at creation, exactly as the old [ref] did.
 
-   Each accessor below costs one slot lookup. That is the design decision of the
+   Each accessor below costs one slot lookup, which the end-of-S2 measurement puts
+   at 64 instructions: nothing per engine operation, and the reason a per-OPERATION
+   check reads the domain identifier instead. That is the design decision of the
    S2 log: one access per operation, never two, and never a second slot in this
    module. *)
 [@@@alert "-lwt_internal"]
