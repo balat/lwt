@@ -1,0 +1,25 @@
+# TSan suppressions for Lwt's own test runs. See test/tsan/README.md.
+#
+# A suppression is a claim that a report is not a bug, and every entry here has to
+# say why. An entry without a reason is a bug in hiding.
+#
+# NOTHING in Lwt's OCaml code is suppressed. If a report points at src/core or
+# src/unix OCaml code, it is a finding, not noise.
+#
+# Both entries below are PROSPECTIVE: the switch this was first run in has neither
+# libev nor liburing installed, so neither entry has ever matched anything. They are
+# here for the run that does have them, and they should be checked against real
+# output the first time that happens.
+
+# libev shares state with the kernel through an epoll file descriptor and does its
+# own signal bookkeeping with volatile writes that TSan cannot see as
+# synchronisation. Nothing in Lwt is on either side of these accesses: only libev
+# reads what libev wrote.
+called_from_lib:libev
+race:^ev_
+
+# liburing's submission and completion queues are shared with the KERNEL through
+# mmap, and the memory barriers that order them are in the kernel and in liburing's
+# inline helpers. TSan sees one side of a happens-before edge it cannot know about.
+called_from_lib:liburing
+race:^io_uring_
