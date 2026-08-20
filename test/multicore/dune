@@ -56,3 +56,15 @@
  (build_if
   (>= %{ocaml_version} "5.0"))
  (libraries lwt.unix lwt_multicore))
+
+; A model of the bounded channel, checked by qcheck-stm. Sequential: blocking
+; operations are not linearisable against a deterministic model, so concurrency is
+; tested by forced interleaving elsewhere.
+
+(test
+ (name stm_stream)
+ (package lwt_multicore)
+ (modules stm_stream)
+ (build_if
+  (>= %{ocaml_version} "5.0"))
+ (libraries lwt.unix lwt_multicore qcheck-stm.sequential))
