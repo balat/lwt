@@ -361,7 +361,7 @@ module Pool : sig
 
   val create : ?capacity:int -> ?count:int -> unit -> t
   (** [create ()] spawns [count] domains, defaulting to one fewer than
-      {!Domain.recommended_domain_count}, on the assumption that the calling
+      [Domain.recommended_domain_count], on the assumption that the calling
       domain is doing something too. [capacity] bounds each worker's queue. *)
 
   val detach : t -> ('a -> 'b) -> 'a -> 'b Lwt.t

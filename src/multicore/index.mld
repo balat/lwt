@@ -1,0 +1,26 @@
+{0 lwt_multicore}
+
+Communication between Lwt loops running on different domains.
+
+Lwt promises are domain-local: a promise belongs to the loop that created it, and
+touching one from another domain raises rather than corrupting it quietly. That is
+what makes several independent loops safe, and it is also why they need something to
+talk through. This package is that something.
+
+Everything here returns an ordinary local promise, resolved by the calling loop.
+Nothing crosses a domain except plain data and the wake-up that carries it. What
+tells you a value is shared is its {e type}, not the way you use it: the code around
+a {!Lwt_multicore.Mutex.t} looks like ordinary Lwt.
+
+It is a separate opam package so that its [saturn] dependency stays out of [lwt],
+whose OCaml 4.14 floor and js_of_ocaml support must not be touched by it. It
+requires OCaml 5.
+
+For how to run several loops in the first place, and for what belongs to which loop,
+see the section "Several loops, one per domain" of the Lwt manual.
+
+{1 API}
+
+{!modules:
+Lwt_multicore
+}
