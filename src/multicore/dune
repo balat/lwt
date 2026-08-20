@@ -9,3 +9,9 @@
  (enabled_if
   (>= %{ocaml_version} "5.0"))
  (libraries lwt.unix saturn))
+
+; The package's documentation page. Cross-references the manual section in `lwt`,
+; since the first question is not "how do loops talk" but "how do I get two".
+
+(documentation
+ (package lwt_multicore))

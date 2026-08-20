@@ -9,7 +9,7 @@
     module is importable from anywhere and no wrapping hides it; the alert on its
     values is what says to keep away, the same device {!Lwt.Private} uses.
 
-    On OCaml 5 this is {!Domain.DLS}. On 4.14, where there is a single domain by
+    On OCaml 5 this is [Domain.DLS]. On 4.14, where there is a single domain by
     construction, it degrades to a plain cell: same interface, no test, no
     indirection, so keeping the 4.14 floor costs nothing at run time. That is
     also what makes the layer free under js_of_ocaml.
