@@ -585,15 +585,35 @@ struct notification_channel {
 static struct notification_channel
     *notification_channels[LWT_NOTIFICATION_CHANNELS];
 
-/* Guards allocation and release of slots, never the send path. */
-static lwt_unix_mutex notification_channels_mutex;
-static int notification_channels_initialized = 0;
+/* Guards allocation and release of slots, never the send path.
 
-static void init_notification_channels(void) {
-  if (!notification_channels_initialized) {
-    lwt_unix_mutex_init(&notification_channels_mutex);
-    notification_channels_initialized = 1;
-  }
+   Initialised STATICALLY where the platform allows it, and that is not a detail.
+   The first version of this initialised it lazily, on the first call, guarded by a
+   plain flag:
+
+     if (!initialized) { mutex_init(&m); initialized = 1; }
+
+   which is a race, and ThreadSanitizer found it: two domains creating their loop at
+   the same moment, one locking the mutex while the other was still building it. It
+   survived every test in the suite, because the window is a few instructions wide
+   and losing it costs nothing visible; what it really costs is undefined behaviour
+   in pthreads, and possibly two loops believing they own the same slot. */
+#if defined(HAVE_PTHREAD)
+#define LWT_NOTIFICATION_MUTEX_IS_STATIC 1
+static lwt_unix_mutex notification_channels_mutex = PTHREAD_MUTEX_INITIALIZER;
+#else
+static lwt_unix_mutex notification_channels_mutex;
+#endif
+
+/* Windows has no static initialiser for a CRITICAL_SECTION, so there the mutex is
+   built here, and OCaml calls this once from [Lwt_unix]'s module initialisation:
+   that runs on the main domain, at program startup, before any other domain can
+   exist. A no-op wherever the static initialiser did the job. */
+CAMLprim value lwt_unix_init_notifications(value unit) {
+#if !defined(LWT_NOTIFICATION_MUTEX_IS_STATIC)
+  lwt_unix_mutex_init(&notification_channels_mutex);
+#endif
+  return Val_unit;
 }
 
 /* The channel an id names, or NULL if it names none any more: an index out of
@@ -879,7 +899,6 @@ CAMLprim value lwt_unix_new_notification_channel(value unit) {
   int i, found = -1;
   struct notification_channel *chan;
 
-  init_notification_channels();
   lwt_unix_mutex_lock(&notification_channels_mutex);
   for (i = 0; i < LWT_NOTIFICATION_CHANNELS; i++) {
     if (notification_channels[i] == NULL ||
@@ -936,7 +955,6 @@ CAMLprim value lwt_unix_new_notification_channel(value unit) {
 CAMLprim value lwt_unix_free_notification_channel(value val_index) {
   int i = Int_val(val_index);
   struct notification_channel *chan;
-  init_notification_channels();
   lwt_unix_mutex_lock(&notification_channels_mutex);
   chan = notification_channels[i];
   if (chan != NULL && chan->in_use) {
