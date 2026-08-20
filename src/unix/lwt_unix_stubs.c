@@ -943,24 +943,43 @@ CAMLprim value lwt_unix_free_notification_channel(value val_index) {
 #define NSIG 64
 #endif
 
-/* Notifications id for each monitored signal. */
-static intnat signal_notifications[NSIG];
+/* SUBSCRIBERS PER SIGNAL: one notification id per interested loop, indexed by
+   that loop's channel. A signal is an event of the whole process, so the answer
+   to "which loop gets it" is "every loop that asked", and each gets it on its own
+   channel. No loop has to relay to another, which is why this phase needs no
+   inter-domain primitive at all.
+
+   A table rather than a list, deliberately: [handle_signal] runs in
+   async-signal context, where allocating, locking and following a freed pointer
+   are all forbidden. Reading a static array of integers is none of those. An
+   entry is written by OCaml, one word at a time, and 0 means nobody. */
+static intnat signal_notifications[NSIG][LWT_NOTIFICATION_CHANNELS];
 
 CAMLextern int caml_convert_signal_number(int);
 
-/* Send a notification when a signal is received. */
+/* Send a notification to every loop subscribed to this signal. */
 static void handle_signal(int signum) {
+  int i;
   if (signum >= 0 && signum < NSIG) {
-    intnat id = signal_notifications[signum];
-    if (id != -1) {
 #if defined(LWT_ON_WINDOWS)
-      /* The signal handler must be reinstalled if we use the signal
-         function. */
-      signal(signum, handle_signal);
+    /* The signal handler must be reinstalled if we use the signal
+       function. */
+    signal(signum, handle_signal);
 #endif
-      lwt_unix_send_notification(id);
+    for (i = 0; i < LWT_NOTIFICATION_CHANNELS; i++) {
+      intnat id = signal_notifications[signum][i];
+      if (id != 0) lwt_unix_send_notification(id);
     }
   }
+}
+
+/* How many loops are subscribed to this signal. Called with the runtime lock, so
+   the count is consistent with the writes below. */
+static int signal_subscriber_count(int signum) {
+  int i, n = 0;
+  for (i = 0; i < LWT_NOTIFICATION_CHANNELS; i++)
+    if (signal_notifications[signum][i] != 0) n++;
+  return n;
 }
 
 CAMLprim value lwt_unix_handle_signal(value val_signum) {
@@ -971,11 +990,16 @@ CAMLprim value lwt_unix_handle_signal(value val_signum) {
 #if defined(LWT_ON_WINDOWS)
 /* Handle Ctrl+C on windows. */
 static BOOL WINAPI handle_break(DWORD event) {
-  intnat id = signal_notifications[SIGINT];
-  if (id == -1 || (event != CTRL_C_EVENT && event != CTRL_BREAK_EVENT))
-    return FALSE;
-  lwt_unix_send_notification(id);
-  return TRUE;
+  int i, sent = 0;
+  if (event != CTRL_C_EVENT && event != CTRL_BREAK_EVENT) return FALSE;
+  for (i = 0; i < LWT_NOTIFICATION_CHANNELS; i++) {
+    intnat id = signal_notifications[SIGINT][i];
+    if (id != 0) {
+      lwt_unix_send_notification(id);
+      sent = 1;
+    }
+  }
+  return sent ? TRUE : FALSE;
 }
 #endif
 
@@ -986,24 +1010,32 @@ CAMLprim value lwt_unix_set_signal(value val_signum, value val_notification, val
 #endif
   int signum = caml_convert_signal_number(Int_val(val_signum));
   intnat notification = Long_val(val_notification);
+  int slot;
+  int first;
 
   if (signum < 0 || signum >= NSIG)
     caml_invalid_argument("Lwt_unix.on_signal: unavailable signal");
 
-  signal_notifications[signum] = notification;
+  /* The id names the subscribing loop's channel, so it also says where to record
+     the subscription. */
+  slot = LWT_NOTIFICATION_INDEX(notification);
+  first = (signal_subscriber_count(signum) == 0);
+  signal_notifications[signum][slot] = notification;
 
-  if (Bool_val(val_forwarded)) return Val_unit;
+  /* The process-wide handler is installed by the FIRST subscriber only; a second
+     loop subscribing must not reinstall it, and must not be told it failed. */
+  if (Bool_val(val_forwarded) || !first) return Val_unit;
 
 #if defined(LWT_ON_WINDOWS)
   if (signum == SIGINT) {
     if (!SetConsoleCtrlHandler(handle_break, TRUE)) {
-      signal_notifications[signum] = -1;
+      signal_notifications[signum][slot] = 0;
       win32_maperr(GetLastError());
       uerror("SetConsoleCtrlHandler", Nothing);
     }
   } else {
     if (signal(signum, handle_signal) == SIG_ERR) {
-      signal_notifications[signum] = -1;
+      signal_notifications[signum][slot] = 0;
       uerror("signal", Nothing);
     }
   }
@@ -1016,24 +1048,28 @@ CAMLprim value lwt_unix_set_signal(value val_signum, value val_notification, val
 #endif
   sigemptyset(&sa.sa_mask);
   if (sigaction(signum, &sa, NULL) == -1) {
-    signal_notifications[signum] = -1;
+    signal_notifications[signum][slot] = 0;
     uerror("sigaction", Nothing);
   }
 #endif
   return Val_unit;
 }
 
-/* Remove a signal handler. */
-CAMLprim value lwt_unix_remove_signal(value val_signum, value val_forwarded) {
+/* Remove one loop's subscription, and the process-wide handler with the last of
+   them. */
+CAMLprim value lwt_unix_remove_signal(value val_signum, value val_notification,
+                                      value val_forwarded) {
 #if !defined(LWT_ON_WINDOWS)
   struct sigaction sa;
 #endif
   /* The signal number is valid here since it was when we did the
      set_signal. */
   int signum = caml_convert_signal_number(Int_val(val_signum));
-  signal_notifications[signum] = -1;
+  int slot = LWT_NOTIFICATION_INDEX(Long_val(val_notification));
+  signal_notifications[signum][slot] = 0;
 
-  if (Bool_val(val_forwarded)) return Val_unit;
+  if (Bool_val(val_forwarded) || signal_subscriber_count(signum) > 0)
+    return Val_unit;
 
 #if defined(LWT_ON_WINDOWS)
   if (signum == SIGINT)
@@ -1051,8 +1087,9 @@ CAMLprim value lwt_unix_remove_signal(value val_signum, value val_forwarded) {
 
 /* Mark all signals as non-monitored. */
 CAMLprim value lwt_unix_init_signals(value Unit) {
-  int i;
-  for (i = 0; i < NSIG; i++) signal_notifications[i] = -1;
+  /* The table is static, hence already zero, and zero means "no subscriber".
+     Kept as a function so that the OCaml side need not care. */
+  (void)Unit;
   return Val_unit;
 }
 

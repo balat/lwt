@@ -8,9 +8,11 @@
    submitted it. That is checked here with the real thing, a file opened and read
    on a spawned domain, since opening a file IS a job.
 
-   Signal handlers and child waiting are still wired to the domain that
-   initialised the module, and still fail explicitly elsewhere rather than
-   silently waking a foreign promise or hanging.
+   Signal handlers and child waiting are no longer restricted either: a signal
+   reaches every loop that subscribed, each on its own channel, and each loop
+   reaps the children it waits for. What that leaves restricted is [fork], and not
+   because of notifications: the runtime does not support forking while other
+   domains are running.
 
    Needs a second domain, hence OCaml 5. *)
 
@@ -66,13 +68,27 @@ let () =
        | n -> n > 0
        | exception _ -> false));
 
-  (* Still refused off the owner. *)
-  check "a signal handler is refused on another domain"
+  (* Signals reach every subscribed loop, so another domain may subscribe and
+     receives the signal itself. *)
+  check "another domain subscribes to a signal and receives it"
     (on_other_domain (fun () ->
-       refused (fun () -> Lwt_unix.on_signal Sys.sigusr1 (fun _ -> ()))));
-  check "waiting for a child is refused on another domain"
+       let got = ref false in
+       let id = Lwt_unix.on_signal Sys.sigusr1 (fun _ -> got := true) in
+       Unix.kill (Unix.getpid ()) Sys.sigusr1;
+       Lwt_main.run (Lwt_unix.sleep 0.05);
+       Lwt_unix.disable_signal_handler id;
+       !got));
+
+  (* And another domain waits for a child of its own. *)
+  check "another domain waits for a child"
     (on_other_domain (fun () ->
-       refused (fun () -> Lwt_main.run (Lwt_unix.waitpid [] child))));
+       match Lwt_main.run (Lwt_unix.waitpid [] child) with
+       | _ -> true
+       | exception _ -> false));
+
+  (* fork is the one thing still reserved to the loading domain. *)
+  check "fork is refused on another domain"
+    (on_other_domain (fun () -> refused (fun () -> Lwt_unix.fork ())));
   (* Allowed off the owner: a loop with timers, and the notification API. *)
   check "a loop with timers still runs on another domain"
     (on_other_domain (fun () ->

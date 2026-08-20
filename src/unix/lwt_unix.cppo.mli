@@ -1459,10 +1459,17 @@ Jobs are not restricted: {!run_job}, and every operation built on it such
     the loop that submitted it. So may {!abort_jobs}, {!cancel_jobs} and
     {!wait_for_jobs}, each acting on the calling loop's own jobs.
 
-    Signal handlers ({!on_signal} and friends) and child waiting ({!waitpid},
-    {!wait4}) are still wired to the domain that initialised this module, and
-    raise [Failure] with an explanatory message elsewhere. That is a transitional
-    state, not a design.
+    Signal handlers are not restricted either. {!on_signal} subscribes the
+    CALLING loop, and a signal is delivered to every loop that subscribed, each on
+    its own channel, since a signal is an event of the whole process. Child
+    waiting follows: each loop reaps the children it waits for. Two loops each
+    waiting for their own child are both woken and each finds its own; two loops
+    waiting for ANY child race for whichever exits, which is what waiting for any
+    child means.
+
+    {!fork} is the one operation still restricted to the domain that initialised
+    this module, and not because of notifications: the runtime does not support
+    forking while other domains are running.
 
     Nothing else is restricted: any domain can run its own {!Lwt_main.run} with
     its own timers and its own socket I/O. *)
@@ -1673,10 +1680,3 @@ val ensure_channel : unit -> unit
     and may need a job, happens while the channel still lives: domain exit
     callbacks run last-registered-first. *)
 
-val check_notification_owner : string -> unit
-  [@@alert lwt_internal "Internal to the Lwt packages, keep away."]
-(** [check_notification_owner name] fails, mentioning [name], unless the calling
-    domain is the one that initialised this module and therefore owns the
-    notification file descriptor. Exposed for the Lwt packages built on
-    notifications, {!Lwt_preemptive} in particular; it goes away once each domain
-    has a descriptor of its own. *)
