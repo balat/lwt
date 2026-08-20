@@ -298,7 +298,6 @@ type 'a queue = { mutable front : 'a list; mutable back : 'a list }
 let queue_create () = { front = []; back = [] }
 let queue_push q x = q.back <- x :: q.back
 let queue_push_front q x = q.front <- x :: q.front
-let queue_length q = List.length q.front + List.length q.back
 
 let rec queue_pop q =
   match q.front with
@@ -307,6 +306,18 @@ let rec queue_pop q =
     match q.back with
     | [] -> None
     | back -> q.front <- List.rev back; q.back <- []; queue_pop q)
+
+(* Empties the queue in constant time, handing the two lists to the caller, who
+   assembles them OUTSIDE the lock. Building the list under it would allocate
+   there, which the rule for these locks forbids, and a broadcast is exactly where
+   the list is longest. *)
+let queue_take_all q =
+  let front = q.front and back = q.back in
+  q.front <- [];
+  q.back <- [];
+  (front, back)
+
+let queue_assemble (front, back) = front @ List.rev back
 
 (* Drops an element that has been withdrawn, by identity. O(n), on a queue that is
    short. *)
@@ -442,14 +453,11 @@ module Condition = struct
 
   let broadcast t v =
     Stdlib.Mutex.lock t.guard;
-    let rec drain acc =
-      match queue_pop t.waiters with
-      | Some w -> drain (w :: acc)
-      | None -> acc
-    in
-    let waiters = drain [] in
+    let taken = queue_take_all t.waiters in
     Stdlib.Mutex.unlock t.guard;
-    List.iter (fun w -> wake w v ~on_dead:(fun () -> ())) waiters
+    List.iter
+      (fun w -> wake w v ~on_dead:(fun () -> ()))
+      (queue_assemble taken)
 
   let wait ?mutex t =
     let w = new_waiter () in
@@ -481,6 +489,11 @@ module Stream = struct
     (* Loops waiting for room. They carry nothing: a woken pusher retries, which
        is what keeps cancellation from having to give a value back. *)
     room : unit waiter queue;
+    (* Kept rather than counted: [queue_length] walks the lists, and walking them
+       under the lock would be O(capacity) on every push. No allocation and no
+       system call either way, so the rule for these locks was satisfied, but
+       there is no reason to pay it. *)
+    mutable size : int;
     mutable closed : bool;
   }
 
@@ -491,11 +504,12 @@ module Stream = struct
       items = queue_create ();
       takers = queue_create ();
       room = queue_create ();
+      size = 0;
       closed = false }
 
   let length t =
     Stdlib.Mutex.lock t.guard;
-    let n = queue_length t.items in
+    let n = t.size in
     Stdlib.Mutex.unlock t.guard;
     n
 
@@ -516,6 +530,7 @@ module Stream = struct
       wake w (Some v) ~on_dead:(fun () -> deposit t v)
     | None ->
       queue_push_front t.items v;
+      t.size <- t.size + 1;
       Stdlib.Mutex.unlock t.guard
 
   (* One unit of room has appeared: let the first waiting pusher retry. *)
@@ -542,8 +557,9 @@ module Stream = struct
         wake taker (Some v) ~on_dead:(fun () -> deposit t v);
         Lwt.return_unit
       | None ->
-        if queue_length t.items < t.capacity then begin
+        if t.size < t.capacity then begin
           queue_push t.items v;
+          t.size <- t.size + 1;
           Stdlib.Mutex.unlock t.guard;
           Lwt.return_unit
         end
@@ -565,6 +581,7 @@ module Stream = struct
     Stdlib.Mutex.lock t.guard;
     match queue_pop t.items with
     | Some v ->
+      t.size <- t.size - 1;
       Stdlib.Mutex.unlock t.guard;
       (* Taking freed a slot, so a blocked producer may go. *)
       offer_room t;
@@ -586,16 +603,15 @@ module Stream = struct
 
   let close t =
     Stdlib.Mutex.lock t.guard;
-    let takers = ref [] and room = ref [] in
+    let taken_takers = ref ([], []) and taken_room = ref ([], []) in
     if not t.closed then begin
       t.closed <- true;
-      let rec drain q acc =
-        match queue_pop q with Some w -> drain q (w :: acc) | None -> acc
-      in
-      takers := drain t.takers [];
-      room := drain t.room []
+      taken_takers := queue_take_all t.takers;
+      taken_room := queue_take_all t.room
     end;
     Stdlib.Mutex.unlock t.guard;
+    let takers = ref (queue_assemble !taken_takers) in
+    let room = ref (queue_assemble !taken_room) in
     (* Consumers learn the end; producers waiting for room learn there will be
        none, since pushing to a closed stream fails. *)
     List.iter (fun w -> wake w None ~on_dead:(fun () -> ())) !takers;
