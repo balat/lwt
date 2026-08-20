@@ -431,7 +431,10 @@ let mk_ch ?blocking ?(set_flags=true) fd = {
 }
 
 let check_descriptor ch =
-  Lwt_dls.check_owner "Lwt_unix file descriptor" ch.owner;
+  (* Comparison written out rather than [check_owner]: this runs on every
+     operation, and the call costs more than the check. *)
+  if ch.owner <> Lwt_dls.self_token () then
+    Lwt_dls.foreign "Lwt_unix file descriptor";
   match ch.state with
   | Opened ->
     ()

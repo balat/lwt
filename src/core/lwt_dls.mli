@@ -36,26 +36,41 @@ val is_main_domain : unit -> bool
   [@@alert lwt_internal "Lwt_dls is internal to the Lwt packages, keep away."]
 (** Always [true] on 4.14, where there is one domain and it is the main one. *)
 
-type token
-(** The identity of a domain, as something to compare: physically distinct per
-    domain, and never reused, which a [Domain.id] would not give since those are
-    recycled after a domain terminates.
+type token = private int
+(** The identity of a domain, as something to compare. It is the domain's
+    identifier, which is cheap: reading a slot instead costs 64 instructions
+    against 9, measured, and the domain-affine containers compare one per
+    operation, down to one per buffered character.
 
-    This is what the domain-affine CONTAINERS are stamped with. Promises carry
-    the core's own scheduler record instead, which serves the same purpose there
-    and costs no extra slot; containers have no scheduler to point at, and the
-    core is above them. *)
+    The price is that identifiers are RECYCLED when a domain terminates, so a
+    container created by a domain that has since died can be taken for its own by
+    a later domain that inherited the identifier. That is a missed violation,
+    never a false one, and it needs the owner to be dead.
+
+    This is what the domain-affine CONTAINERS are stamped with. Promises carry the
+    core's own scheduler record instead, which is exact and costs nothing extra
+    there, the record being in hand already. *)
 
 val self_token : unit -> token
   [@@alert lwt_internal "Lwt_dls is internal to the Lwt packages, keep away."]
-(** The calling domain's token. Compare with [!=]. *)
+(** The calling domain's identity. *)
 
 val check_owner : string -> token -> unit
   [@@alert lwt_internal "Lwt_dls is internal to the Lwt packages, keep away."]
 (** [check_owner name owner] raises [Invalid_argument], mentioning [name], unless
     [owner] is the calling domain's token. One implementation for every
     domain-affine container, since all that varies is the name of the operation
-    being refused. *)
+    being refused.
+
+    On the few paths where the CALL costs more than the check -- the buffered
+    character of [Lwt_io], the descriptor of [Lwt_unix] -- write the comparison
+    out with {!self_token} and {!foreign} instead. Measured: the call adds some
+    thirty instructions to a nine-instruction check. *)
+
+val foreign : string -> 'a
+  [@@alert lwt_internal "Lwt_dls is internal to the Lwt packages, keep away."]
+(** Raises the [Invalid_argument] {!check_owner} raises. For the hot paths that
+    inline their own comparison. *)
 
 val at_domain_exit : (unit -> unit) -> unit
   [@@alert lwt_internal "Lwt_dls is internal to the Lwt packages, keep away."]
