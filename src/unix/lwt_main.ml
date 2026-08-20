@@ -61,8 +61,15 @@ let drain_exit_hooks = ref (fun () -> ())
 
 let hooks : hooks Lwt_dls.t =
   Lwt_dls.new_key (fun () ->
-    if not (Lwt_dls.is_main_domain ()) then
-      Lwt_dls.at_domain_exit (fun () -> !drain_exit_hooks ());
+    if not (Lwt_dls.is_main_domain ()) then begin
+      (* Before registering the drain, not after: domain exit callbacks run
+         last-registered-first, and the drain runs a loop whose hooks may need a
+         job, so this domain's notification channel has to outlive it. Forcing
+         the channel here puts its retirement earlier in the list, hence later in
+         the running. *)
+      Lwt_unix.ensure_channel ();
+      Lwt_dls.at_domain_exit (fun () -> !drain_exit_hooks ())
+    end;
     {
       enter_iter = Lwt_sequence.create ();
       leave_iter = Lwt_sequence.create ();

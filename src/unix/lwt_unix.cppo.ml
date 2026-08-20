@@ -21,9 +21,10 @@ open Lwt.Infix
    notification id carries the index of the one it belongs to, so a completion
    wakes the loop that asked for the work.
 
-   What has not caught up yet, and is the current phase's subject: the JOBS
-   themselves, the signal handlers and child waiting are still wired to the
-   domain that initialised this module, so they keep the owner check below.
+   Jobs have caught up: they are per loop, and a completion wakes the loop that
+   submitted the work. What has not, and is the rest of this phase: the signal
+   handlers and child waiting, which keep the owner check below because a signal
+   is a process-wide resource and needs a policy rather than a channel.
 
    So this module has an owner, and it is the domain that initialised it. On
    another domain, submitting a job would have the completion wake a promise the
@@ -66,7 +67,15 @@ let drain_notifications : (int -> unit) ref = ref (fun _ -> ())
    The channel's index is what the C side needs, and the notification ids this
    domain hands out carry it, which is what lets a pool thread or a signal
    handler wake the right loop without asking anything about domains. *)
-type notif = { chan : int; event : Lwt_engine.event }
+type notif = {
+  chan : int;
+  event : Lwt_engine.event;
+  (* The jobs this loop has in flight, with the function that aborts each, and
+     their count. Per domain because a completion wakes the loop that submitted
+     the job, so that is the loop that must remove the node and decrement. *)
+  jobs : (unit Lwt.t * (exn -> unit)) Lwt_sequence.t;
+  mutable job_count : int;
+}
 
 let notif_slot : notif Lwt_dls.t =
   Lwt_dls.new_key (fun () ->
@@ -75,19 +84,30 @@ let notif_slot : notif Lwt_dls.t =
     (* Retire the channel with the domain. The event must be stopped first: the
        engine must not be left watching a closed descriptor.
 
-       ORDER, and a debt to settle at step 2: [Domain.at_exit] is LIFO, so this
-       runs BEFORE [Lwt_main]'s exit-hook drain, which is registered later on a
-       domain that runs a loop. Harmless while jobs still belong to the loading
-       domain, since a spawned domain's exit hooks cannot need one; once step 2
-       gives every domain its jobs, an exit hook could, and the order has to be
-       fixed then, together with the count of jobs in flight that step 7 needs
-       anyway. *)
+       ORDER. [Domain.at_exit] is LIFO, so what is registered LAST runs FIRST.
+       [Lwt_main]'s exit-hook drain runs a loop, and an exit hook may well need a
+       job (closing an [Lwt_io] channel does), so the drain must happen while this
+       channel still lives. That is why [Lwt_main]'s hooks slot calls
+       {!ensure_channel} before registering its own drain: this registration then
+       comes first and therefore runs last.
+
+       A job still in flight when this runs is safe rather than merely unlikely:
+       the channel struct is never freed, only returned to a free list, and the
+       generation in its ids means a late completion is dropped instead of waking
+       whoever takes the slot next. Nobody is waiting for it either way, the
+       domain being gone. *)
     Lwt_dls.at_domain_exit (fun () ->
       Lwt_engine.stop_event event;
       free_notification_channel chan);
-    { chan; event })
+    { chan; event; jobs = Lwt_sequence.create (); job_count = 0 })
 
+let[@inline] self_notif () = Lwt_dls.get notif_slot
 let[@inline] self_channel () = (Lwt_dls.get notif_slot).chan
+
+(* Forces this domain's channel into existence. Called by [Lwt_main] before it
+   registers its exit drain, so that the drain runs while the channel lives; see
+   the ORDER note above. *)
+let ensure_channel () = ignore (Lwt_dls.get notif_slot)
 
 (* Set up lazily, per domain, by the slot above. *)
 let is_owner_slot : bool Lwt_dls.t = Lwt_dls.new_key (fun () -> false)
@@ -104,12 +124,7 @@ let[@inline never] not_the_owner name =
 let[@inline] check_notification_owner name =
   if not (is_notification_owner ()) then not_the_owner name
 
-(* PROCESS-WIDE, and deliberately not per domain: the running jobs and their
-   count. Splitting them per domain would be wrong while completions all fire on
-   the owner, since a completion would then remove a node from, and decrement a
-   counter of, another domain's state. They need no lock either: the owner check
-   above means only the owner ever touches them. *)
-let job_count = ref 0
+
 
 (* +-----------------------------------------------------------------+
    | Configuration                                                   |
@@ -284,28 +299,21 @@ external check_job : 'a job -> int -> bool = "lwt_unix_check_job" "noalloc"
    when it finishes. *)
 [@@ocaml.warning "-3"]
 
-(* For all running job, a waiter and a function to abort it. *)
-let jobs = Lwt_sequence.create ()
-
-let rec abort_jobs_aux exn =
+(* Each of these acts on THIS loop's jobs, which is the only set a domain has any
+   business touching, and the only one it can service. *)
+let rec abort_jobs_aux jobs exn =
   match Lwt_sequence.take_opt_l jobs with
-  | Some (_, f) -> f exn; abort_jobs_aux exn
+  | Some (_, f) -> f exn; abort_jobs_aux jobs exn
   | None -> ()
 
-let abort_jobs exn =
-  check_notification_owner "Lwt_unix.abort_jobs";
-  abort_jobs_aux exn
-
-let cancel_jobs () =
-  check_notification_owner "Lwt_unix.cancel_jobs";
-  abort_jobs_aux Lwt.Canceled
+let abort_jobs exn = abort_jobs_aux (self_notif ()).jobs exn
+let cancel_jobs () = abort_jobs_aux (self_notif ()).jobs Lwt.Canceled
 
 let wait_for_jobs () =
-  check_notification_owner "Lwt_unix.wait_for_jobs";
-  Lwt.join (Lwt_sequence.fold_l (fun (w, _) l -> w :: l) jobs [])
+  Lwt.join
+    (Lwt_sequence.fold_l (fun (w, _) l -> w :: l) (self_notif ()).jobs [])
 
 let run_job_aux async_method job result =
-  check_notification_owner "Lwt_unix.run_job";
   (* Starts the job. *)
   if start_job job async_method then
     (* The job has already terminated, read and return the result
@@ -314,19 +322,22 @@ let run_job_aux async_method job result =
   else begin
     (* Thread for the job. *)
     let waiter, wakener = Lwt.wait () in
-    (* Add the job to the sequence of all jobs. *)
+    (* Add the job to this loop's sequence. One slot read for the whole
+       operation: the notification the completion needs comes from the same
+       record. *)
+    let notif = self_notif () in
     let node = Lwt_sequence.add_l (
       (waiter >>= fun _ -> Lwt.return_unit),
       (fun exn -> if Lwt.state waiter = Lwt.Sleep then Lwt.wakeup_exn wakener exn))
-      jobs in
-    incr job_count;
+      notif.jobs in
+    notif.job_count <- notif.job_count + 1;
     ignore begin
       (* Create the notification for asynchronous wakeup. *)
       let notification =
         make_notification ~once:true
           (fun () ->
              Lwt_sequence.remove node;
-             decr job_count;
+             notif.job_count <- notif.job_count - 1;
              let result = result job in
              if Lwt.state waiter = Lwt.Sleep then Lwt.wakeup_result wakener result)
       in
@@ -2589,8 +2600,11 @@ let fork () =
     let event =
       Lwt_engine.on_readable fd (fun _ -> !drain_notifications chan)
     in
-    Lwt_dls.set notif_slot { chan; event };
+    (* The child keeps the parent's job sequence, which the lines below empty and
+       cancel; only the channel is replaced. *)
+    Lwt_dls.set notif_slot { old with chan; event };
     (* Collect all pending jobs. *)
+    let jobs = (self_notif ()).jobs in
     let l = Lwt_sequence.fold_l (fun (_, f) l -> f :: l) jobs [] in
     (* Remove them all. *)
     Lwt_sequence.iter_node_l Lwt_sequence.remove jobs;
@@ -2886,4 +2900,5 @@ struct
   let send_msg_2 = send_msg
 end
 
-let write_job_count_runtimte_event () = Lwt_rte.emit_job_count !job_count
+let write_job_count_runtimte_event () =
+  Lwt_rte.emit_job_count (self_notif ()).job_count

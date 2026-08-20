@@ -1454,12 +1454,15 @@ val wait_for_jobs : unit -> unit Lwt.t
     A handler only runs while its own domain is running a loop. A notification
     created on a domain that then stops running one is simply never delivered.
 
-    Jobs ({!run_job} and every operation built on it), signal handlers
-    ({!on_signal} and friends) and child waiting ({!waitpid}, {!wait4}) are for
-    the moment still restricted to the domain that initialised this module, and
+Jobs are not restricted: {!run_job}, and every operation built on it such
+    as {!openfile} or {!stat}, may be submitted from any domain and completes on
+    the loop that submitted it. So may {!abort_jobs}, {!cancel_jobs} and
+    {!wait_for_jobs}, each acting on the calling loop's own jobs.
+
+    Signal handlers ({!on_signal} and friends) and child waiting ({!waitpid},
+    {!wait4}) are still wired to the domain that initialised this module, and
     raise [Failure] with an explanatory message elsewhere. That is a transitional
-    state, not a design: the pipe is per loop now, and the remaining restriction
-    is what the phase currently under way removes.
+    state, not a design.
 
     Nothing else is restricted: any domain can run its own {!Lwt_main.run} with
     its own timers and its own socket I/O. *)
@@ -1662,6 +1665,13 @@ val install_sigchld_handler : unit -> unit
     notification pipe it does nothing, since the handler could neither be
     delivered there nor safely wake that domain's waiters. For internal use:
     [Lwt_main.run] and {!waitpid} call it. *)
+
+val ensure_channel : unit -> unit
+  [@@alert lwt_internal "Internal to the Lwt packages, keep away."]
+(** Forces this domain's notification channel into existence. [Lwt_main] calls it
+    before registering its exit-hook drain, so that the drain, which runs a loop
+    and may need a job, happens while the channel still lives: domain exit
+    callbacks run last-registered-first. *)
 
 val check_notification_owner : string -> unit
   [@@alert lwt_internal "Internal to the Lwt packages, keep away."]
