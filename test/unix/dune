@@ -23,7 +23,30 @@
    domain_upstream_scenarios
    domain_notifications
    domain_signals
-   domain_gc)))
+   domain_gc
+   domain_reuseport
+   bench_reuseport)))
+
+; The scaling benchmark for the server recipe. An executable, not a test: it needs
+; an external load generator.
+
+(executable
+ (name bench_reuseport)
+ (modules bench_reuseport)
+ (enabled_if
+  (>= %{ocaml_version} "5.0"))
+ (libraries lwt.unix lwt_uring))
+
+; The server recipe: one listening socket per domain on the same port, through
+; SO_REUSEPORT. Needs a second domain, hence OCaml 5.
+
+(test
+ (name domain_reuseport)
+ (package lwt)
+ (modules domain_reuseport)
+ (build_if
+  (>= %{ocaml_version} "5.0"))
+ (libraries lwt.unix))
 
 ; Lwt_gc's deferred function runs on the loop that registered it, and one whose
 ; domain has gone is dropped. Needs a second domain, hence OCaml 5.
