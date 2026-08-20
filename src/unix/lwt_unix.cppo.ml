@@ -56,9 +56,11 @@ external recv_notifications : int -> int array = "lwt_unix_recv_notifications"
 
 external encode_notification : int -> int -> int = "lwt_unix_encode_notification"
 
-(* Forward cell: draining needs [call_notification], which needs the notifier
-   table, which is defined below. Set once, at the end of that section. *)
+(* Forward cells: draining needs [call_notification], and retiring a loop needs
+   [remove_signal]; both are defined below. Set once, each at the end of its
+   section. *)
 let drain_notifications : (int -> unit) ref = ref (fun _ -> ())
+let drop_signal_subscriptions : (unit -> unit) ref = ref (fun () -> ())
 
 (* PER DOMAIN: the channel this loop is woken through, and the engine event that
    watches it. Created on first use, so a domain that never touches Lwt_unix
@@ -129,6 +131,11 @@ let notif_slot : notif Lwt_dls.t =
        whoever takes the slot next. Nobody is waiting for it either way, the
        domain being gone. *)
     Lwt_dls.at_domain_exit (fun () ->
+      (* Unsubscribe from every signal this loop subscribed to, FIRST. Otherwise
+         the process-wide handler stays installed for a loop that no longer
+         exists, and the signal keeps being swallowed: a program whose last
+         subscriber died would stop dying on SIGTERM. *)
+      !drop_signal_subscriptions ();
       Lwt_engine.stop_event event;
       free_notification_channel chan);
     { chan;
@@ -2596,6 +2603,17 @@ let disable_signal_handler id =
         notif.signals <- Signal_map.remove sh.sh_num notif.signals;
         stop_notification notification
       end
+
+(* Closes the forward cell opened at the top: retiring a loop drops its
+   subscriptions. Only this domain's, and it is the only one that could. *)
+let () =
+  drop_signal_subscriptions :=
+    fun () ->
+      let notif = self_notif () in
+      Signal_map.iter
+        (fun signum (notification, _) -> remove_signal signum notification)
+        notif.signals;
+      notif.signals <- Signal_map.empty
 
 let reinstall_signal_handler signum =
   match Signal_map.find signum (self_notif ()).signals with
