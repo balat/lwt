@@ -111,16 +111,24 @@ let () =
   (try Lwt_main.run (Lwt_unix.close r) with _ -> ());
   (try Lwt_main.run (Lwt_unix.close wfd) with _ -> ());
 
-  (* 5. preempting: detaching blocking work from a spawned domain. *)
-  check "preempting: detaching from another domain is refused"
-    (on_other_domain (fun () ->
-       refused (fun () ->
-         Lwt_main.run (Lwt_preemptive.detach (fun () -> 1) ()))));
-  check "preempting: detaching from the owner works"
-    (match Lwt_main.run (Lwt_preemptive.detach String.length "hello") with
-     | 5 -> true
-     | _ -> false
-     | exception _ -> false);
+  (* 5. preempting: detaching blocking work from a spawned domain. This one
+     upstream's scenario wanted, and it now works: the detached result returns
+     through the detaching loop's own channel. The scenario's own shape, several
+     domains each detaching a list of work, is what this checks. *)
+  check "preempting: several domains detach at once"
+    (let inputs = [ "a"; "bb"; "ccc"; "dddd" ] in
+     let run () =
+       Domain.spawn (fun () ->
+         match
+           Lwt_main.run
+             (Lwt_list.map_p (Lwt_preemptive.detach String.length) inputs)
+         with
+         | lengths -> lengths = List.map String.length inputs
+         | exception _ -> false)
+     in
+     let a = run () and b = run () in
+     let ra = Domain.join a and rb = Domain.join b in
+     ra && rb);
 
   if !failures > 0 then exit 1;
   print_endline "upstream multidomain scenarios, refused as designed: ok"

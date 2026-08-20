@@ -12,42 +12,58 @@ module Lwt_sequence = Lwt_sequence
 
 open Lwt.Infix
 
-(* The worker pool is PROCESS-WIDE and stays so: a pool of system threads is a
-   process resource, and N pools of [max_threads] threads is not what anyone
-   asked for. What makes it safe is the same rule as [Lwt_unix]'s jobs, and for
-   the same reason: [detach] gets its result back through a notification, whose
-   handler runs on the domain that owns the notification descriptor, so a detach
-   from anywhere else would wake a promise from a domain that does not own it.
-   Only the owner may detach, and therefore only the owner touches the pool, the
-   waiter queue and the thread count, which need no lock as a result.
+(* ONE POOL PER LOOP, and that is not a preference: a shared pool of system
+   threads cannot survive domains that come and go.
 
-   [run_in_main] and [run_in_main_dont_wait] are the other direction and stay
-   callable from any thread and any domain: that is their entire purpose. The
-   function they take runs on the owning domain. *)
+   The fact that decides it, measured rather than assumed: A DOMAIN DOES NOT
+   TERMINATE WHILE ANY OF ITS THREADS IS STILL RUNNING. Spawn a domain, let it
+   create a thread that loops, return from its body, and [Domain.join] blocks for
+   ever. Worker threads are created by whichever domain first needs one, so a
+   shared pool would hand a spawned domain a thread it created and thereby pin
+   that domain alive after its work is done. Nothing about notifications or
+   promises enters into it; it is the threads themselves.
+
+   So each loop keeps its own free list, its own count and its own queue of
+   clients waiting for a worker. Everything here is touched by one domain only,
+   which is also why none of it needs a lock: the shared-pool version had to
+   protect the free list with a mutex and hand waiting clients their worker
+   through a notification, because their promises belonged to different domains.
+   Per loop, the promises are local again and the code is the one Lwt always had.
+
+   The bounds stay PROCESS-WIDE settings, applied per loop: [set_bounds (0, 4)]
+   means four workers per loop, not four in the process. Documented, because a
+   program with several loops does get more threads than it used to.
+
+   A loop's workers are terminated when its domain exits, which is what makes the
+   domain able to exit at all.
+
+   [run_in_main] and [run_in_main_dont_wait] keep their meaning: the function runs
+   on the domain that initialised this module, not on the domain that detached the
+   work. With N loops "the main thread" is ambiguous, and changing it silently
+   would be worse than leaving it documented. *)
 [@@@alert "-lwt_internal"]
 
 (* +-----------------------------------------------------------------+
    | Parameters                                                      |
    +-----------------------------------------------------------------+ *)
 
-(* Minimum number of preemptive threads: *)
-let min_threads : int ref = ref 0
+(* Settings, shared by every loop and applied per loop, so read and written from
+   any domain: atomics rather than refs. *)
 
-(* Maximum number of preemptive threads: *)
-let max_threads : int ref = ref 0
+(* Minimum number of preemptive threads, per loop: *)
+let min_threads = Atomic.make 0
+
+(* Maximum number of preemptive threads, per loop: *)
+let max_threads = Atomic.make 0
 
 (* Size of the waiting queue: *)
-let max_thread_queued = ref 1000
+let max_thread_queued = Atomic.make 1000
 
-let get_max_number_of_threads_queued _ =
-  !max_thread_queued
+let get_max_number_of_threads_queued _ = Atomic.get max_thread_queued
 
 let set_max_number_of_threads_queued n =
   if n < 0 then invalid_arg "Lwt_preemptive.set_max_number_of_threads_queued";
-  max_thread_queued := n
-
-(* The total number of preemptive threads currently running: *)
-let threads_count = ref 0
+  Atomic.set max_thread_queued n
 
 (* +-----------------------------------------------------------------+
    | Preemptive threads management                                   |
@@ -99,88 +115,154 @@ type thread = {
   mutable thread : Thread.t;
   (* The worker thread. *)
 
-  mutable reuse : bool;
-  (* Whether the thread must be re-added to the pool when the work is
-     done. *)
+  reuse : bool Atomic.t;
+  (* Whether the thread must be re-added to the pool when the work is done.
+     Atomic because the worker writes it and its loop reads it. *)
 }
 
-(* Pool of worker threads: *)
-let workers : thread Queue.t = Queue.create ()
+(* PER LOOP. Only its own domain touches any of this, so none of it is locked;
+   see the note at the top for why a shared pool is not an option. *)
+type pool = {
+  (* Free workers. *)
+  free : thread Queue.t;
+  (* Clients waiting for one, as promises of this domain. *)
+  waiters : thread Lwt.u Lwt_sequence.t;
+  (* How many workers this loop has created. *)
+  mutable count : int;
+  (* Every worker created, so that they can be joined at domain exit. *)
+  mutable all : thread list;
+  (* Set at domain exit: tells a worker to stop looping. Read by the workers,
+     hence atomic. *)
+  stopping : bool Atomic.t;
+  (* A notification a dying worker can send harmlessly: this domain will not be
+     draining any more, so it is dropped. *)
+  quit : Lwt_unix.notification;
+}
 
-(* Queue of clients waiting for a worker to be available: *)
-let waiters : thread Lwt.u Lwt_sequence.t = Lwt_sequence.create ()
+let shutdown_pool : (pool -> unit) ref = ref (fun _ -> ())
+
+let pool_slot : pool Lwt_dls.t =
+  Lwt_dls.new_key (fun () ->
+    let pool =
+      { free = Queue.create ();
+        waiters = Lwt_sequence.create ();
+        count = 0;
+        all = [];
+        stopping = Atomic.make false;
+        quit = Lwt_unix.make_notification (fun () -> ()) }
+    in
+    Lwt_dls.at_domain_exit (fun () -> !shutdown_pool pool);
+    pool)
+
+let[@inline] self_pool () = Lwt_dls.get pool_slot
 
 (* Code executed by a worker: *)
-let rec worker_loop worker =
+let rec worker_loop pool worker =
   let id, task = CELL.get worker.task_cell in
   task ();
-  (* If there is too much threads, exit. This can happen if the user
-     decreased the maximum: *)
-  if !threads_count > !max_threads then worker.reuse <- false;
-  (* Tell the main thread that work is done: *)
+  (* Tell the loop that submitted this task that the work is done. The id names
+     that loop's notification channel. *)
   Lwt_unix.send_notification id;
-  if worker.reuse then worker_loop worker
+  if Atomic.get worker.reuse && not (Atomic.get pool.stopping) then
+    worker_loop pool worker
 
 (* create a new worker: *)
-let make_worker () =
-  incr threads_count;
+let make_worker pool =
+  pool.count <- pool.count + 1;
   let worker = {
     task_cell = CELL.make ();
     thread = Thread.self ();
-    reuse = true;
+    reuse = Atomic.make true;
   } in
-  worker.thread <- Thread.create worker_loop worker;
+  worker.thread <- Thread.create (worker_loop pool) worker;
+  pool.all <- worker :: pool.all;
   worker
 
 (* Add a worker to the pool: *)
-let add_worker worker =
-  match Lwt_sequence.take_opt_l waiters with
+let add_worker pool worker =
+  match Lwt_sequence.take_opt_l pool.waiters with
   | None ->
-    Queue.add worker workers
+    Queue.add worker pool.free
   | Some w ->
     Lwt.wakeup w worker
 
 (* Wait for worker to be available, then return it: *)
-let get_worker () =
-  if not (Queue.is_empty workers) then
-    Lwt.return (Queue.take workers)
-  else if !threads_count < !max_threads then
-    Lwt.return (make_worker ())
+let get_worker pool =
+  if not (Queue.is_empty pool.free) then
+    Lwt.return (Queue.take pool.free)
+  else if pool.count < Atomic.get max_threads then
+    Lwt.return (make_worker pool)
   else
-    (Lwt.add_task_r [@ocaml.warning "-3"]) waiters
+    (Lwt.add_task_r [@ocaml.warning "-3"]) pool.waiters
+
+(* Ends this loop's workers, and waits for them. Without this the domain could
+   not terminate at all: a running thread pins its domain, so a loop that ever
+   detached anything would hang [Domain.join] for ever.
+
+   A free worker is woken with a task that does nothing, so that it notices
+   [stopping] and leaves its loop. A BUSY worker is left to finish what it is
+   doing and notices on its own; joining it is what makes the wait correct rather
+   than a race. *)
+(* Ordering, and why this needs none. A worker created AFTER this has run, for
+   instance by an exit hook that detaches, is not a leak and does not hang the
+   domain: [stopping] is already set, so the worker leaves its loop after its one
+   task, and [detach]'s own finaliser joins it. So this may run before or after
+   [Lwt_main]'s exit drain, and does not have to be sequenced against it. *)
+let shutdown pool =
+  Atomic.set pool.stopping true;
+  Queue.iter
+    (fun worker -> CELL.set worker.task_cell (pool.quit, fun () -> ()))
+    pool.free;
+  Queue.clear pool.free;
+  List.iter (fun worker -> Thread.join worker.thread) pool.all;
+  pool.all <- [];
+  pool.count <- 0
+
+let () = shutdown_pool := shutdown
 
 (* +-----------------------------------------------------------------+
    | Initialisation, and dynamic parameters reset                    |
    +-----------------------------------------------------------------+ *)
 
-let get_bounds () = (!min_threads, !max_threads)
+let get_bounds () = (Atomic.get min_threads, Atomic.get max_threads)
 
+(* The bounds are process-wide; the workers they launch are this loop's. *)
 let set_bounds (min, max) =
-  Lwt_unix.check_notification_owner "Lwt_preemptive.set_bounds";
   if min < 0 || max < min then invalid_arg "Lwt_preemptive.set_bounds";
-  let diff = min - !threads_count in
-  min_threads := min;
-  max_threads := max;
+  let pool = self_pool () in
+  let diff = min - pool.count in
+  Atomic.set min_threads min;
+  Atomic.set max_threads max;
   (* Launch new workers: *)
   for _i = 1 to diff do
-    add_worker (make_worker ())
+    add_worker pool (make_worker pool)
   done
 
-let initialized = ref false
+(* Whether the bounds have been set. Per loop, since what [simple_init] has to
+   arrange is this loop's minimum: a second domain arriving later must still get
+   its own workers. The bounds themselves stay shared. *)
+let initialized : bool ref Lwt_dls.t = Lwt_dls.new_key (fun () -> ref false)
 
 let init min max _errlog =
-  initialized := true;
+  (Lwt_dls.get initialized) := true;
   set_bounds (min, max)
 
 let simple_init () =
-  if not !initialized then begin
-    initialized := true;
-    set_bounds (0, 4)
+  let flag = Lwt_dls.get initialized in
+  if not !flag then begin
+    flag := true;
+    (* Only take the default bounds if nobody has set any. *)
+    if Atomic.get max_threads = 0 then set_bounds (0, 4)
+    else set_bounds (Atomic.get min_threads, Atomic.get max_threads)
   end
 
-let nbthreads () = !threads_count
-let nbthreadsqueued () = Lwt_sequence.fold_l (fun _ x -> x + 1) waiters 0
-let nbthreadsbusy () = !threads_count - Queue.length workers
+(* All three report on the CALLING loop's pool. *)
+let nbthreads () = (self_pool ()).count
+let nbthreadsqueued () =
+  Lwt_sequence.fold_l (fun _ x -> x + 1) (self_pool ()).waiters 0
+let nbthreadsbusy () =
+  let pool = self_pool () in
+  pool.count - Queue.length pool.free
 
 (* +-----------------------------------------------------------------+
    | Detaching                                                       |
@@ -189,8 +271,8 @@ let nbthreadsbusy () = !threads_count - Queue.length workers
 let init_result = Result.Error (Failure "Lwt_preemptive.detach")
 
 let detach f args =
-  Lwt_unix.check_notification_owner "Lwt_preemptive.detach";
   simple_init ();
+  let pool = self_pool () in
   let result = ref init_result in
   (* The task for the worker thread: *)
   let task () =
@@ -199,7 +281,7 @@ let detach f args =
     with exn when Lwt.Exception_filter.run exn ->
       result := Result.Error exn
   in
-  get_worker () >>= fun worker ->
+  get_worker pool >>= fun worker ->
   let waiter, wakener = Lwt.wait () in
   let id =
     Lwt_unix.make_notification ~once:true
@@ -211,11 +293,11 @@ let detach f args =
        CELL.set worker.task_cell (id, task);
        waiter)
     (fun () ->
-       if worker.reuse then
+       if Atomic.get worker.reuse && not (Atomic.get pool.stopping) then
          (* Put back the worker to the pool: *)
-         add_worker worker
+         add_worker pool worker
        else begin
-         decr threads_count;
+         pool.count <- pool.count - 1;
          (* Or wait for the thread to terminates, to free its associated
             resources: *)
          Thread.join worker.thread

@@ -10,16 +10,27 @@
     See {{:https://github.com/hcarty/mwt} Mwt} for a more modern
     implementation. *)
 
-(** {2 Which domain these belong to}
+(** {2 One pool per loop}
 
-    The pool of system threads is a process resource and is shared, but
-    {!detach} hands its result back through Lwt's notification pipe, which is
-    read by the domain that initialised {!Lwt_unix}. So {!detach}, {!init} and
-    {!set_bounds} belong to that domain and raise [Failure] elsewhere.
+    {!detach} may be called from any domain, and its result comes back on the
+    loop that detached the work.
+
+    Each loop has its OWN pool of worker threads, which is not a preference but
+    a consequence: a domain does not terminate while any of its threads is still
+    running, and worker threads are created by the domain that needs one. A
+    shared pool would therefore pin a domain alive after its work was done. Each
+    loop's workers are ended when its domain exits.
+
+    So the bounds are process-wide settings applied PER LOOP: [set_bounds (0, 4)]
+    means four worker threads per loop, and a program with several loops does get
+    more threads than the same program with one. {!nbthreads},
+    {!nbthreadsbusy} and {!nbthreadsqueued} report on the calling loop.
 
     {!run_in_main} and {!run_in_main_dont_wait} go the other way and may be
-    called from any thread and any domain; the function they are given runs on
-    that same owning domain. *)
+    called from any thread and any domain. The function they are given runs on the
+    domain that initialised {!Lwt_unix}, not on the domain that detached the work:
+    with several loops "the main thread" is ambiguous, and this is the historical
+    behaviour. *)
 
 val detach : ('a -> 'b) -> 'a -> 'b Lwt.t
   (** [detach f x] runs the computation [f x] in a separate preemptive thread.

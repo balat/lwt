@@ -8,9 +8,10 @@
    one across a domain boundary is refused rather than spliced into the wrong
    wheel.
 
-   [Lwt_preemptive] is the opposite case. Its pool of system threads is a process
-   resource and stays shared, but a detached result comes back through the
-   notification pipe, so detaching belongs to the domain that owns the pipe.
+   [Lwt_preemptive] turned out to be the same case, for a reason that has nothing
+   to do with promises: a domain does not terminate while any of its threads is
+   still running, so a shared pool would pin a spawned domain alive after its work
+   was done. Each loop therefore has its own pool, and its workers end with it.
 
    Needs a second domain, hence OCaml 5. *)
 
@@ -18,9 +19,6 @@ let failures = ref 0
 
 let check name b =
   if not b then (Printf.eprintf "FAILED: %s\n" name; incr failures)
-
-let refused_with_failure f =
-  match f () with _ -> false | exception Failure _ -> true | exception _ -> false
 
 let refused_with_invalid_arg f =
   match f () with
@@ -70,17 +68,50 @@ let () =
        (Domain.spawn (fun () ->
           refused_with_invalid_arg (fun () -> Lwt_timeout.change ours 2))));
 
-  (* Detaching belongs to the domain that owns the notification pipe. *)
-  check "detaching from another domain is refused"
+  (* Detaching works from any domain now: the result comes back through the
+     detaching loop's own notification channel. *)
+  check "another domain detaches blocking work"
     (Domain.join
        (Domain.spawn (fun () ->
-          refused_with_failure (fun () ->
-            Lwt_main.run (Lwt_preemptive.detach (fun () -> 1) ())))));
-  check "the owner still detaches"
-    (match Lwt_main.run (Lwt_preemptive.detach (fun x -> x * 2) 21) with
-     | 42 -> true
+          match Lwt_main.run (Lwt_preemptive.detach (fun x -> x * 2) 21) with
+          | 42 -> true
+          | _ -> false
+          | exception _ -> false)));
+  check "and so do we"
+    (match Lwt_main.run (Lwt_preemptive.detach String.length "hello") with
+     | 5 -> true
      | _ -> false
      | exception _ -> false);
 
+  (* Several loops detaching at once, each with more work than the bounds allow,
+     so the per-loop queue of waiting clients is exercised too. *)
+  check "two domains detach at once, past their bounds"
+    (let work () =
+       Domain.spawn (fun () ->
+         match
+           Lwt_main.run
+             (Lwt_list.map_p (Lwt_preemptive.detach String.length)
+                [ "a"; "bb"; "ccc"; "dddd"; "eeeee"; "ffffff" ])
+         with
+         | l -> l = [ 1; 2; 3; 4; 5; 6 ]
+         | exception _ -> false)
+     in
+     let a = work () and b = work () in
+     Domain.join a && Domain.join b);
+
+  (* An exit hook that detaches, which lands AFTER the pool has been shut down.
+     It must still work: the worker it creates leaves after its one task and is
+     joined by detach itself, so nothing hangs and nothing is left running. *)
+  check "an exit hook may still detach"
+    (let got = Atomic.make 0 in
+     Domain.join
+       (Domain.spawn (fun () ->
+          Lwt_main.at_exit (fun () ->
+            Lwt.bind (Lwt_preemptive.detach (fun x -> x * 3) 14) (fun v ->
+              Atomic.set got v;
+              Lwt.return_unit));
+          ignore (Lwt_main.run (Lwt_preemptive.detach (fun x -> x) 1))));
+     Atomic.get got = 42);
+
   if !failures > 0 then exit 1;
-  print_endline "per-domain timeouts, shared thread pool: ok"
+  print_endline "per-domain timeouts and thread pools: ok"
