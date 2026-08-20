@@ -21,7 +21,19 @@
    domain_io_affinity
    domain_two_loops
    domain_upstream_scenarios
-   domain_notifications)))
+   domain_notifications
+   domain_signals)))
+
+; A signal reaches every loop that subscribed to it, each on its own channel.
+; Needs a second domain, hence OCaml 5.
+
+(test
+ (name domain_signals)
+ (package lwt)
+ (modules domain_signals)
+ (build_if
+  (>= %{ocaml_version} "5.0"))
+ (libraries lwt.unix))
 
 ; Every loop has its own notification channel, and an id carries the channel it
 ; belongs to. Needs a second domain, hence OCaml 5.
