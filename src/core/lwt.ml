@@ -1500,5 +1500,15 @@ module Private = struct
   let scheduler_set_idle = set_idle
   let scheduler_queue_is_empty () = Run_queue.is_empty (self_sched ()).queue
   let scheduler_enqueue = enqueue
+
+  (* Which domain owns a PENDING promise, for the one layer that needs to ask:
+     adopting a foreign promise means getting its owner to attach the callback,
+     since attaching it ourselves is exactly what the ownership check forbids. A
+     READ, so unchecked, like [state]; [dom] is immutable and the promise reached
+     us by being passed, which is what publishes it. *)
+  let promise_owner_domain (type a) (p : a t) : int option =
+    match (prj p).st with
+    | Pending pe -> Some (pe.owner.dom :> int)
+    | Fulfilled _ | Rejected _ -> None
 end
 
