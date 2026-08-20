@@ -105,3 +105,35 @@ jobs:
 
       - run: opam exec -- dune runtest --only-packages lwt,lwt_runtime_events
         if: ${{ fromJSON(steps.configpackages.outputs.runtime_events) }}
+
+  # The js_of_ocaml smoke test.  It is a separate job because js_of_ocaml is not a
+  # dependency of lwt and must not become one: the test cannot be a dune rule in
+  # the tree, so it is a script that runs in a switch that has the backend.
+  #
+  # What it protects is stated in test/jsoo/smoke.sh: the per-domain shim keys on
+  # the COMPILER version through cppo, not on the backend, so it takes the
+  # Domain.DLS branch under js_of_ocaml, and that is only correct because
+  # js_of_ocaml implements the primitive.  Nothing else in the suite would notice
+  # if a backend stopped doing so.
+  js_of_ocaml:
+    runs-on: ubuntu-latest
+
+    name: js_of_ocaml / 5.4
+
+    steps:
+
+      - name: Checkout tree
+        uses: actions/checkout@v6
+
+      - name: Set-up OCaml
+        uses: ocaml/setup-ocaml@v3
+        with:
+          ocaml-compiler: "5.4"
+
+      - run: opam install ./lwt.opam --deps-only
+
+      - run: opam install js_of_ocaml js_of_ocaml-compiler
+
+      - run: node --version
+
+      - run: opam exec -- sh test/jsoo/smoke.sh

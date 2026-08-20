@@ -6,13 +6,13 @@
    degrades to nothing.
 
    It runs as an ordinary test everywhere. To run it as the jsoo smoke test, in a
-   switch that has js_of_ocaml and with node available:
+   switch that has js_of_ocaml and with node on the PATH:
 
-     dune build src/core/lwt.cma
-     ocamlc -I _build/default/src/core/.lwt.objs/byte \
-       _build/default/src/core/lwt.cma \
-       test/core/test_browser_invariants.ml -o smoke.bc
-     js_of_ocaml smoke.bc -o smoke.js && node smoke.js
+     sh test/jsoo/smoke.sh
+
+   That script is what CI runs (job "js_of_ocaml / 5.4"), so the two cannot drift
+   apart. It is a script rather than a dune rule because js_of_ocaml is not a
+   dependency of lwt and must not become one.
 
    Why this matters here rather than at verification time: the shim [Lwt_dls]
    keys on the COMPILER version through cppo, not on the backend. Under jsoo the
