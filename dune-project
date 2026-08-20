@@ -84,6 +84,19 @@
   (uring (>= 2.7))))
 
 (package
+ (name lwt_multicore)
+ (version 6.0.0)
+ (synopsis "Communication primitives between Lwt loops on several domains")
+ ; A SEPARATE package, and for a precise reason: its Saturn dependency must stay
+ ; out of the `lwt` package, so that the core keeps its OCaml 4.14 floor and its
+ ; js_of_ocaml support untouched. OCaml 5 only, which multicore is anyway.
+ (depends
+  (ocaml (>= 5.0))
+  base-unix
+  (lwt (>= 6))
+  (saturn (>= 1.0))))
+
+(package
  (name lwt_runtime_events)
  (version 6.0.0)
  (synopsis "Emit runtime events to trace the execution of Lwt programs")

@@ -1,0 +1,10 @@
+; Two loops on two domains exchanging work through Lwt_multicore. OCaml 5 only,
+; like the library itself.
+
+(test
+ (name run_on)
+ (package lwt_multicore)
+ (modules run_on)
+ (build_if
+  (>= %{ocaml_version} "5.0"))
+ (libraries lwt.unix lwt_multicore))
