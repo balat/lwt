@@ -45,6 +45,13 @@ let () =
       Lwt.map (fun () -> ()) pending);
     must_raise "wakeup of a foreign pending promise" (fun () ->
       Lwt.wakeup resolver ());
+    must_raise "wakeup_later of a foreign pending promise" (fun () ->
+      Lwt.wakeup_later resolver ());
+    must_raise "try_bind on a foreign pending promise" (fun () ->
+      Lwt.try_bind
+        (fun () -> pending)
+        (fun () -> Lwt.return_unit)
+        (fun _ -> Lwt.return_unit));
     must_raise "on_success on a foreign pending promise" (fun () ->
       Lwt.on_success pending (fun () -> ()));
     must_raise "on_cancel on a foreign pending promise" (fun () ->
