@@ -13,16 +13,17 @@ module Lwt_sequence = Lwt_sequence
 open Lwt.Infix
 
 (* +-----------------------------------------------------------------+
-   | The domain that owns the notification file descriptor            |
+   | This domain's notification channel                              |
    +-----------------------------------------------------------------+ *)
 
-(* Jobs, signal handlers and child waiting all reach Lwt through ONE
-   process-wide resource: the notification file descriptor. The C side keeps a
-   single [notification_fd] and [lwt_unix_init_notification] is destructive, so
-   a second one cannot be created without closing the first; and the event that
-   reads it is registered, once, on the engine of the domain that initialises
-   this module. Completions therefore always run on THAT domain, whichever
-   domain submitted the work.
+(* Jobs, signal handlers and child waiting reach Lwt through a notification
+   channel. There is now ONE PER LOOP: the C side keeps a table of channels and a
+   notification id carries the index of the one it belongs to, so a completion
+   wakes the loop that asked for the work.
+
+   What has not caught up yet, and is the current phase's subject: the JOBS
+   themselves, the signal handlers and child waiting are still wired to the
+   domain that initialised this module, so they keep the owner check below.
 
    So this module has an owner, and it is the domain that initialised it. On
    another domain, submitting a job would have the completion wake a promise the
@@ -42,6 +43,53 @@ open Lwt.Infix
    which is every existing program, it reads [true] and nothing changes. *)
 [@@@alert "-lwt_internal"]
 
+external new_notification_channel : unit -> Unix.file_descr * int
+  = "lwt_unix_new_notification_channel"
+
+external free_notification_channel : int -> unit
+  = "lwt_unix_free_notification_channel"
+
+external send_notification : int -> unit = "lwt_unix_send_notification_stub"
+
+external recv_notifications : int -> int array = "lwt_unix_recv_notifications"
+
+external encode_notification : int -> int -> int = "lwt_unix_encode_notification"
+
+(* Forward cell: draining needs [call_notification], which needs the notifier
+   table, which is defined below. Set once, at the end of that section. *)
+let drain_notifications : (int -> unit) ref = ref (fun _ -> ())
+
+(* PER DOMAIN: the channel this loop is woken through, and the engine event that
+   watches it. Created on first use, so a domain that never touches Lwt_unix
+   never opens a descriptor.
+
+   The channel's index is what the C side needs, and the notification ids this
+   domain hands out carry it, which is what lets a pool thread or a signal
+   handler wake the right loop without asking anything about domains. *)
+type notif = { chan : int; event : Lwt_engine.event }
+
+let notif_slot : notif Lwt_dls.t =
+  Lwt_dls.new_key (fun () ->
+    let fd, chan = new_notification_channel () in
+    let event = Lwt_engine.on_readable fd (fun _ -> !drain_notifications chan) in
+    (* Retire the channel with the domain. The event must be stopped first: the
+       engine must not be left watching a closed descriptor.
+
+       ORDER, and a debt to settle at step 2: [Domain.at_exit] is LIFO, so this
+       runs BEFORE [Lwt_main]'s exit-hook drain, which is registered later on a
+       domain that runs a loop. Harmless while jobs still belong to the loading
+       domain, since a spawned domain's exit hooks cannot need one; once step 2
+       gives every domain its jobs, an exit hook could, and the order has to be
+       fixed then, together with the count of jobs in flight that step 7 needs
+       anyway. *)
+    Lwt_dls.at_domain_exit (fun () ->
+      Lwt_engine.stop_event event;
+      free_notification_channel chan);
+    { chan; event })
+
+let[@inline] self_channel () = (Lwt_dls.get notif_slot).chan
+
+(* Set up lazily, per domain, by the slot above. *)
 let is_owner_slot : bool Lwt_dls.t = Lwt_dls.new_key (fun () -> false)
 let () = Lwt_dls.set is_owner_slot true
 
@@ -144,16 +192,19 @@ type notification = int (* a simple ID*)
    https://github.com/ocsigen/lwt/pull/278. *)
 let current_notification_id = ref (0x7FFFFFFF - 1000)
 
-let rec find_free_id id =
-  if Notifiers.mem notifiers id then
-    find_free_id (id + 1)
-  else
-    id
-
+(* The id carries the CALLING domain's channel, so the handler runs on the domain
+   that created the notification, whichever domain sends it. The local counter
+   stays process-wide and under the same lock; the C side masks it to whatever
+   room the word has left, and the table below is what settles collisions. *)
 let make_notification ?(once=false) f =
+  let chan = self_channel () in
   with_notifiers (fun () ->
-    let id = find_free_id (!current_notification_id + 1) in
-    current_notification_id := id;
+    let rec find local =
+      let id = encode_notification chan local in
+      if Notifiers.mem notifiers id then find (local + 1) else (id, local)
+    in
+    let id, local = find (!current_notification_id + 1) in
+    current_notification_id := local;
     Notifiers.add notifiers id { notify_once = once; notify_handler = f };
     id)
 
@@ -2416,15 +2467,11 @@ let tcflow ch act =
    | Reading notifications                                           |
    +-----------------------------------------------------------------+ *)
 
-external init_notification : unit -> Unix.file_descr = "lwt_unix_init_notification"
-external send_notification : int -> unit = "lwt_unix_send_notification_stub"
-external recv_notifications : unit -> int array = "lwt_unix_recv_notifications"
-
-let handle_notifications _ =
-  (* Process available notifications. *)
-  Array.iter call_notification (recv_notifications ())
-
-let event_notifications = ref (Lwt_engine.on_readable (init_notification ()) handle_notifications)
+(* Closes the forward cell opened at the top: from here on, a channel's event
+   drains that channel. *)
+let () =
+  drain_notifications :=
+    fun chan -> Array.iter call_notification (recv_notifications chan)
 
 (* +-----------------------------------------------------------------+
    | Signals                                                         |
@@ -2528,10 +2575,21 @@ let fork () =
     Lwt_engine.fork ();
     (* Reset threading. *)
     reset_after_fork ();
-    (* Stop the old event for notifications. *)
-    Lwt_engine.stop_event !event_notifications;
-    (* Reinitialise the notification system. *)
-    event_notifications := Lwt_engine.on_readable (init_notification ()) handle_notifications;
+    (* Replace this domain's notification channel: the inherited descriptors are
+       the parent's, and its buffer may hold ids the parent will service. The
+       old channel is retired first, which closes those descriptors.
+
+       Only THIS domain's channel is dealt with, which is enough: [fork] is
+       refused off the loading domain, and the runtime does not support forking
+       with several domains running, so there is one channel to replace. *)
+    let old = Lwt_dls.get notif_slot in
+    Lwt_engine.stop_event old.event;
+    free_notification_channel old.chan;
+    let fd, chan = new_notification_channel () in
+    let event =
+      Lwt_engine.on_readable fd (fun _ -> !drain_notifications chan)
+    in
+    Lwt_dls.set notif_slot { chan; event };
     (* Collect all pending jobs. *)
     let l = Lwt_sequence.fold_l (fun (_, f) l -> f :: l) jobs [] in
     (* Remove them all. *)

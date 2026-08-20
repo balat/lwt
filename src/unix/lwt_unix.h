@@ -94,7 +94,13 @@ void lwt_unix_not_available(char const *feature) Noreturn;
    | Notifications                                                   |
    +-----------------------------------------------------------------+ */
 
-/* Sends a notification for the given id. */
+/* Sends a notification for the given id.
+
+   The id names the Lwt loop to wake: every loop has its own notification
+   channel, and the channel's identity is encoded in the id. That is why this
+   still takes nothing but an integer, and why it remains callable from a pool
+   thread with no runtime lock and from a signal handler, neither of which could
+   ask which domain it is running on. An id whose loop is gone is dropped. */
 void lwt_unix_send_notification(intnat id);
 
 /* +-----------------------------------------------------------------+
