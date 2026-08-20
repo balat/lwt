@@ -2126,5 +2126,14 @@ module Private : sig
       storage current at the call). Used by direct-style layers
       ([Lwt_direct]) to schedule their continuations without an
       intermediate task queue. *)
+
+  val promise_owner_domain : 'a t -> int option
+  (** The identifier of the domain that owns [p], or [None] if [p] is already
+      resolved and therefore owned by nobody.
+
+      For [Lwt_multicore.adopt], which needs it for a precise reason: following a
+      foreign promise means asking its OWNER to attach the callback, attaching one
+      ourselves being exactly what {!Foreign_promise} forbids. A read, so it is
+      allowed from any domain, like {!state}. *)
 end [@@alert trespassing "for internal use only, keep away"]
 
