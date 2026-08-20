@@ -222,3 +222,50 @@ module Condition : sig
   val broadcast : 'a t -> 'a -> unit
   (** Wakes every waiting loop, each on its own domain. *)
 end
+
+module Stream : sig
+  (** A bounded channel between loops: many producers, many consumers, with
+      back-pressure. This is what to reach for to send WORK and DATA to another
+      domain, and it is deliberately not a domain-safe {!Lwt_stream}: a lazy,
+      clonable stream is not the right thing across a boundary, a channel is. *)
+
+  exception Closed
+  (** Raised by {!push} on a closed stream, and used to reject producers that
+      were waiting for room when the stream was closed. *)
+
+  type 'a t
+
+  val create : capacity:int -> 'a t
+  (** [create ~capacity] is an empty stream holding at most [capacity] items
+      before producers have to wait. [capacity] must be at least 1: an unbounded
+      channel is a memory leak waiting to happen, so this module does not offer
+      one. *)
+
+  val push : 'a t -> 'a -> unit Lwt.t
+  (** Adds an item, waiting while the stream is full. That wait is the
+      back-pressure, and it is the point of the bound.
+
+      Cancelling the wait is harmless: a producer that is waiting has handed over
+      nothing, so nothing can be lost by giving up.
+
+      @raise Closed if the stream is closed, as a rejected promise. *)
+
+  val take : 'a t -> 'a option Lwt.t
+  (** Takes the next item, waiting if there is none. [None] means the stream is
+      closed AND drained, so a consumer learns the end rather than waiting for
+      it.
+
+      Cancelling is safe: if an item had already been handed to this consumer, it
+      goes back to the front of the stream rather than being lost. *)
+
+  val close : 'a t -> unit
+  (** Closes the stream. Waiting consumers get [None], waiting producers are
+      rejected with {!Closed}, and items already in the stream are still there to
+      be taken. Idempotent. *)
+
+  val length : 'a t -> int
+  (** How many items are waiting. A snapshot. *)
+
+  val is_closed : 'a t -> bool
+  (** A snapshot. *)
+end
