@@ -111,6 +111,33 @@ type 'a waiter = {
   w_resolver : 'a Lwt.u;
 }
 
+(* Built OUTSIDE any critical section, always: a promise is an allocation and an
+   Lwt operation, and the rule for the locks in this module is that a critical
+   section holds neither. *)
+let new_waiter () =
+  let promise, resolver = Lwt.task () in
+  { w_loop = self (); w_promise = promise; w_resolver = resolver }
+
+(* [w]'s promise belongs to [w]'s domain, so this has to happen there. Returns
+   whether it actually resolved it: a waiter whose promise was cancelled
+   meanwhile is a case the callers below must handle, since a resource may have
+   been handed to it. *)
+let wake_now w v =
+  if Lwt.is_sleeping w.w_promise then (Lwt.wakeup w.w_resolver v; true)
+  else false
+
+(* Resolves [w] on its own loop, wherever that is. [on_dead] is for the caller to
+   undo whatever it handed over, and runs on the waiter's loop too. *)
+let wake w v ~on_dead =
+  let here = self () in
+  if w.w_loop == here then (if not (wake_now w v) then on_dead ())
+  else
+    match
+      run_on w.w_loop (fun () -> if not (wake_now w v) then on_dead ())
+    with
+    | () -> ()
+    | exception Loop_terminated -> on_dead ()
+
 type 'a t = {
   mutex : Mutex.t;
   mutable state : 'a state;
@@ -244,3 +271,196 @@ let adopt (p : 'a Lwt.t) : 'a Lwt.t =
          | exception Loop_terminated -> raise Cannot_adopt);
         await shared
     end
+
+(* +-----------------------------------------------------------------+
+   | Mutual exclusion, conditions, counting                          |
+   +-----------------------------------------------------------------+ *)
+
+(* The three below share one shape and one protocol, worth stating once.
+
+   Each keeps its state under an ORDINARY mutex, whose critical sections are a
+   test and an assignment: no Lwt operation, no system call, no allocation. The
+   waiters queue holds promises of other loops, which are DATA here and resolved
+   only on their own domain.
+
+   The protocol that needs care is HANDING THE RESOURCE OVER. Serving a waiter
+   means choosing it under the lock and waking it outside, and in between its
+   promise may be cancelled by its own domain. Then the resource has been handed
+   to nobody, so the waking function hands it BACK, on the waiter's loop, by
+   calling the release path again. Every round consumes one waiter, so this
+   terminates. That is what the [~on_dead] argument of [wake] is for, and it is
+   the only subtle thing in these hundred lines. *)
+
+(* A first-in, first-out queue of waiters, kept as a list pair. Short by nature:
+   these are domain boundaries, not hot paths. *)
+type 'a queue = { mutable front : 'a waiter list; mutable back : 'a waiter list }
+
+let queue_create () = { front = []; back = [] }
+let queue_push q w = q.back <- w :: q.back
+
+let rec queue_pop q =
+  match q.front with
+  | w :: rest -> q.front <- rest; Some w
+  | [] -> (
+    match q.back with
+    | [] -> None
+    | back -> q.front <- List.rev back; q.back <- []; queue_pop q)
+
+(* Drops a waiter that has been withdrawn. O(n), on a queue that is short. *)
+let queue_remove q w =
+  q.front <- List.filter (fun w' -> w' != w) q.front;
+  q.back <- List.filter (fun w' -> w' != w) q.back
+
+module Mutex = struct
+  type t = {
+    guard : Stdlib.Mutex.t;
+    mutable held : bool;
+    waiters : unit queue;
+  }
+
+  let create () =
+    { guard = Stdlib.Mutex.create (); held = false; waiters = queue_create () }
+
+  let is_locked t =
+    Stdlib.Mutex.lock t.guard;
+    let held = t.held in
+    Stdlib.Mutex.unlock t.guard;
+    held
+
+  (* Hands the lock to the next live waiter, or releases it. Also the path taken
+     when a served waiter turns out to have been cancelled. *)
+  let rec hand_over t =
+    Stdlib.Mutex.lock t.guard;
+    match queue_pop t.waiters with
+    | None ->
+      t.held <- false;
+      Stdlib.Mutex.unlock t.guard
+    | Some w ->
+      (* The lock stays held: it passes to [w] without becoming free, which is
+         what keeps a third party from jumping the queue. *)
+      Stdlib.Mutex.unlock t.guard;
+      wake w () ~on_dead:(fun () -> hand_over t)
+
+  let unlock t =
+    Stdlib.Mutex.lock t.guard;
+    if not t.held then (Stdlib.Mutex.unlock t.guard)
+    else begin
+      Stdlib.Mutex.unlock t.guard;
+      hand_over t
+    end
+
+  let lock t =
+    let w = new_waiter () in
+    Stdlib.Mutex.lock t.guard;
+    let taken =
+      if t.held then (queue_push t.waiters w; false)
+      else (t.held <- true; true)
+    in
+    Stdlib.Mutex.unlock t.guard;
+    if taken then Lwt.return_unit
+    else begin
+      Lwt.on_cancel w.w_promise (fun () ->
+        Stdlib.Mutex.lock t.guard;
+        queue_remove t.waiters w;
+        Stdlib.Mutex.unlock t.guard);
+      w.w_promise
+    end
+
+  let with_lock t f =
+    Lwt.bind (lock t) (fun () ->
+      Lwt.finalize f (fun () -> unlock t; Lwt.return_unit))
+end
+
+module Semaphore = struct
+  type t = {
+    guard : Stdlib.Mutex.t;
+    mutable count : int;
+    waiters : unit queue;
+  }
+
+  let create count =
+    if count < 0 then invalid_arg "Lwt_multicore.Semaphore.create";
+    { guard = Stdlib.Mutex.create (); count; waiters = queue_create () }
+
+  let available t =
+    Stdlib.Mutex.lock t.guard;
+    let count = t.count in
+    Stdlib.Mutex.unlock t.guard;
+    count
+
+  (* Gives the unit to the next live waiter, or puts it back in the count. *)
+  let rec release t =
+    Stdlib.Mutex.lock t.guard;
+    match queue_pop t.waiters with
+    | None ->
+      t.count <- t.count + 1;
+      Stdlib.Mutex.unlock t.guard
+    | Some w ->
+      Stdlib.Mutex.unlock t.guard;
+      wake w () ~on_dead:(fun () -> release t)
+
+  let acquire t =
+    let w = new_waiter () in
+    Stdlib.Mutex.lock t.guard;
+    let taken =
+      if t.count > 0 then (t.count <- t.count - 1; true)
+      else (queue_push t.waiters w; false)
+    in
+    Stdlib.Mutex.unlock t.guard;
+    if taken then Lwt.return_unit
+    else begin
+      Lwt.on_cancel w.w_promise (fun () ->
+        Stdlib.Mutex.lock t.guard;
+        queue_remove t.waiters w;
+        Stdlib.Mutex.unlock t.guard);
+      w.w_promise
+    end
+
+  let with_resource t f =
+    Lwt.bind (acquire t) (fun () ->
+      Lwt.finalize f (fun () -> release t; Lwt.return_unit))
+end
+
+module Condition = struct
+  type 'a t = { guard : Stdlib.Mutex.t; waiters : 'a queue }
+
+  let create () = { guard = Stdlib.Mutex.create (); waiters = queue_create () }
+
+  (* Nothing is handed over by a signal, so a cancelled waiter is simply not
+     there any more and the value is dropped, exactly as [Lwt_condition] does
+     when nobody is waiting. *)
+  let rec signal t v =
+    Stdlib.Mutex.lock t.guard;
+    let w = queue_pop t.waiters in
+    Stdlib.Mutex.unlock t.guard;
+    match w with
+    | None -> ()
+    | Some w -> wake w v ~on_dead:(fun () -> signal t v)
+
+  let broadcast t v =
+    Stdlib.Mutex.lock t.guard;
+    let rec drain acc =
+      match queue_pop t.waiters with
+      | Some w -> drain (w :: acc)
+      | None -> acc
+    in
+    let waiters = drain [] in
+    Stdlib.Mutex.unlock t.guard;
+    List.iter (fun w -> wake w v ~on_dead:(fun () -> ())) waiters
+
+  let wait ?mutex t =
+    let w = new_waiter () in
+    Stdlib.Mutex.lock t.guard;
+    queue_push t.waiters w;
+    Stdlib.Mutex.unlock t.guard;
+    Lwt.on_cancel w.w_promise (fun () ->
+      Stdlib.Mutex.lock t.guard;
+      queue_remove t.waiters w;
+      Stdlib.Mutex.unlock t.guard);
+    (* Same discipline as [Lwt_condition.wait]: release the mutex while waiting
+       and take it again afterwards, so that a signaller can get in. *)
+    (match mutex with Some m -> Mutex.unlock m | None -> ());
+    Lwt.finalize
+      (fun () -> w.w_promise)
+      (fun () -> match mutex with Some m -> Mutex.lock m | None -> Lwt.return_unit)
+end
