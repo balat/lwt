@@ -1,0 +1,14 @@
+; This example cannot be built inside the Lwt tree: it needs cohttp-lwt-unix, which
+; links the INSTALLED lwt, and dune refuses to have two libraries named lwt in one
+; build (the one built here from src/core, and the installed one). So it ships with
+; its own dune-project and is built OUTSIDE the tree, in a switch where this branch's
+; lwt and cohttp-lwt-unix are both installed:
+;
+;   cp -r examples/multicore_cohttp /tmp/mc && cd /tmp/mc && dune build ./server.exe
+;
+; examples/ is data_only_dirs in the root dune file, so nothing here is built by CI
+; either way.
+
+(executable
+ (name server)
+ (libraries cohttp-lwt-unix lwt.unix))
