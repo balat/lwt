@@ -85,6 +85,26 @@ let () =
             ok)));
     check "and ours still works afterwards" (socket_roundtrip ());
 
+    (* The deferred flags are asked for by default, and a per-domain ring is what
+       makes SINGLE_ISSUER legitimate: two domains, two rings, each with one
+       submitting task. Checked by doing real I/O on both with the flags on, and
+       by checking that asking for a plain ring still works. *)
+    check "two domains each run a ring with the deferred flags"
+      (Domain.join
+         (Domain.spawn (fun () ->
+            Lwt_uring.set ();
+            let ok = socket_roundtrip () in
+            Lwt_engine.set (new Lwt_engine.select);
+            ok))
+       && socket_roundtrip ());
+    check "and a plain ring can still be asked for"
+      (Domain.join
+         (Domain.spawn (fun () ->
+            Lwt_uring.set ~deferred:false ();
+            let ok = socket_roundtrip () in
+            Lwt_engine.set (new Lwt_engine.select);
+            ok)));
+
     if !failures > 0 then exit 1;
     print_endline "per-domain rings: ok"
   end

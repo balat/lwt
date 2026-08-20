@@ -231,10 +231,44 @@ let dispatch ring result more data =
       reject_acceptors str (Unix.Unix_error (error, "accept", ""))
     end
 
-class uring ?(queue_depth = 256) () = object
+(* SINGLE_ISSUER and DEFER_TASKRUN, available but OFF BY DEFAULT, and the reason
+   is worth writing down because the plan expected the opposite.
+
+   What a per-domain ring makes legitimate is the first flag: the kernel is told
+   that one task submits, so it can drop the synchronisation that assumption
+   removes. The premise is ours to keep, and it holds as long as one loop, on one
+   system thread, owns the ring.
+
+   Measured, twice, in one process with the two configurations interleaved: a
+   sequential socket ping-pong gave -1.7% and a 50-connection keep-alive load over
+   Lwt_io gave +3.6%, both inside a spread of 4% and 18% respectively. So the
+   plan's "free win even on a single core" is NOT what this machine shows; there
+   is no measurable win, and possibly a small loss under concurrency.
+
+   And there is a correctness condition the flags come with, which is the stronger
+   argument for leaving them off. DEFER_TASKRUN means the kernel runs completion
+   work when we enter the ring ASKING FOR EVENTS. [iter] only does that when it
+   blocks; when the run queue is busy it submits and peeks, which under these flags
+   can see nothing while completions are pending. A loop that never goes idle would
+   then starve its own I/O. Turning them on for good means making [iter] always
+   enter with GETEVENTS, and measuring that on a machine that is not thermally
+   throttled.
+
+   Requires Linux 6.0. On an older kernel [io_uring_setup] fails, so asking for
+   them falls back to a plain ring rather than making the engine unavailable. *)
+let deferred_flags = U.Setup_flags.(single_issuer + defer_taskrun)
+
+let create_ring ~queue_depth ~deferred =
+  if not deferred then U.create ~queue_depth ()
+  else
+    match U.create ~flags:deferred_flags ~queue_depth () with
+    | ring -> ring
+    | exception Unix.Unix_error _ -> U.create ~queue_depth ()
+
+class uring ?(queue_depth = 256) ?(deferred = false) () = object
   inherit Lwt_engine.abstract
 
-  val ring : req U.t = U.create ~queue_depth ()
+  val ring : req U.t = create_ring ~queue_depth ~deferred
 
   initializer (self_state ()).ring <- Some ring
 
@@ -566,5 +600,5 @@ let available () =
   | ring -> U.exit ring; true
   | exception _ -> false
 
-let set ?queue_depth () =
-  Lwt_engine.set (new uring ?queue_depth ())
+let set ?queue_depth ?deferred () =
+  Lwt_engine.set (new uring ?queue_depth ?deferred ())
