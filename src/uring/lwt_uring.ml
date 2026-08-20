@@ -244,6 +244,24 @@ class uring ?(queue_depth = 256) () = object
     let st = self_state () in
     (match st.ring with Some r when r == ring -> st.ring <- None | _ -> ());
     teardown_accept_streams st;
+    (* Reap what is still in flight before exiting. Cancelling in io_uring is
+       itself an operation: [Lwt_engine.abstract]'s [destroy] and [transfer] stop
+       every event, each stop SUBMITS a cancel, and both the cancel and the
+       request it cancels stay in flight until they are reaped. [U.exit] refuses a
+       ring with requests still active, so without this a uring engine could not
+       be destroyed once it had ever watched a descriptor. Nothing re-arms here:
+       the events are already stopped and the accept streams disarmed. Bounded, so
+       that a request that never completes cannot hang the teardown. *)
+    let rec drain n =
+      if n > 0 && U.active_ops ring > 0 then begin
+        ignore (U.submit ring);
+        (match U.wait ring with
+         | U.Some { result; data; more } -> dispatch ring result more data
+         | U.None -> ());
+        drain (n - 1)
+      end
+    in
+    drain 4096;
     U.exit ring
 
   method private register_readable fd f =
