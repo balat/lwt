@@ -24,11 +24,24 @@ let callback _conn _req _body =
   incr served;
   Cohttp_lwt_unix.Server.respond_string ~status:`OK ~body:"hello\n" ()
 
+(* Forced ONCE, on the main domain, before any other domain exists, and passed to
+   every loop afterwards. This is the second thing to know about running an existing
+   library on N loops, and it is a general rule rather than a cohttp detail: a
+   process-wide [lazy] forced by two domains at the same moment raises
+   [CamlinternalLazy.Undefined] in one of them.
+
+   Cohttp's default context is exactly that, three lazies deep: Net.default_ctx
+   forces Conduit_lwt_unix.default_ctx, which forces the TLS authenticator, which
+   reads the system certificate store. Leave it to the default argument of
+   [Server.create] and each domain races to force it on its first call. The failure
+   is a startup crash that appears roughly one run in ten, which is the worst kind. *)
+let shared_ctx = Lazy.force Cohttp_lwt_unix.Net.default_ctx
+
 let serve port =
   Lwt_main.run
     (let* fd = listener port in
      let mode = `TCP (`Socket fd) in
-     Cohttp_lwt_unix.Server.create ~mode
+     Cohttp_lwt_unix.Server.create ~ctx:shared_ctx ~mode
        (Cohttp_lwt_unix.Server.make ~callback ()))
 
 let () =

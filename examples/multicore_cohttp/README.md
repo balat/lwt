@@ -57,6 +57,38 @@ needs more than this (a condition per loop, and `active` should be an `Atomic.t`
 rather than a `ref` that several domains increment), which is a conduit design
 question rather than a patch.
 
+## And a second thing, rarer and nastier: shared lazies
+
+Once, on four loops, the server died at startup with
+
+```
+Fatal error: exception CamlinternalLazy.Undefined
+```
+
+reported by two domains at the same instant. `Cohttp_lwt_unix.Server.create` takes
+`?ctx`, whose default argument is `Lazy.force Net.default_ctx`, and that lazy forces
+`Conduit_lwt_unix.default_ctx`, which forces the TLS authenticator, which reads the
+system certificate store. Three process-wide lazies, forced by whichever domain calls
+`Server.create` first, and OCaml documents forcing one lazy from several domains at
+once as unsafe: the loser gets `Undefined`.
+
+It did not reproduce in the forty-odd startups that followed (six loops, twelve
+loops, both), which makes it worse rather than better: a startup crash that appears
+once in dozens of runs is exactly what reaches production.
+
+The application can remove the whole class without touching the library, by forcing
+the value once before any other domain exists, which is what `server.ml` does:
+
+```ocaml
+let shared_ctx = Lazy.force Cohttp_lwt_unix.Net.default_ctx
+...
+Cohttp_lwt_unix.Server.create ~ctx:shared_ctx ~mode ...
+```
+
+**The general rule, worth more than this instance: force the shared lazies of your
+libraries on the main domain, before spawning.** A `lazy` at module level is a
+process-wide resource pretending to be a local convenience.
+
 ## Measured here, on one machine
 
 Six physical cores, the load generator sharing them with the server, so these
