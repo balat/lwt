@@ -37,7 +37,23 @@ let await (fut : 'a Lwt.t) : 'a =
   match Lwt.state fut with
   | Lwt.Return x -> x
   | Lwt.Fail exn -> raise exn
-  | Lwt.Sleep -> Effect.perform (Await fut)
+  | Lwt.Sleep -> (
+    match Effect.perform (Await fut) with
+    | v -> v
+    | exception Effect.Unhandled (Await _) ->
+      (* No handler on this stack. Either no Lwt loop is running on this
+         domain (a direct-style program awaiting at top level, where running
+         the loop until [fut] settles is exactly what is meant), or a C frame
+         stands between us and the loop's handler: an effect cannot be
+         performed across a C call, and the libev engine invokes its watcher
+         callbacks through [caml_callback]. In the latter case [Lwt_main.run]
+         refuses to nest, and we turn its message into ours. *)
+      (try Lwt_main.run fut with
+       | Failure msg when String.length msg >= 6 && String.sub msg 0 6 = "Nested" ->
+         failwith
+           "Lwt_direct.await: no effect handler on the current stack while \
+            Lwt_main.run is running on this domain; an await cannot be \
+            performed from a callback invoked by C code (libev engine?)"))
 
 let yield () : unit = Effect.perform Yield
 
@@ -112,3 +128,57 @@ let run_inside_effect_handler_in_the_background_ f () : unit =
 
 let spawn_in_the_background f : unit =
   push_task (run_inside_effect_handler_in_the_background_ f)
+
+[@@@alert "-trespassing"]
+(* part 5: await anywhere, by running the scheduler loop under the handler *)
+
+(* The scheduler loop itself runs under the effect handler, so an [await] (or a
+   [yield]) performed by ANY code the loop runs (a bind continuation, an
+   [on_success] callback, a completion handler of the engine) is handled, not
+   only inside [spawn]. The continuation captured then holds the rest of the
+   loop pass too, which is why that pass must be retired: [drive] tells the core
+   the fiber is no longer the drainer ([scheduler_retire_drainer]) and starts a
+   new pass on a fresh fiber. When the suspended fiber is resumed (as a task of
+   the new drainer) it finishes its callback, and the loop pass inside it, seeing
+   it was retired, returns, back into the resumer's task. So exactly one pass
+   drains the queue at any time, and a resumed one sits on top of it only for
+   the duration of its own callback. The recursion in [drive] is outside the
+   handler and in tail position: the stack does not grow with the number of
+   suspensions.
+
+   [spawn] keeps its own, nearer handler: an [await] inside a spawned task
+   suspends that task alone, as before, and never reaches this one.
+
+   What the continuation freezes along with the callback is whatever else was
+   on the stack between the loop and the [await]: the remaining waiters of the
+   same resolution cascade, and the resolver's own code after its [wakeup]. See
+   the .mli for the rule of thumb this gives. *)
+let rec drive (loop : unit -> unit) : unit =
+  let gen = Lwt.Private.scheduler_drainer_gen () in
+  let retire_if_drainer () =
+    if Lwt.Private.scheduler_drainer_gen () = gen then
+      Lwt.Private.scheduler_retire_drainer ()
+  in
+  let outcome =
+    match loop () with
+    | () -> `Done
+    | effect Yield, k ->
+      retire_if_drainer ();
+      push_task (fun () -> ignore (Effect.Deep.continue k ()));
+      `Suspended
+    | effect Await fut, k ->
+      retire_if_drainer ();
+      let storage = Storage.save_current () in
+      Lwt.on_any fut
+        (fun res -> push_task (fun () ->
+          Storage.restore_current storage; ignore (Effect.Deep.continue k res)))
+        (fun exn -> push_task (fun () ->
+          Storage.restore_current storage; ignore (Effect.Deep.discontinue k exn)));
+      `Suspended
+  in
+  match outcome with
+  | `Done -> ()
+  | `Suspended -> drive loop
+
+let () = Lwt.Private.scheduler_set_runner drive
+[@@@alert "+trespassing"]

@@ -1,6 +1,6 @@
 (test
  (name main)
- (modules main test_lwt_direct)
+ (modules main test_lwt_direct test_await_anywhere)
  (package lwt_direct)
  (build_if
   (>= %{ocaml_version} "5.0"))
@@ -12,4 +12,12 @@
  (package lwt_direct)
  (build_if
   (>= %{ocaml_version} "5.0"))
+ (libraries lwt_direct lwt.unix))
+
+(test
+ (name test_toplevel_await)
+ (modules test_toplevel_await)
+ (package lwt_direct)
+ (build_if
+  (>= %{ocaml_version} "5.3"))
  (libraries lwt_direct lwt.unix))
