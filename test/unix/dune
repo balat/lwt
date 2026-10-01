@@ -29,7 +29,8 @@
    domain_soak
    domain_exit_main
    domain_wakeup_stress
-   domain_shared_resolved)))
+   domain_shared_resolved
+   domain_emfile)))
 
 ; What the ownership check protects inside a RESOLVED promise, and what it does
 ; not. Needs a second domain, hence OCaml 5.
@@ -280,3 +281,17 @@
  (name set_engine)
  (libraries lwt lwt.unix)
  (modules set_engine))
+
+; Loop creation when descriptors are exhausted: must fail cleanly and leave the
+; channel table usable. The test lowers its own limit by re-running itself
+; under a shell, hence not on Windows. Needs a second domain, hence OCaml 5.
+
+(test
+ (name domain_emfile)
+ (package lwt)
+ (modules domain_emfile)
+ (enabled_if
+  (and
+   (>= %{ocaml_version} "5.0")
+   (<> %{os_type} Win32)))
+ (libraries lwt.unix))
