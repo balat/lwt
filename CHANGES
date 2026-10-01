@@ -88,6 +88,9 @@
     the point of the call instead of suspending, for code that must run
     without interleaving, such as a reactive update cycle.
 
+  * Lwt_direct requires OCaml 5.3 (it uses the effect-handler syntax); lwt
+    itself still requires OCaml 4.14.
+
 ====== Fixes ======
 
   * Lwt.key: the sequence-associated storage no longer routes values through a
