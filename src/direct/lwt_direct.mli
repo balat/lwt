@@ -1,9 +1,10 @@
 (** Direct style control flow for Lwt.
 
     Using this module you can write code in direct style (using loops,
-    exceptions handlers, etc.) in an Lwt codebase. Your direct-style sections
-    must be enclosed in a call to {!spawn} and they may {!await} on promises.
-    For example:
+    exceptions handlers, etc.) in an Lwt codebase. Direct-style sections are
+    typically enclosed in a call to {!spawn}, and they may {!await} on
+    promises; {!await} also works in any callback the event loop runs, and at
+    top level, see its documentation. For example:
 
     {[
     open Lwt_direct
@@ -67,9 +68,8 @@ val yield : unit -> unit
     This is similar to [await (Lwt.pause ())], using less indirection internally
     and fewer characters to write.
 
-    Calling [yield] outside of {!spawn} or {!spawn_in_the_background} will raise
-    an exception, crash your program, or otherwise cause errors. It is a
-    programming error to do so. *)
+    Outside of {!spawn} and {!spawn_in_the_background}, [yield] suspends the
+    current task, as {!await} does; see there for what the current task is. *)
 
 val await : 'a Lwt.t -> 'a
 (** [await p] returns the result of [p] (or raises the exception with which [p]
@@ -79,9 +79,27 @@ val await : 'a Lwt.t -> 'a
     the computation started by the surrounding {!spawn}) and resume it when [p]
     is resolved.
 
-    Calling [await] outside of {!spawn} or {!spawn_in_the_background} will raise
-    an exception, crash your program, or otherwise cause errors. It is a
-    programming error to do so. *)
+    [await] also works outside of {!spawn} and {!spawn_in_the_background},
+    under {!Lwt_main.run}: in a {!Lwt.bind} continuation, in an
+    {!Lwt.on_success} callback, in any callback the event loop runs. What it
+    suspends is then the {e current task}: the callback, together with whatever
+    called it synchronously and is still on the stack. The event loop runs the
+    callbacks of each pause, I/O completion and timer as a task of their own,
+    so an awaiting callback never delays the callbacks of other events. A
+    callback triggered synchronously by {!Lwt.wakeup}, or by {!Lwt.wakeup_later}
+    called from outside any callback, shares its task with the code that
+    resolved the promise: that code, and the other callbacks attached to the
+    same promise, resume only once the await is over. ({!Lwt.wakeup_later}
+    called from inside a callback defers the callbacks instead, so they run as
+    their own task.) When that matters, start a task with {!spawn} inside the
+    callback.
+
+    With no event loop running on the current domain, [await p] runs
+    {!Lwt_main.run}[ p]: a direct-style program needs no [Lwt_main.run] of its
+    own. An await from a callback that the engine invokes from C (as the libev
+    engine does) raises [Failure], because an effect cannot cross a C frame; the
+    callbacks of promises are never in that position, only a callback handed
+    directly to {!Lwt_engine} is. *)
 
 (** Local storage.
 
