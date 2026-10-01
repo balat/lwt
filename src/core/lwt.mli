@@ -2169,6 +2169,25 @@ module Private : sig
       a C frame, across which no effect can be performed, and the callbacks of
       one event must not be frozen by an [await] in those of another. *)
 
+  type resolution_state
+  (** The state of the resolution loop that belongs to the fiber running it:
+      the callback nesting depth, the current storage and the cascades in
+      progress. Stack-shaped, so a fiber suspended in the middle of it must
+      take it along. *)
+
+  val scheduler_suspend : unit -> resolution_state
+  (** Called by a runner right after it captured a continuation: returns the
+      state the suspended fiber will need, hands what its frames were still to
+      run (the remaining waiters of the cascades in progress, the callbacks
+      deferred to the end of the outermost one) to the run queue so that they
+      do not wait for the fiber, and leaves the scheduler as at the start of
+      a pass. *)
+
+  val scheduler_resume : resolution_state -> (unit -> unit) -> unit
+  (** [scheduler_resume st f] installs [st], runs [f ()] (the resumption of
+      the suspended fiber), then puts the resumer's own state back, whether
+      [f] returned or raised. *)
+
   val promise_owner_domain : 'a t -> int option
   (** The identifier of the domain that owns [p], or [None] if [p] is already
       resolved and therefore owned by nobody.

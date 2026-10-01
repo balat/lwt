@@ -258,16 +258,30 @@ and sched = {
   mutable defer_fills : bool;
     (* While set, resolutions queue their callbacks as tasks instead of running
        them on the spot; see [defer_fills]. *)
+  mutable cascades : cascade list;
+    (* The cascades in progress on the current fiber's stack, innermost first,
+       when they have more than one waiter. Part of the state a suspension
+       takes with it; see [suspend]. *)
 }
+
+(* A resolution cascade in progress: the result being delivered and the
+   waiters still to receive it. [run_resolution_callbacks] iterates through
+   the cursor rather than through the list itself so that a direct-style layer
+   suspending the fiber in the middle of it can hand the remaining waiters to
+   the run queue ([suspend]), instead of freezing them in the continuation. *)
+and cascade =
+  | Cascade : ('a, exn) result * 'a waiter ref -> cascade
 
 (* A ready unit of work in the run queue. A [Thunk] carries the storage to
    restore before it runs. [Paused] and [Fill] are the loop's own events served
-   as tasks (see [serve_paused_sched] and [defer_fills]); as variants rather
+   as tasks (see [serve_paused_sched] and [defer_fills]), and [Detached] one
+   waiter detached from a suspended cascade (see [suspend]); as variants rather
    than thunks they cost one small block each and no closure. *)
 and task =
   | Thunk of storage * (unit -> unit)
   | Paused of unit promise
   | Fill : 'a pending * ('a, exn) result -> task
+  | Detached : ('a, exn) result * (('a, exn) result -> unit) -> task
 
 exception Canceled
 
@@ -392,6 +406,7 @@ let new_sched () : sched =
     idle = (fun s -> !default_idle s);
     drainer_gen = 0;
     defer_fills = false;
+    cascades = [];
   }
 
 (* S1 step 3: the record moves into a per-domain slot. This is the whole of the
@@ -476,6 +491,7 @@ let abandon_resolution_loop () =
   let sched = self_sched () in
   if sched.nesting <> 0 then begin
     sched.nesting <- 1;
+    sched.cascades <- [];
     leave_resolution_loop sched empty_storage
   end
 
@@ -619,19 +635,33 @@ let new_pending (sched : sched) : 'a t =
    The waiter list is not mutated while this runs: the promise is no longer
    [Pending], so a waiter added to it from a callback runs at once instead of
    being linked, and a removable waiter firing from here finds the promise
-   resolved and leaves its node alone (see [add_removable_waiter_to_each_of]). *)
-let run_resolution_callbacks (type a) (pe : a pending) (r : (a, exn) result) :
-    unit =
+   resolved and leaves its node alone (see [add_removable_waiter_to_each_of]).
+   That is also what lets a cursor into it be followed later. *)
+let run_resolution_callbacks (type a) (sched : sched) (pe : a pending)
+    (r : (a, exn) result) : unit =
   (match r with
   | Error Canceled -> List.iter (fun f -> f ()) pe.cancel_waiters
   | Ok _ | Error _ -> ());
-  let rec go = function
-    | No_waiter -> ()
-    | Waiter w ->
-      w.run r;
-      go w.older
-  in
-  go pe.newest
+  match pe.newest with
+  | No_waiter -> ()
+  | Waiter { older = No_waiter; run; _ } -> run r
+  | Waiter _ as first ->
+    (* Several waiters: go through a cursor the scheduler knows about, so that
+       a suspension inside one of them can detach the others ([suspend]). The
+       single-waiter case above, which is every pending [bind], pays nothing. *)
+    let cursor = ref first in
+    let outer = sched.cascades in
+    sched.cascades <- Cascade (r, cursor) :: outer;
+    let rec go () =
+      match !cursor with
+      | No_waiter -> ()
+      | Waiter w ->
+        cursor := w.older;
+        w.run r;
+        go ()
+    in
+    go ();
+    sched.cascades <- outer
 
 let fill_general (type a) (sched : sched) ~allow_deferring
     ~maximum_callback_nesting_depth (p : a t) (r : (a, exn) result) : unit =
@@ -645,8 +675,10 @@ let fill_general (type a) (sched : sched) ~allow_deferring
          [defer_fills]. *)
       Run_queue.push sched.queue (Fill (pe, r))
     else if allow_deferring && sched.nesting >= maximum_callback_nesting_depth then
-      Queue.push (fun () -> run_resolution_callbacks pe r) sched.deferred
-    else run_in_resolution_loop sched (fun () -> run_resolution_callbacks pe r)
+      Queue.push (fun () -> run_resolution_callbacks sched pe r) sched.deferred
+    else
+      run_in_resolution_loop sched (fun () ->
+        run_resolution_callbacks sched pe r)
   | Fulfilled _ | Rejected _ -> ()
 
 (* Internal resolution: immediate up to the default nesting depth. *)
@@ -1087,6 +1119,66 @@ let defer_fills (sched : sched) (f : unit -> 'a) : 'a =
     sched.defer_fills <- saved;
     raise e
 
+(* The resolution loop keeps stack-shaped state in the scheduler: [nesting]
+   and [storage] are restored by the frames that set them, and [cascades] by
+   [run_resolution_callbacks]. A direct-style layer suspends a fiber in the
+   middle of such frames, so that state must travel with the fiber, or the
+   pass that goes on without it runs at the wrong depth: a [wakeup_later]
+   there is deferred, and never drained until the fiber resumes. [suspend]
+   captures it for the fiber about to be parked and leaves the scheduler as
+   at the start of a pass; [resume] installs it around the resumption and
+   puts the resumer's own back afterwards.
+
+   What the parked frames were still to run must not wait for them either:
+   the remaining waiters of each cascade in progress, innermost first, and the
+   callbacks deferred to the end of the outermost one. They become tasks, in
+   their order, each run at depth 1 as it would have been, so [wakeup_later]
+   keeps deferring inside them. *)
+type resolution_state = {
+  r_nesting : int;
+  r_storage : storage;
+  r_cascades : cascade list;
+}
+
+let capture (sched : sched) : resolution_state =
+  { r_nesting = sched.nesting; r_storage = sched.storage; r_cascades = sched.cascades }
+
+let install (sched : sched) (st : resolution_state) : unit =
+  sched.nesting <- st.r_nesting;
+  sched.storage <- st.r_storage;
+  sched.cascades <- st.r_cascades
+
+let suspend (sched : sched) : resolution_state =
+  let st = capture sched in
+  List.iter
+    (fun (Cascade (r, cursor)) ->
+      let rec detach = function
+        | No_waiter -> ()
+        | Waiter w ->
+          Run_queue.push sched.queue (Detached (r, w.run));
+          detach w.older
+      in
+      detach !cursor;
+      cursor := No_waiter)
+    st.r_cascades;
+  while not (Queue.is_empty sched.deferred) do
+    let f = Queue.pop sched.deferred in
+    Run_queue.push sched.queue
+      (Thunk (st.r_storage, fun () -> run_in_resolution_loop sched f))
+  done;
+  install sched { r_nesting = 0; r_storage = empty_storage; r_cascades = [] };
+  st
+
+let resume (sched : sched) (st : resolution_state) (f : unit -> unit) : unit =
+  let saved = capture sched in
+  install sched st;
+  match f () with
+  | () -> install sched saved
+  | exception e ->
+    let bt = Printexc.get_raw_backtrace () in
+    install sched saved;
+    Printexc.raise_with_backtrace e bt
+
 let register_pause_notifier f = (self_sched ()).pause_notifier <- Some f
 
 let abandon_paused () =
@@ -1168,7 +1260,9 @@ let run_scheduler (sched : sched) : unit =
         f ()
       | Paused p -> fill sched (inj p) ok_unit
       | Fill (pe, r) ->
-        run_in_resolution_loop sched (fun () -> run_resolution_callbacks pe r));
+        run_in_resolution_loop sched (fun () ->
+          run_resolution_callbacks sched pe r)
+      | Detached (r, w) -> run_in_resolution_loop sched (fun () -> w r));
       if sched.drainer_gen = gen then loop ()
     end
   in
@@ -1782,6 +1876,12 @@ module Private = struct
      [serve_paused_sched] and [defer_fills]. *)
   let scheduler_serve_paused () = serve_paused_sched (self_sched ())
   let scheduler_defer_fills f = defer_fills (self_sched ()) f
+
+  (* The resolution state a suspended fiber takes with it; see [suspend]. *)
+  type nonrec resolution_state = resolution_state
+
+  let scheduler_suspend () = suspend (self_sched ())
+  let scheduler_resume st f = resume (self_sched ()) st f
 
   (* Which domain owns a PENDING promise, for the one layer that needs to ask:
      adopting a foreign promise means getting its owner to attach the callback,
