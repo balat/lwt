@@ -59,32 +59,37 @@ let no_handler fname =
        Lwt_main.run), or this callback was invoked from C code, across which 
        an effect cannot be performed.")
 
+(* A region where suspension is forbidden ([no_await]) is a counter kept by the
+   scheduler, [Lwt.Private.no_suspend], so that the core's other clients
+   ([Lwt_react]'s setters) can open one without depending on this library or
+   on effects. [await] and [yield] consult it right before performing, on the
+   pending path only, and raise at the point of the call. *)
+exception Suspension_forbidden
+
+[@@@alert "-trespassing"]
+
+let check_suspension_allowed () =
+  if Lwt.Private.suspension_forbidden () then raise Suspension_forbidden
+
+let no_await (f : unit -> 'a) : 'a = Lwt.Private.no_suspend f
+
+[@@@alert "+trespassing"]
+
 let await (fut : 'a Lwt.t) : 'a =
   match Lwt.state fut with
   | Lwt.Return x -> x
   | Lwt.Fail exn -> raise exn
   | Lwt.Sleep -> (
+    check_suspension_allowed ();
     match Effect.perform (Await fut) with
     | v -> v
     | exception Effect.Unhandled (Await _) -> no_handler "Lwt_direct.await")
 
 let yield () : unit =
+  check_suspension_allowed ();
   match Effect.perform Yield with
   | () -> ()
   | exception Effect.Unhandled Yield -> no_handler "Lwt_direct.yield"
-
-(* A region where suspension is forbidden: the nearest handler wins, so an
-   [await] on a pending promise (or a [yield]) anywhere below [f], at any depth,
-   reaches this handler first and is turned into an exception raised at the
-   point of the call. A [spawn] started inside the region only pushes a task; its
-   body runs later, outside the region. *)
-exception Suspension_forbidden
-
-let no_await (f : unit -> 'a) : 'a =
-  match f () with
-  | v -> v
-  | effect Await _, k -> Effect.Deep.discontinue k Suspension_forbidden
-  | effect Yield, k -> Effect.Deep.discontinue k Suspension_forbidden
 
 (* interlude: task-local storage helpers *)
 
