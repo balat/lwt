@@ -262,6 +262,9 @@ and sched = {
     (* The cascades in progress on the current fiber's stack, innermost first,
        when they have more than one waiter. Part of the state a suspension
        takes with it; see [suspend]. *)
+  mutable suspension_forbidden : int;
+    (* Depth of the regions in which suspending the current task is an error;
+       see [no_suspend]. *)
 }
 
 (* A resolution cascade in progress: the result being delivered and the
@@ -407,6 +410,7 @@ let new_sched () : sched =
     drainer_gen = 0;
     defer_fills = false;
     cascades = [];
+    suspension_forbidden = 0;
   }
 
 (* S1 step 3: the record moves into a per-domain slot. This is the whole of the
@@ -1177,6 +1181,23 @@ let resume (sched : sched) (st : resolution_state) (f : unit -> unit) : unit =
     install sched saved;
     Printexc.raise_with_backtrace e bt
 
+(* A region in which suspending the current task is an error. The core only
+   keeps the count: a direct-style layer consults it before suspending and
+   raises ([Lwt_direct.no_await], [Lwt_direct.await]), and [Lwt_react] opens
+   one around every propagation its setters start, without depending on that
+   layer or on effects. A counter so that regions nest; stack-shaped, which
+   holds because nothing can suspend while it is set. *)
+let no_suspend (sched : sched) (f : unit -> 'a) : 'a =
+  sched.suspension_forbidden <- sched.suspension_forbidden + 1;
+  match f () with
+  | v ->
+    sched.suspension_forbidden <- sched.suspension_forbidden - 1;
+    v
+  | exception e ->
+    let bt = Printexc.get_raw_backtrace () in
+    sched.suspension_forbidden <- sched.suspension_forbidden - 1;
+    Printexc.raise_with_backtrace e bt
+
 let register_pause_notifier f = (self_sched ()).pause_notifier <- Some f
 
 let abandon_paused () =
@@ -1880,6 +1901,10 @@ module Private = struct
 
   let scheduler_suspend () = suspend (self_sched ())
   let scheduler_resume st f = resume (self_sched ()) st f
+
+  (* Regions where suspension is an error; see [no_suspend]. *)
+  let no_suspend f = no_suspend (self_sched ()) f
+  let suspension_forbidden () = (self_sched ()).suspension_forbidden > 0
 
   (* Which domain owns a PENDING promise, for the one layer that needs to ask:
      adopting a foreign promise means getting its owner to attach the callback,
