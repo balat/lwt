@@ -55,25 +55,26 @@ module Storage_map = Map.Make (Int)
 
 type storage = exn Storage_map.t
 
-(* A ready unit of work in the run queue. Each task carries the storage to
-   restore before it runs. *)
-type task = Thunk of storage * (unit -> unit)
-
 (* Growable ring buffer used as the run queue. Stdlib.Queue allocates a list
    cell on every push; this allocates only when it has to grow. Capacity is kept
    a power of two so indexing uses [land] instead of [mod]. A sentinel fills
-   freed slots so consumed continuations are not retained. *)
+   freed slots so consumed continuations are not retained. Generic over its
+   elements, because the tasks it holds mention promises, which are declared
+   further down. *)
 module Run_queue = struct
-  let sentinel : task = Thunk (Storage_map.empty, ignore)
+  type 'a t = {
+    mutable a : 'a array;
+    mutable head : int;
+    mutable len : int;
+    sentinel : 'a;
+  }
 
-  type t = { mutable a : task array; mutable head : int; mutable len : int }
-
-  let create () = { a = Array.make 16 sentinel; head = 0; len = 0 }
+  let create sentinel = { a = Array.make 16 sentinel; head = 0; len = 0; sentinel }
   let is_empty q = q.len = 0
 
   let grow q =
     let cap = Array.length q.a in
-    let a' = Array.make (2 * cap) sentinel in
+    let a' = Array.make (2 * cap) q.sentinel in
     for i = 0 to q.len - 1 do
       a'.(i) <- q.a.((q.head + i) land (cap - 1))
     done;
@@ -88,7 +89,7 @@ module Run_queue = struct
   (* Caller must ensure [not (is_empty q)]; avoids allocating an option. *)
   let pop q =
     let x = q.a.(q.head) in
-    q.a.(q.head) <- sentinel;
+    q.a.(q.head) <- q.sentinel;
     q.head <- (q.head + 1) land (Array.length q.a - 1);
     q.len <- q.len - 1;
     x
@@ -228,8 +229,9 @@ and sched = {
   deferred : (unit -> unit) Queue.t;
     (* Callbacks deferred past the nesting cap; drained when the outermost loop
        exits. *)
-  queue : Run_queue.t;
-    (* Ready work: pauses, and the resumptions of direct-style layers. *)
+  queue : task Run_queue.t;
+    (* Ready work: pauses, the resumptions of direct-style layers, and the
+       resolutions performed during an engine iteration. *)
   mutable paused : unit promise list;
   mutable paused_n : int;
   mutable pause_notifier : (int -> unit) option;
@@ -253,7 +255,19 @@ and sched = {
        fiber running [run_scheduler]. Bumped by [retire_drainer] when a
        direct-style layer suspends that fiber, so that once resumed it ends
        after its task instead of competing with the new drainer. *)
+  mutable defer_fills : bool;
+    (* While set, resolutions queue their callbacks as tasks instead of running
+       them on the spot; see [defer_fills]. *)
 }
+
+(* A ready unit of work in the run queue. A [Thunk] carries the storage to
+   restore before it runs. [Paused] and [Fill] are the loop's own events served
+   as tasks (see [serve_paused_sched] and [defer_fills]); as variants rather
+   than thunks they cost one small block each and no closure. *)
+and task =
+  | Thunk of storage * (unit -> unit)
+  | Paused of unit promise
+  | Fill : 'a pending * ('a, exn) result -> task
 
 exception Canceled
 
@@ -370,13 +384,14 @@ let new_sched () : sched =
     storage = empty_storage;
     nesting = 0;
     deferred = Queue.create ();
-    queue = Run_queue.create ();
+    queue = Run_queue.create (Thunk (empty_storage, ignore));
     paused = [];
     paused_n = 0;
     pause_notifier = None;
     on_reset = ignore;
     idle = (fun s -> !default_idle s);
     drainer_gen = 0;
+    defer_fills = false;
   }
 
 (* S1 step 3: the record moves into a per-domain slot. This is the whole of the
@@ -625,7 +640,11 @@ let fill_general (type a) (sched : sched) ~allow_deferring
   | Pending pe ->
     check_owner sched pe;
     p.st <- (match r with Ok v -> Fulfilled v | Error e -> Rejected e);
-    if allow_deferring && sched.nesting >= maximum_callback_nesting_depth then
+    if sched.defer_fills then
+      (* Inside the engine iteration: the callbacks become a task, see
+         [defer_fills]. *)
+      Run_queue.push sched.queue (Fill (pe, r))
+    else if allow_deferring && sched.nesting >= maximum_callback_nesting_depth then
       Queue.push (fun () -> run_resolution_callbacks pe r) sched.deferred
     else run_in_resolution_loop sched (fun () -> run_resolution_callbacks pe r)
   | Fulfilled _ | Rejected _ -> ()
@@ -1035,6 +1054,39 @@ let wakeup_paused_sched (sched : sched) =
 (* [Lwt.wakeup_paused] is public and takes no argument. *)
 let wakeup_paused () = wakeup_paused_sched (self_sched ())
 
+(* Serve the paused batch as one task per promise, instead of resolving the
+   whole batch on the idle hook's stack. Each pause's callbacks then run from
+   the loop as their own task, so an [await] in one of them (see [runner])
+   suspends that task alone; resolving them in one [List.iter] would freeze the
+   rest of the batch in the continuation. Same order as [wakeup_paused_sched]
+   (FIFO), and the batch still runs before the next idle lap. [Lwt.wakeup_paused],
+   the public entry point, keeps its synchronous semantics. *)
+let serve_paused_sched (sched : sched) =
+  let ps = List.rev sched.paused in
+  sched.paused <- [];
+  sched.paused_n <- 0;
+  List.iter (fun p -> Run_queue.push sched.queue (Paused p)) ps
+
+(* Run [f] with every resolution it triggers turned into a task of the run
+   queue (see [fill_general]) rather than run on the spot. [Lwt_main] wraps the
+   engine iteration in it: an engine callback may run on a C frame (libev
+   invokes its watchers through [caml_callback], and an effect cannot be
+   performed across a C call), and the callbacks of one event must not freeze
+   the dispatch of the others when one of them awaits. The state of a promise is
+   still set at once; only its callbacks move to the queue, in FIFO order, which
+   is within what [wakeup_later] promises and invisible to [wakeup]'s callers
+   inside the engine. *)
+let defer_fills (sched : sched) (f : unit -> 'a) : 'a =
+  let saved = sched.defer_fills in
+  sched.defer_fills <- true;
+  match f () with
+  | v ->
+    sched.defer_fills <- saved;
+    v
+  | exception e ->
+    sched.defer_fills <- saved;
+    raise e
+
 let register_pause_notifier f = (self_sched ()).pause_notifier <- Some f
 
 let abandon_paused () =
@@ -1076,7 +1128,7 @@ let retire_drainer (sched : sched) : unit =
    iterations from starving under a sustained stream of pauses. *)
 let core_idle (sched : sched) : bool =
   if sched.paused_n > 0 then begin
-    wakeup_paused_sched sched;
+    serve_paused_sched sched;
     true
   end
   else false
@@ -1113,7 +1165,10 @@ let run_scheduler (sched : sched) : unit =
       (match Run_queue.pop sched.queue with
       | Thunk (s, f) ->
         sched.storage <- s;
-        f ());
+        f ()
+      | Paused p -> fill sched (inj p) ok_unit
+      | Fill (pe, r) ->
+        run_in_resolution_loop sched (fun () -> run_resolution_callbacks pe r));
       if sched.drainer_gen = gen then loop ()
     end
   in
@@ -1721,6 +1776,12 @@ module Private = struct
   let scheduler_set_runner f = runner := f
   let scheduler_drainer_gen () = (self_sched ()).drainer_gen
   let scheduler_retire_drainer () = retire_drainer (self_sched ())
+
+  (* Serving the loop's own events as tasks, so that a callback they run may
+     await without freezing its neighbours or sitting on a C frame; see
+     [serve_paused_sched] and [defer_fills]. *)
+  let scheduler_serve_paused () = serve_paused_sched (self_sched ())
+  let scheduler_defer_fills f = defer_fills (self_sched ()) f
 
   (* Which domain owns a PENDING promise, for the one layer that needs to ask:
      adopting a foreign promise means getting its owner to attach the callback,

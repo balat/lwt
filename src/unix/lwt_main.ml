@@ -113,10 +113,11 @@ let run (type a) (p : a Lwt.t) : a =
         && Lwt.paused_count () = 0
         && Lwt.Private.scheduler_queue_is_empty ()
       in
-      Lwt_engine.iter should_block_waiting_for_io;
+      Lwt.Private.scheduler_defer_fills (fun () ->
+        Lwt_engine.iter should_block_waiting_for_io);
 
       (* Fulfill paused promises. *)
-      Lwt.wakeup_paused ();
+      Lwt.Private.scheduler_serve_paused ();
 
       (* Call leave hooks. *)
       Lwt_sequence.iter_l (fun f -> f ()) (leave_iter_hooks ());

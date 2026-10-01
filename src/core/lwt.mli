@@ -2154,6 +2154,21 @@ module Private : sig
       resumed, then returns to whoever resumed it instead of draining the queue
       on top of the new pass. *)
 
+  val scheduler_serve_paused : unit -> unit
+  (** Queues the current paused batch as one task per promise, in the order
+      {!wakeup_paused} would resolve them, so that each pause's callbacks run
+      from the loop as their own task: an [await] in one of them then suspends
+      that task alone. For the idle hook of a backend; {!wakeup_paused} keeps
+      resolving the batch synchronously. *)
+
+  val scheduler_defer_fills : (unit -> 'a) -> 'a
+  (** [scheduler_defer_fills f] runs [f ()] with every promise resolution it
+      performs queuing its callbacks as a task of the run queue, FIFO, instead
+      of running them on the spot (the promise's state is still set at once).
+      A backend wraps its engine iteration in it: an engine callback may run on
+      a C frame, across which no effect can be performed, and the callbacks of
+      one event must not be frozen by an [await] in those of another. *)
+
   val promise_owner_domain : 'a t -> int option
   (** The identifier of the domain that owns [p], or [None] if [p] is already
       resolved and therefore owned by nobody.
