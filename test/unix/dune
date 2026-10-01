@@ -74,14 +74,21 @@
  (libraries lwt.unix))
 
 ; The scaling benchmark for the server recipe. An executable, not a test: it needs
-; an external load generator.
+; an external load generator. The io_uring engine is optional: lwt_uring is a
+; separate package, and lwt's own tests must build without it.
 
 (executable
  (name bench_reuseport)
- (modules bench_reuseport)
+ (modules bench_reuseport reuseport_engine)
  (enabled_if
   (>= %{ocaml_version} "5.0"))
- (libraries lwt.unix lwt_uring))
+ (libraries
+  lwt.unix
+  (select
+   reuseport_engine.ml
+   from
+   (lwt_uring -> reuseport_engine.uring.ml)
+   (-> reuseport_engine.none.ml))))
 
 ; The server recipe: one listening socket per domain on the same port, through
 ; SO_REUSEPORT. Needs a second domain, hence OCaml 5.
