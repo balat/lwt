@@ -2554,6 +2554,7 @@ let () =
 
 external set_signal : int -> int -> bool -> unit = "lwt_unix_set_signal"
 external remove_signal : int -> int -> bool -> unit = "lwt_unix_remove_signal"
+external reinstall_signal : int -> unit = "lwt_unix_reinstall_signal"
 external init_signals : unit -> unit = "lwt_unix_init_signals"
 external handle_signal : int -> unit = "lwt_unix_handle_signal"
 
@@ -2636,11 +2637,12 @@ let () =
         notif.signals;
       notif.signals <- Signal_map.empty
 
+(* Subscribing again would not do it: this loop is already counted, and only
+   the first subscriber installs the process-wide handler. *)
 let reinstall_signal_handler signum =
-  match Signal_map.find signum (self_notif ()).signals with
-  | exception Not_found -> ()
-  | notification, _ ->
-    set_signal signum notification
+  if Signal_map.mem signum (self_notif ()).signals
+  && not (Lwt_engine.forwards_signal signum) then
+    reinstall_signal signum
 
 (* +-----------------------------------------------------------------+
    | Processes                                                       |

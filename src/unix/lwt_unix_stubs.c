@@ -1016,6 +1016,63 @@ static int signal_subscriber_count(int signum) {
   return n;
 }
 
+/* Installs the process-wide handler for [signum]. Returns 0, or the error code
+   with the name of the call that failed in [*name], so that the caller can
+   raise once it has released the mutex. */
+static int install_process_handler(int signum, const char **name) {
+#if defined(LWT_ON_WINDOWS)
+  if (signum == SIGINT) {
+    if (!SetConsoleCtrlHandler(handle_break, TRUE)) {
+      *name = "SetConsoleCtrlHandler";
+      return (int)GetLastError();
+    }
+  } else {
+    if (signal(signum, handle_signal) == SIG_ERR) {
+      *name = "signal";
+      return errno;
+    }
+  }
+#else
+  struct sigaction sa;
+  sa.sa_handler = handle_signal;
+#if OCAML_VERSION >= 50000
+  sa.sa_flags = SA_ONSTACK;
+#else
+  sa.sa_flags = 0;
+#endif
+  sigemptyset(&sa.sa_mask);
+  if (sigaction(signum, &sa, NULL) == -1) {
+    *name = "sigaction";
+    return errno;
+  }
+#endif
+  return 0;
+}
+
+static void uninstall_process_handler(int signum) {
+#if defined(LWT_ON_WINDOWS)
+  if (signum == SIGINT)
+    SetConsoleCtrlHandler(NULL, FALSE);
+  else
+    signal(signum, SIG_DFL);
+#else
+  struct sigaction sa;
+  sa.sa_handler = SIG_DFL;
+  sa.sa_flags = 0;
+  sigemptyset(&sa.sa_mask);
+  sigaction(signum, &sa, NULL);
+#endif
+}
+
+static void raise_handler_error(int error, const char *name) {
+#if defined(LWT_ON_WINDOWS)
+  win32_maperr(error);
+  uerror(name, Nothing);
+#else
+  unix_error(error, name, Nothing);
+#endif
+}
+
 CAMLprim value lwt_unix_handle_signal(value val_signum) {
   handle_signal(caml_convert_signal_number(Int_val(val_signum)));
   return Val_unit;
@@ -1039,13 +1096,12 @@ static BOOL WINAPI handle_break(DWORD event) {
 
 /* Install a signal handler. */
 CAMLprim value lwt_unix_set_signal(value val_signum, value val_notification, value val_forwarded) {
-#if !defined(LWT_ON_WINDOWS)
-  struct sigaction sa;
-#endif
   int signum = caml_convert_signal_number(Int_val(val_signum));
   intnat notification = Long_val(val_notification);
   int slot;
   int first;
+  int error = 0;
+  const char *name = NULL;
 
   if (signum < 0 || signum >= NSIG)
     caml_invalid_argument("Lwt_unix.on_signal: unavailable signal");
@@ -1058,34 +1114,12 @@ CAMLprim value lwt_unix_set_signal(value val_signum, value val_notification, val
 
   /* The process-wide handler is installed by the FIRST subscriber only; a second
      loop subscribing must not reinstall it, and must not be told it failed. */
-  if (Bool_val(val_forwarded) || !first) return Val_unit;
+  if (!Bool_val(val_forwarded) && first) {
+    error = install_process_handler(signum, &name);
+    if (error != 0) signal_notifications[signum][slot] = 0;
+  }
 
-#if defined(LWT_ON_WINDOWS)
-  if (signum == SIGINT) {
-    if (!SetConsoleCtrlHandler(handle_break, TRUE)) {
-      signal_notifications[signum][slot] = 0;
-      win32_maperr(GetLastError());
-      uerror("SetConsoleCtrlHandler", Nothing);
-    }
-  } else {
-    if (signal(signum, handle_signal) == SIG_ERR) {
-      signal_notifications[signum][slot] = 0;
-      uerror("signal", Nothing);
-    }
-  }
-#else
-  sa.sa_handler = handle_signal;
-#if OCAML_VERSION >= 50000
-  sa.sa_flags = SA_ONSTACK;
-#else
-  sa.sa_flags = 0;
-#endif
-  sigemptyset(&sa.sa_mask);
-  if (sigaction(signum, &sa, NULL) == -1) {
-    signal_notifications[signum][slot] = 0;
-    uerror("sigaction", Nothing);
-  }
-#endif
+  if (error != 0) raise_handler_error(error, name);
   return Val_unit;
 }
 
@@ -1093,29 +1127,34 @@ CAMLprim value lwt_unix_set_signal(value val_signum, value val_notification, val
    them. */
 CAMLprim value lwt_unix_remove_signal(value val_signum, value val_notification,
                                       value val_forwarded) {
-#if !defined(LWT_ON_WINDOWS)
-  struct sigaction sa;
-#endif
   /* The signal number is valid here since it was when we did the
      set_signal. */
   int signum = caml_convert_signal_number(Int_val(val_signum));
   int slot = LWT_NOTIFICATION_INDEX(Long_val(val_notification));
+
   signal_notifications[signum][slot] = 0;
+  if (!Bool_val(val_forwarded) && signal_subscriber_count(signum) == 0)
+    uninstall_process_handler(signum);
+  return Val_unit;
+}
 
-  if (Bool_val(val_forwarded) || signal_subscriber_count(signum) > 0)
-    return Val_unit;
+/* Puts the process-wide handler back, for a signal some loop is subscribed to.
+   What [Lwt_unix.reinstall_signal_handler] is for: another library replaced the
+   handler with its own, and Lwt's subscribers would otherwise never hear the
+   signal again. Subscribing again does not do it, since the loop is already
+   counted and only the first subscriber installs. */
+CAMLprim value lwt_unix_reinstall_signal(value val_signum) {
+  int signum = caml_convert_signal_number(Int_val(val_signum));
+  int error = 0;
+  const char *name = NULL;
 
-#if defined(LWT_ON_WINDOWS)
-  if (signum == SIGINT)
-    SetConsoleCtrlHandler(NULL, FALSE);
-  else
-    signal(signum, SIG_DFL);
-#else
-  sa.sa_handler = SIG_DFL;
-  sa.sa_flags = 0;
-  sigemptyset(&sa.sa_mask);
-  sigaction(signum, &sa, NULL);
-#endif
+  if (signum < 0 || signum >= NSIG)
+    caml_invalid_argument("Lwt_unix.reinstall_signal_handler: unavailable signal");
+
+  if (signal_subscriber_count(signum) > 0)
+    error = install_process_handler(signum, &name);
+
+  if (error != 0) raise_handler_error(error, name);
   return Val_unit;
 }
 

@@ -1249,9 +1249,38 @@ let dup_tests ~blocking =
       Lwt.return_true);
 ]
 
+let signal_tests = [
+  (* Another library can replace the process-wide handler with its own, after
+     which Lwt's subscribers never hear the signal again. reinstall_signal_handler
+     is what puts Lwt's handler back. Subscribing again would not do it: this
+     loop is already counted, and only the first subscriber installs. SIGURG is
+     ignored by default, so a handler that is not restored costs a timeout, not
+     the test process. *)
+  test "reinstall_signal_handler" ~sequential:true
+      ~only_if:(fun () -> not Sys.win32) begin fun () ->
+    let got, resolve_got = Lwt.wait () in
+    let id =
+      Lwt_unix.on_signal Sys.sigurg (fun _ ->
+        if Lwt.is_sleeping got then Lwt.wakeup resolve_got ())
+    in
+    let other_library_ran = ref false in
+    Sys.set_signal Sys.sigurg
+      (Sys.Signal_handle (fun _ -> other_library_ran := true));
+    Lwt_unix.reinstall_signal_handler Sys.sigurg;
+    Unix.kill (Unix.getpid ()) Sys.sigurg;
+    Lwt.pick
+      [ (got >|= fun () -> true);
+        (Lwt_unix.sleep 2. >|= fun () -> false) ]
+    >|= fun lwt_handler_ran ->
+    Lwt_unix.disable_signal_handler id;
+    lwt_handler_ran && not !other_library_ran
+  end;
+]
+
 let suite =
   suite "lwt_unix"
     (wait_tests @
+     signal_tests @
      openfile_tests @
      utimes_tests @
      readdir_tests @
