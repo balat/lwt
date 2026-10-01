@@ -8,8 +8,20 @@ open Lwt.Infix
 type 'a event = 'a React.event
 type 'a signal = 'a React.signal
 
+[@@@alert "-trespassing"]
+
 module E = struct
   include React.E
+
+  (* A propagation entered through a sender made here must not be suspended:
+     React runs the dependent nodes synchronously inside [send], and a node
+     function that waited (an [await] of a direct-style layer) would leave the
+     update step in progress while other tasks run. The sender opens a region
+     in which the scheduler refuses to suspend, so such an await raises at its
+     call site instead. Every event this module builds is sent through one. *)
+  let create () =
+    let event, send = create () in
+    (event, fun ?step v -> Lwt.Private.no_suspend (fun () -> send ?step v))
 
   (* +---------------------------------------------------------------+
      | Lwt-specific utilities                                        |
@@ -263,6 +275,12 @@ end
 
 module S = struct
   include React.S
+
+  (* Same guarantee as [E.create]: the propagation a setter starts cannot be
+     suspended. *)
+  let create ?eq v =
+    let signal, set = create ?eq v in
+    (signal, fun ?step v -> Lwt.Private.no_suspend (fun () -> set ?step v))
 
   (* +---------------------------------------------------------------+
      | Lwt-specific utilities                                        |
