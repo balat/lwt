@@ -128,7 +128,9 @@ val no_await : (unit -> 'a) -> 'a
 
     Tasks started inside the region with {!spawn} or
     {!spawn_in_the_background} run later, as tasks of their own, and are not
-    affected. *)
+    affected. The senders and setters returned by [Lwt_react.E.create] and
+    [Lwt_react.S.create] open such a region around the propagation they
+    start. *)
 
 (** Local storage.
 

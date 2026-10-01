@@ -4,7 +4,7 @@
  (package lwt_direct)
  (build_if
   (>= %{ocaml_version} "5.3"))
- (libraries lwt_direct lwt.unix lwttester))
+ (libraries lwt_direct lwt.unix lwt_react lwttester))
 
 (test
  (name test_backtrace)

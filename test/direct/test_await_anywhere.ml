@@ -229,6 +229,41 @@ let no_await_suite = suite "no_await" [
     await (Lwt_unix.sleep 1e-3);
     true
   end;
+
+  test "a setter from Lwt_react.S.create refuses to suspend its propagation" begin fun () ->
+    Lwt.pause () >|= fun () ->
+    let s, set = Lwt_react.S.create 0 in
+    let seen = ref [] in
+    let s' =
+      React.S.map (fun v ->
+        if v = 2 then await (Lwt_unix.sleep 1e-3);
+        seen := v :: !seen; v) s
+    in
+    set 1;
+    let refused =
+      match set 2 with
+      | () -> false
+      | exception Lwt_direct.Suspension_forbidden -> true
+    in
+    ignore (React.S.value s');
+    refused && !seen = [1; 0]
+  end;
+
+  test "a setter from React.S.create suspends silently; no_await around it refuses" begin fun () ->
+    Lwt.pause () >|= fun () ->
+    let s, set = React.S.create 0 in
+    let s' = React.S.map (fun v -> if v > 0 then await (Lwt_unix.sleep 1e-3); v) s in
+    (* Unprotected: the node awaits, this task is suspended with the update
+       step in progress, and resumes 1 ms later as if nothing had happened. *)
+    set 1;
+    let after_silent = React.S.value s' = 1 in
+    let refused =
+      match Lwt_direct.no_await (fun () -> set 2) with
+      | () -> false
+      | exception Lwt_direct.Suspension_forbidden -> true
+    in
+    after_silent && refused
+  end;
 ]
 
 let state_suite = suite "resolution state across suspensions" [

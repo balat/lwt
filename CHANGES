@@ -94,7 +94,10 @@
     (Lwt_main.run (spawn f)); and Lwt_direct.no_await, a region in which an
     await on a pending promise, or a yield, raises Suspension_forbidden at
     the point of the call instead of suspending, for code that must run
-    without interleaving, such as a reactive update cycle.
+    without interleaving. The senders and setters returned by
+    Lwt_react.E.create and Lwt_react.S.create open such a region around the
+    propagation they start, so an await in a React node function raises
+    instead of leaving the update step in progress.
 
   * Lwt_direct requires OCaml 5.3 (it uses the effect-handler syntax); lwt
     itself still requires OCaml 4.14.

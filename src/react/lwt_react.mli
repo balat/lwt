@@ -21,6 +21,13 @@ type 'a signal = 'a React.signal
 module E : sig
   include module type of React.E
 
+  val create : unit -> 'a event * (?step:React.step -> 'a -> unit)
+  (** Like {!React.E.create}, except that the propagation started by the
+      returned sender cannot be suspended: a node function that tries to wait
+      through a direct-style layer ([Lwt_direct.await]) raises at that point
+      instead of leaving the update step in progress while other tasks run.
+      Every event this module builds is sent through such a sender. *)
+
   (** {2 Lwt-specific utilities} *)
 
   val with_finaliser : (unit -> unit) -> 'a event -> 'a event
@@ -114,6 +121,11 @@ end
 
 module S : sig
   include module type of React.S
+
+  val create :
+    ?eq:('a -> 'a -> bool) -> 'a -> 'a signal * (?step:React.step -> 'a -> unit)
+  (** Like {!React.S.create}, with the same guarantee as {!E.create}: the
+      propagation started by the returned setter cannot be suspended. *)
 
   (** {2 Monadic interface} *)
 
