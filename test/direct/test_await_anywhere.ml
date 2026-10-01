@@ -103,7 +103,7 @@ let anywhere_suite = suite "await anywhere" [
         "callback: after await"; "resolver: after wakeup" ])
   end;
 
-  test "the other waiters of the same promise wait too" begin fun () ->
+  test "the other waiters of the same promise do not wait" begin fun () ->
     reset ();
     let p, r = Lwt.wait () in
     let q, rq = Lwt.wait () in
@@ -114,7 +114,7 @@ let anywhere_suite = suite "await anywhere" [
     Lwt.pause () >>= fun () ->
     Lwt.wakeup r ();
     Lwt_unix.sleep 3e-3 >|= fun () ->
-    order () = ["awaiter: before"; "helper"; "awaiter: after"; "sibling"]
+    order () = ["awaiter: before"; "sibling"; "helper"; "awaiter: after"]
   end;
 
   test "wakeup_later from a callback defers, so the resolver is not suspended" begin fun () ->
@@ -231,4 +231,47 @@ let no_await_suite = suite "no_await" [
   end;
 ]
 
-let suites = [anywhere_suite; no_await_suite]
+let state_suite = suite "resolution state across suspensions" [
+  test "a wakeup_later from another task resolves the awaited promise" begin fun () ->
+    (* The suspended callback left the resolution loop at depth 1; the pass
+       must not inherit that depth, or this wakeup_later is deferred and never
+       drained. *)
+    let q, rq = Lwt.wait () in
+    Lwt.async (fun () -> Lwt_unix.sleep 1e-3 >|= fun () -> Lwt.wakeup_later rq ());
+    Lwt.pause () >|= fun () -> await q; true
+  end;
+
+  test "callbacks deferred before an await run while it is suspended" begin fun () ->
+    reset ();
+    let q, rq = Lwt.wait () in
+    let p2, r2 = Lwt.wait () in
+    Lwt.on_success p2 (fun () -> mark "deferred");
+    resolve_later ~delay:1e-3 ~mark:"helper" rq;
+    Lwt.pause () >|= fun () ->
+    (* At depth 1: this wakeup_later is deferred to the end of the cascade. *)
+    Lwt.wakeup_later r2 ();
+    mark "before"; await q; mark "after";
+    order () = ["before"; "deferred"; "helper"; "after"]
+  end;
+
+  test "siblings of nested cascades run, the resolver still waits" begin fun () ->
+    reset ();
+    let q, rq = Lwt.wait () in
+    let p, r = Lwt.wait () in
+    let p2, r2 = Lwt.wait () in
+    Lwt.on_success p2 (fun () -> mark "inner sibling");
+    Lwt.on_success p2 (fun () ->
+      mark "inner awaiter: before"; await q; mark "inner awaiter: after");
+    Lwt.on_success p (fun () -> mark "outer sibling");
+    Lwt.on_success p (fun () -> Lwt.wakeup r2 (); mark "outer: after wakeup");
+    resolve_later ~delay:1e-3 ~mark:"helper" rq;
+    Lwt.pause () >>= fun () ->
+    Lwt.wakeup r ();
+    Lwt_unix.sleep 3e-3 >|= fun () ->
+    order () = [
+      "inner awaiter: before"; "inner sibling"; "outer sibling"; "helper";
+      "inner awaiter: after"; "outer: after wakeup" ]
+  end;
+]
+
+let suites = [anywhere_suite; no_await_suite; state_suite]
