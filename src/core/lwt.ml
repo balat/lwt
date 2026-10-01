@@ -118,30 +118,71 @@ and 'a pending = {
        it then pays on every promise costs slightly more than the lookup saved.
        Stamping also attributes a violation to the true creator, and it is what
        the level-2 sanitizer of annexe B.8 needs. *)
-  mutable waiters : (('a, exn) result -> unit) list;
-    (* Most-recently-added first; each waiter runs once and only enqueues.
+  mutable newest : 'a waiter;
+  mutable oldest : 'a waiter;
+    (* The waiters attached to this promise, as an intrusive doubly-linked
+       list between its two ends, [No_waiter] standing for "none" at an end as
+       in a link. A fresh promise has [No_waiter] at both ends.
 
-       A waiter RECEIVES the scheduler rather than capturing it. It could capture
-       it, since a promise's callbacks always run on the domain that owns it,
-       which is the domain that installed the waiter; but capturing costs one
-       word per waiter, measured at +5 words per suspended bind across the
-       combinators (study, section 13.4), and receiving costs nothing. It also
-       states the invariant in the type. *)
+       Why not a plain list: a waiter list must support adding (every
+       suspended bind), unlinking one node (the removable waiters of [choose],
+       [pick], [protected] and friends, which detach from the losers when the
+       winner resolves) and splicing one list into another ([forward], when a
+       continuation returns a pending promise). On a plain list the last two
+       are linear in the list and the first of them reallocates it. Measured:
+       ten thousand concurrent picks against one long-lived promise cost 50
+       microseconds per resolution against 1.4 on the historical core, and ten
+       thousand binds returning one shared promise carrying ten thousand
+       waiters cost 89 microseconds per merge against 0.26. The historical core
+       buys its O(1) with callback trees, a removable cell shared across
+       promises and a throttled cleanup; here every operation is O(1) by
+       construction, for one more word per waiter (a node is four words where a
+       list cell is three) and one more word per pending promise (the second
+       end).
+
+       Why a variant with an inline record, and two ends rather than a circular
+       list: the node IS the variant block, so a link costs no box and
+       [No_waiter] is an immediate; and a node is always built with both its
+       links in hand, where the first node of a circular list would need a
+       recursive value definition, which OCaml compiles through a dummy block
+       and a copy, measured at 26 ns against 7 for a plain allocation.
+
+       Waiters run most recently added first, Lwt's order; see
+       [run_resolution_callbacks]. A waiter RECEIVES the scheduler rather than
+       capturing it: capturing would cost one word per waiter, measured at +5
+       words per suspended bind across the combinators (study, section 13.4),
+       and a promise's callbacks always run on the domain that installed them,
+       which the type then states. *)
   mutable cancel_waiters : (unit -> unit) list;
     (* [on_cancel] callbacks; run BEFORE [waiters] when rejected with
-       [Canceled] (Lwt's ordering guarantee). *)
+       [Canceled] (Lwt's ordering guarantee). Rarely more than one and never
+       unlinked individually, so a plain list is right here. *)
   mutable cancel : cancel_mode;
     (* How this promise reacts to [cancel] while pending (Lwt's model). *)
   mutable link : 'a promise option;
-    (* [Some root]: this cell is an alias of [root] — Lwt's proxy, with the
-       merge direction REVERSED so that tail-recursive bind loops are O(1) in
-       live memory. When a pending [bind] continuation returns a fresh pending
-       promise, [forward] moves the fresh promise's waiters onto the (older,
-       anchored) result and links the fresh cell to it: the fresh cell becomes
-       garbage as soon as its creator drops it, while the anchored result —
-       the one the outside world holds — never grows a chain. [prj] follows
-       links with path compression, so all reads/writes act on the root. *)
+    (* [Some root]: this cell is an alias of [root], Lwt's proxy. When a pending
+       [bind] continuation returns a fresh pending promise, [forward] moves the
+       fresh promise's waiters onto the (older, anchored) result and links the
+       fresh cell to it, exactly as Lwt's [make_into_proxy] makes the promise
+       the continuation returned a proxy of the outer one: the fresh cell
+       becomes garbage as soon as its creator drops it, while the anchored
+       result, the one the outside world holds, never grows a chain. [prj]
+       follows links with path compression, so all reads and writes act on the
+       root. *)
 }
+
+(* A node of a promise's waiter list, or the absence of one. [run] is the
+   waiter proper. A linked node has [No_waiter] as [newer] only when it is the
+   newest and as [older] only when it is the oldest; an unlinked node has
+   [No_waiter] at both, which [unlink_waiter] tells apart from a node alone in
+   its list by looking at the list's newest end. *)
+and 'a waiter =
+  | No_waiter
+  | Waiter of {
+      run : ('a, exn) result -> unit;
+      mutable newer : 'a waiter;
+      mutable older : 'a waiter;
+    }
 
 (* Lwt's cancellation model:
    - [Cancel_self hook]: directly cancelable ([task], timers, I/O) — [cancel]
@@ -436,8 +477,8 @@ exception Foreign_promise
      [add_waiter], [set_on_cancel], [set_cancel_forward],
      [set_cancel_forward_list], [forward] (which moves waiters between TWO
      pending records, so both are checked), [both] (sets the cancel mode
-     directly), the remover of a removable waiter (filters waiter lists), and
-     [on_cancel] (writes [cancel_waiters]).
+     directly), the remover of a removable waiter (unlinks its node from each
+     list), and [on_cancel] (writes [cancel_waiters]).
    - NOT checked because the promise is provably ours: [wait] and [no_cancel]
      set [Not_cancelable] on a promise [new_pending] has just created for us,
      so the owner is this scheduler by construction.
@@ -481,29 +522,95 @@ let[@inline] owner_sched (pe : 'a pending) : sched =
   if sched.dom <> Lwt_dls.self_token () then raise Foreign_promise;
   sched
 
+(* The waiter list primitives. Both ends are at hand in the pending record, so
+   linking the newest, unlinking any node and splicing one list behind another
+   are a few pointer writes each, and none allocates beyond the node itself. *)
+
+let link_waiter (pe : 'a pending) (run : ('a, exn) result -> unit) : 'a waiter =
+  let node = Waiter { run; newer = No_waiter; older = pe.newest } in
+  (match pe.newest with
+  | Waiter newest -> newest.newer <- node
+  | No_waiter -> pe.oldest <- node);
+  pe.newest <- node;
+  node
+
+(* [unlink_waiter pe node] takes [node] out of [pe]'s list. Harmless when there
+   is no node, and when [node] was already unlinked: its links are then both
+   [No_waiter] and it is not the list's newest, which tells it apart from a
+   node alone in its list, whose links are also both [No_waiter]. *)
+let unlink_waiter (pe : 'a pending) (node : 'a waiter) : unit =
+  match node with
+  | No_waiter -> ()
+  | Waiter w ->
+    let linked =
+      match w.newer with Waiter _ -> true | No_waiter -> pe.newest == node
+    in
+    if linked then begin
+      (match w.newer with
+      | Waiter newer -> newer.older <- w.older
+      | No_waiter -> pe.newest <- w.older);
+      (match w.older with
+      | Waiter older -> older.newer <- w.newer
+      | No_waiter -> pe.oldest <- w.newer);
+      w.newer <- No_waiter;
+      w.older <- No_waiter
+    end
+
+(* [splice_waiters ~into ~from] moves every waiter of [from] behind those of
+   [into] and empties [from]. Afterwards [into]'s own waiters run first, newest
+   to oldest, then [from]'s: Lwt's order when a bind result absorbs the promise
+   its continuation returned (the outer promise's callbacks before the returned
+   promise's, see [Pending_callbacks.merge_callbacks] in the historical core). *)
+let splice_waiters ~(into : 'a pending) ~(from : 'a pending) : unit =
+  (match from.newest with
+  | No_waiter -> ()
+  | Waiter from_newest -> (
+    match into.oldest with
+    | No_waiter ->
+      into.newest <- from.newest;
+      into.oldest <- from.oldest
+    | Waiter into_oldest ->
+      into_oldest.older <- from.newest;
+      from_newest.newer <- into.oldest;
+      into.oldest <- from.oldest));
+  from.newest <- No_waiter;
+  from.oldest <- No_waiter
+
 let new_pending (sched : sched) : 'a t =
   inj
     { st =
         Pending
           {
             owner = sched;
-            waiters = [];
+            newest = No_waiter;
+            oldest = No_waiter;
             cancel_waiters = [];
             cancel = Cancel_self ignore;
             link = None;
           };
     }
 
-(* Both lists are most-recently-added first and are run in THAT order: Lwt
-   runs attached callbacks in reverse registration order (its callback trees
-   prepend new nodes and are traversed front-first — LIFO). Observable, e.g.,
-   through [Lwt_react.E.limit]'s flush racing a user [on_success]. *)
+(* Both lists run most-recently-added first: Lwt runs attached callbacks in
+   reverse registration order (its callback trees prepend new nodes and are
+   traversed front-first). Observable, e.g., through [Lwt_react.E.limit]'s flush
+   racing a user [on_success].
+
+   The waiter list is not mutated while this runs: the promise is no longer
+   [Pending], so a waiter added to it from a callback runs at once instead of
+   being linked, and a removable waiter firing from here finds the promise
+   resolved and leaves its node alone (see [add_removable_waiter_to_each_of]). *)
 let run_resolution_callbacks (type a) (pe : a pending) (r : (a, exn) result) :
     unit =
   (match r with
   | Error Canceled -> List.iter (fun f -> f ()) pe.cancel_waiters
   | Ok _ | Error _ -> ());
-  List.iter (fun w -> w r) pe.waiters
+  let rec go = function
+    | No_waiter -> ()
+    | Waiter w ->
+      w.run r;
+      go w.older
+  in
+  go pe.newest
 
 let fill_general (type a) (sched : sched) ~allow_deferring
     ~maximum_callback_nesting_depth (p : a t) (r : (a, exn) result) : unit =
@@ -527,7 +634,8 @@ let add_waiter (type a) (sched : sched) (p : a t)
   match (prj p).st with
   | Pending pe ->
     check_owner sched pe;
-    pe.waiters <- w :: pe.waiters
+    let (_ : a waiter) = link_waiter pe w in
+    ()
   | Fulfilled v -> w (Ok v)
   | Rejected e -> w (Error e)
 
@@ -631,17 +739,14 @@ let apply (f : 'a -> 'b t) (v : 'a) : 'b t =
    make [result]'s cancellation follow [p'] (Lwt: cancelling a derived promise
    cancels its current source; the rejection then flows back through waiters). *)
 (* [forward result p']: [result] resolves as [p'] does. When both are pending,
-   this is Lwt's [make_into_proxy] with the merge direction REVERSED: [p']
-   (the fresh promise a bind continuation just returned) is absorbed into
-   [result] (the older, anchored one): its waiters are moved over (newest
-   first, before [result]'s own — Lwt's merge/LIFO order), its cancel mode is
-   taken (cancelling [result] must reach the {e current} source), and its cell
-   becomes an alias of [result]. A tail-recursive [p >>= loop] therefore keeps
-   a single live promise: each lap's fresh cell is dropped by its creator and
-   collected, instead of chaining (which both a waiter-chain and Lwt's own
-   merge direction would do, the latter saved upstream only by Lwt_main's
-   per-lap [poll] compressing the proxy chain — our scheduler serves pauses
-   without polling the main promise). *)
+   this is Lwt's [make_into_proxy]: [p'], the promise a bind continuation just
+   returned, is absorbed into [result], the older, anchored one. Its waiters are
+   spliced behind [result]'s own (Lwt runs the outer promise's callbacks before
+   the returned promise's), its cancel mode is taken (cancelling [result] must
+   reach the {e current} source), and its cell becomes an alias of [result]. As
+   in Lwt, the fresh cell is the one that becomes the proxy, so a tail-recursive
+   [p >>= loop] keeps a single live promise: each lap's fresh cell is dropped by
+   its creator and collected, and the anchored result never grows a chain. *)
 let forward (type a) (sched : sched) (result : a t) (p' : a t) : unit =
   let rp' = prj p' in
   match rp'.st with
@@ -655,10 +760,9 @@ let forward (type a) (sched : sched) (result : a t) (p' : a t) : unit =
       | Pending pe ->
         check_owner sched pe;
         check_owner sched pe';
-        pe.waiters <- pe'.waiters @ pe.waiters;
-        pe.cancel_waiters <- pe'.cancel_waiters @ pe.cancel_waiters;
+        splice_waiters ~into:pe ~from:pe';
+        pe.cancel_waiters <- pe.cancel_waiters @ pe'.cancel_waiters;
         pe.cancel <- pe'.cancel;
-        pe'.waiters <- [];
         pe'.cancel_waiters <- [];
         pe'.link <- Some r
       | Fulfilled _ | Rejected _ ->
@@ -786,17 +890,23 @@ let both (a : 'a t) (b : 'b t) : ('a * 'b) t =
   result
 
 (* Removable waiters (Lwt's "explicitly removable callbacks"). One shared cell
-   holds [f]; a small wrapper is added to every promise in [ps]. The first
-   resolution runs [f] once and REMOVES the wrapper from the still-pending
+   holds [f]; a small wrapper is linked into every promise in [ps]. The first
+   resolution runs [f] once and UNLINKS the wrapper from the still-pending
    promises, dropping [f] and its captures. Without this, a long-lived promise
    repeatedly passed to [choose]/[pick] (e.g. a server's shutdown promise, one
-   pick per request/connection) accumulates dead waiters without bound — the
+   pick per request/connection) accumulates dead waiters without bound, the
    leak classic Lwt prevents with [clear_explicitly_removable_callback_cell].
+   Each unlink is O(1), where classic Lwt clears a shared cell and rebuilds the
+   list every forty-second time, so ten thousand concurrent picks against one
+   promise cost the same per pick as one.
    Returns the remover, for mirrors ([protected]) that must detach on
    cancellation; calling it after the waiter fired is a no-op. *)
 let add_removable_waiter_to_each_of (sched : sched) (ps : 'a t list)
     (f : ('a, exn) result -> unit) : unit -> unit =
   let cell = ref (Some f) in
+  (* Each node with its promise: unlinking needs the record the node lives in
+     NOW, which [forward] may have moved it to, and [prj] finds that record. *)
+  let nodes = ref [] in
   let rec wrapper r =
     match !cell with
     | None -> ()
@@ -811,15 +921,23 @@ let add_removable_waiter_to_each_of (sched : sched) (ps : 'a t list)
       (* The promise being resolved is no longer [Pending], so this never
          mutates a waiter list while [run_resolution_callbacks] iterates it. *)
       List.iter
-        (fun p ->
+        (fun (p, node) ->
           match (prj p).st with
           | Pending pe ->
             check_owner sched pe;
-            pe.waiters <- List.filter (fun w -> w != wrapper) pe.waiters
+            unlink_waiter pe node
           | Fulfilled _ | Rejected _ -> ())
-        ps
+        !nodes
   in
-  List.iter (fun p -> add_waiter sched p wrapper) ps;
+  List.iter
+    (fun p ->
+      match (prj p).st with
+      | Pending pe ->
+        check_owner sched pe;
+        nodes := (p, link_waiter pe wrapper) :: !nodes
+      | Fulfilled v -> wrapper (Ok v)
+      | Rejected e -> wrapper (Error e))
+    ps;
   remove
 
 (* Among already-resolved promises, Lwt's [choose]/[pick] prefer a {e rejection};

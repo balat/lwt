@@ -17,4 +17,5 @@ Test.run "core"
     Test_lwt_sequence.suite;
     Test_lwt_seq.suite_base;
     Test_lwt_seq.suite_fuzzing;
+    Test_lwt_waiters.suite;
   ])
