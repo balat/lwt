@@ -903,6 +903,22 @@ static void channel_close_transport(struct notification_channel *chan) {
 
 #endif /* defined(LWT_ON_WINDOWS) */
 
+/* Moves a transport opened on the stack into a channel. */
+static void channel_adopt_transport(struct notification_channel *chan,
+                                    const struct notification_channel *t) {
+  chan->mode = t->mode;
+  chan->send = t->send;
+  chan->recv = t->recv;
+#if defined(LWT_ON_WINDOWS)
+  chan->socket_r = t->socket_r;
+  chan->socket_w = t->socket_w;
+#else
+  chan->fd = t->fd;
+  chan->fds[0] = t->fds[0];
+  chan->fds[1] = t->fds[1];
+#endif
+}
+
 /* Creates a channel for the calling loop and returns (descriptor, index). The
    index is the caller's handle on it, and the only thing OCaml needs to keep. */
 CAMLprim value lwt_unix_new_notification_channel(value unit) {
@@ -910,6 +926,14 @@ CAMLprim value lwt_unix_new_notification_channel(value unit) {
   CAMLlocal2(result, fd);
   int i, found = -1;
   struct notification_channel *chan;
+  struct notification_channel transport;
+
+  /* The transport is opened BEFORE the table is locked, into a channel on the
+     stack: opening it can fail (running out of descriptors is the usual way),
+     and failing raises. Raising with the mutex held would hang every loop
+     created or retired from then on, which is a worse outcome than the EMFILE. */
+  memset((void *)&transport, 0, sizeof(struct notification_channel));
+  fd = channel_open_transport(&transport);
 
   lwt_unix_mutex_lock(&notification_channels_mutex);
   for (i = 0; i < LWT_NOTIFICATION_CHANNELS; i++) {
@@ -921,6 +945,7 @@ CAMLprim value lwt_unix_new_notification_channel(value unit) {
   }
   if (found == -1) {
     lwt_unix_mutex_unlock(&notification_channels_mutex);
+    channel_close_transport(&transport);
     caml_failwith(
         "Lwt_unix: too many notification channels (one per Lwt loop; raise "
         "LWT_NOTIFICATION_CHANNELS)");
@@ -945,9 +970,7 @@ CAMLprim value lwt_unix_new_notification_channel(value unit) {
         (chan->generation + 1) & (unsigned)LWT_NOTIFICATION_GEN_MASK;
   }
   chan->index = 0;
-  chan->mode = NOTIFICATION_MODE_NONE;
-
-  fd = channel_open_transport(chan);
+  channel_adopt_transport(chan, &transport);
 
   /* Published last, and in_use last of all: [channel_of_id] reads this slot
      without the mutex, so nothing may name the channel before it is complete. */
