@@ -3,8 +3,9 @@
     Using this module you can write code in direct style (using loops,
     exceptions handlers, etc.) in an Lwt codebase. Direct-style sections are
     typically enclosed in a call to {!spawn}, and they may {!await} on
-    promises; {!await} also works in any callback the event loop runs, and at
-    top level, see its documentation. For example:
+    promises; {!await} also works in any callback the event loop runs, see its
+    documentation, and a direct-style program starts with {!main}. For
+    example:
 
     {[
     open Lwt_direct
@@ -94,12 +95,19 @@ val await : 'a Lwt.t -> 'a
     their own task.) When that matters, start a task with {!spawn} inside the
     callback.
 
-    With no event loop running on the current domain, [await p] runs
-    {!Lwt_main.run}[ p]: a direct-style program needs no [Lwt_main.run] of its
-    own. An await from a callback that the engine invokes from C (as the libev
-    engine does) raises [Failure], because an effect cannot cross a C frame; the
+    [await] needs an event loop running on the current domain, that is a
+    surrounding {!Lwt_main.run} or {!main}; otherwise it raises [Failure]. It
+    also raises [Failure] from a callback that the engine invokes from C (as
+    the libev engine does), because an effect cannot cross a C frame; the
     callbacks of promises are never in that position, only a callback handed
     directly to {!Lwt_engine} is. *)
+
+val main : (unit -> 'a) -> 'a
+(** [main f] runs the event loop until [f ()], started as a task with
+    {!spawn}, returns, and returns its result, or raises the exception it
+    raised. It is {!Lwt_main.run}[ (spawn f)]: the entry point of a program
+    written in direct style, as [Lwt_main.run] is the entry point of a program
+    written with promises. *)
 
 exception Suspension_forbidden
 (** Raised by {!await} and {!yield} inside a {!no_await} region, at the point
