@@ -62,12 +62,20 @@ class virtual abstract = object(self)
   val timers = Lwt_sequence.create ()
   (* Sequence of timers. *)
 
+  val mutable destroyed = false
+  (* Destroying twice must be harmless: [set] destroys the engine it replaces,
+     and a domain's exit destroys whatever engine it has then. For libev the
+     second destruction would free the loop a second time. *)
+
   method destroy =
-    Lwt_sequence.iter_l (fun (_fd, _f, _g, ev) -> stop_event ev) readables;
-    Lwt_sequence.iter_l (fun (_fd, _f, _g, ev) -> stop_event ev) writables;
-    Lwt_sequence.iter_l (fun (_delay, _repeat, _f, _g, ev) -> stop_event ev)
-      timers;
-    self#cleanup
+    if not destroyed then begin
+      destroyed <- true;
+      Lwt_sequence.iter_l (fun (_fd, _f, _g, ev) -> stop_event ev) readables;
+      Lwt_sequence.iter_l (fun (_fd, _f, _g, ev) -> stop_event ev) writables;
+      Lwt_sequence.iter_l (fun (_delay, _repeat, _f, _g, ev) -> stop_event ev)
+        timers;
+      self#cleanup
+    end
 
   method transfer (engine : abstract) =
     Lwt_sequence.iter_l (fun (fd, f, _g, ev) ->
@@ -446,6 +454,13 @@ end
    module. *)
 [@@@alert "-lwt_internal"]
 
+(* What a domain's exit destroys is the engine the domain has THEN, which is
+   not the one created here if the program called [set] meanwhile. Destroying
+   the initial one again freed its libev loop a second time, and the engine
+   installed by [set] leaked. A forward reference, because the hook is
+   registered from inside the slot's own initialiser. *)
+let destroy_current : (unit -> unit) ref = ref (fun () -> ())
+
 let current : t Lwt_dls.t =
   Lwt_dls.new_key (fun () ->
     let engine =
@@ -468,10 +483,16 @@ let current : t Lwt_dls.t =
        drain, then channel, then engine, which is the order in which they stop
        being needed. *)
     if not (Lwt_dls.is_main_domain ()) then
-      Lwt_dls.at_domain_exit (fun () -> engine#destroy);
+      Lwt_dls.at_domain_exit (fun () ->
+        !destroy_current ();
+        (* And this one, in case [set ~destroy:false] left it aside: nothing of
+           this domain can use it any more, and destroying is idempotent. *)
+        engine#destroy);
     engine)
 
 let get () = Lwt_dls.get current
+
+let () = destroy_current := fun () -> (get ())#destroy
 
 let set ?(transfer=true) ?(destroy=true) engine =
   let previous = Lwt_dls.get current in
