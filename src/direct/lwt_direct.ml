@@ -39,6 +39,20 @@ type _ Effect.t +=
   | Await : 'a Lwt.t -> 'a Effect.t
   | Yield : unit Effect.t
 
+(* A perform with no handler on the stack raises [Effect.Unhandled] at the
+   point of the perform. Two situations lead there, and the message names
+   both: no event loop is running on this domain, or a C frame stands between
+   the caller and the loop's handler, since an effect cannot be performed
+   across a C call (the libev engine invokes through [caml_callback] the
+   callbacks handed directly to [Lwt_engine]). *)
+let no_handler fname =
+  failwith
+    (fname
+    ^ ": no scheduler handler on the current stack. Either no event loop is 
+       running on this domain (start one with Lwt_direct.main or 
+       Lwt_main.run), or this callback was invoked from C code, across which 
+       an effect cannot be performed.")
+
 let await (fut : 'a Lwt.t) : 'a =
   match Lwt.state fut with
   | Lwt.Return x -> x
@@ -46,22 +60,12 @@ let await (fut : 'a Lwt.t) : 'a =
   | Lwt.Sleep -> (
     match Effect.perform (Await fut) with
     | v -> v
-    | exception Effect.Unhandled (Await _) ->
-      (* No handler on this stack. Either no Lwt loop is running on this
-         domain (a direct-style program awaiting at top level, where running
-         the loop until [fut] settles is exactly what is meant), or a C frame
-         stands between us and the loop's handler: an effect cannot be
-         performed across a C call, and the libev engine invokes its watcher
-         callbacks through [caml_callback]. In the latter case [Lwt_main.run]
-         refuses to nest, and we turn its message into ours. *)
-      (try Lwt_main.run fut with
-       | Failure msg when String.length msg >= 6 && String.sub msg 0 6 = "Nested" ->
-         failwith
-           "Lwt_direct.await: no effect handler on the current stack while \
-            Lwt_main.run is running on this domain; an await cannot be \
-            performed from a callback invoked by C code (libev engine?)"))
+    | exception Effect.Unhandled (Await _) -> no_handler "Lwt_direct.await")
 
-let yield () : unit = Effect.perform Yield
+let yield () : unit =
+  match Effect.perform Yield with
+  | () -> ()
+  | exception Effect.Unhandled Yield -> no_handler "Lwt_direct.yield"
 
 (* A region where suspension is forbidden: the nearest handler wins, so an
    [await] on a pending promise (or a [yield]) anywhere below [f], at any depth,
@@ -142,6 +146,10 @@ let run_inside_effect_handler_in_the_background_ f () : unit =
 
 let spawn_in_the_background f : unit =
   push_task (run_inside_effect_handler_in_the_background_ f)
+
+(* part 4 (coda): the entry point of a direct-style program *)
+
+let main f = Lwt_main.run (spawn f)
 
 [@@@alert "-trespassing"]
 (* part 5: await anywhere, by running the scheduler loop under the handler *)
