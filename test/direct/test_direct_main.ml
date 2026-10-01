@@ -33,10 +33,26 @@ let () =
      ok "yield with no loop raises Failure naming itself")
 
 let () =
-  (* An exception escaping a resumed callback escapes Lwt_main.run, as an
-     exception escaping any callback does in Lwt. *)
+  (* What escapes a resumed callback goes where it would have gone had the
+     callback not suspended. An ordinary exception is caught by the callback's
+     own wrapper: [on_success] hands it to [Lwt.async_exception_hook]. *)
+  let seen = ref None in
+  let hook = !Lwt.async_exception_hook in
+  Lwt.async_exception_hook := (fun e -> seen := Some e);
   let p = Lwt.pause () in
   Lwt.on_success p (fun () -> Lwt_direct.await (Lwt_unix.sleep 1e-3); raise Exit);
+  Lwt_main.run (Lwt_unix.sleep 0.01);
+  Lwt.async_exception_hook := hook;
+  (match !seen with
+   | Some Exit -> ok "an exception out of a resumed on_success callback reaches the hook"
+   | _ -> fail "the exception out of the resumed callback did not reach the hook");
+  (* A runtime exception, which the exception filter lets through every
+     wrapper, escapes Lwt_main.run as it does in Lwt without any suspension:
+     the resumption must not swallow it into the hook. Last, since Lwt_main.run
+     cannot clear its running flag on that path. *)
+  let p = Lwt.pause () in
+  Lwt.on_success p (fun () -> Lwt_direct.await (Lwt_unix.sleep 1e-3); raise Stack_overflow);
   match Lwt_main.run (Lwt_unix.sleep 0.05) with
-  | () -> fail "the exception out of the resumed callback did not escape"
-  | exception Exit -> ok "an exception out of a resumed callback escapes Lwt_main.run"
+  | () -> fail "the runtime exception out of the resumed callback did not escape"
+  | exception Stack_overflow ->
+    ok "a runtime exception out of a resumed callback escapes Lwt_main.run"
