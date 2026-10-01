@@ -73,6 +73,59 @@ let () =
   check "and the departed loops did not receive anything"
     (not (Atomic.get got_b));
 
+  (* Two loops changing their subscriptions to the same signal at the same time.
+     Whether a loop is the first subscriber, and installs the process-wide
+     handler, or the last to leave, and uninstalls it, is decided by counting
+     the table; if the count and the change are not one step, a loop that is
+     subscribed can be left with no handler at all, and then the signal is
+     ignored or kills the process. SIGCHLD is subscribed by every loop and
+     dropped by every departing one, so this is the ordinary life of a program
+     with short-lived domains.
+
+     One domain churns, subscribing and unsubscribing as fast as it can; the
+     other subscribes, sends the signal to the process and waits for its own
+     handler, round after round. SIGURG, because its default action is to be
+     ignored: a lost handler then shows as a round that times out, not as a dead
+     test process. *)
+  let rounds = 200 in
+  let done_ = Atomic.make false in
+  let churner =
+    Domain.spawn (fun () ->
+      let n = ref 0 in
+      while not (Atomic.get done_) do
+        let id = Lwt_unix.on_signal Sys.sigurg (fun _ -> ()) in
+        Lwt_unix.disable_signal_handler id;
+        incr n
+      done;
+      !n)
+  in
+  let received =
+    Domain.spawn (fun () ->
+      let received = ref 0 in
+      for _ = 1 to rounds do
+        let got = ref false in
+        let id = Lwt_unix.on_signal Sys.sigurg (fun _ -> got := true) in
+        Unix.kill (Unix.getpid ()) Sys.sigurg;
+        let rec spin n =
+          if !got || n = 0 then ()
+          else begin
+            Lwt_main.run (Lwt_unix.sleep 0.002);
+            spin (n - 1)
+          end
+        in
+        spin 500;
+        if !got then incr received;
+        Lwt_unix.disable_signal_handler id
+      done;
+      Atomic.set done_ true;
+      !received)
+  in
+  let received = Domain.join received in
+  let churned = Domain.join churner in
+  check "a loop subscribing while another churns always has a handler"
+    (received = rounds);
+  check "the churning loop did churn" (churned > 0);
+
   (* A departed loop's subscription must go with it, and the process-wide handler
      with the last of them. Otherwise the signal keeps being swallowed by a
      handler nobody listens to, which is not a leak you notice until a program
