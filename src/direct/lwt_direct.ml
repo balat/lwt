@@ -25,6 +25,12 @@ let[@inline] push_task f : unit =
       (* TODO 6.0: this and other try-with: respect exception-filter *)
       !Lwt.async_exception_hook exn)
 
+(* The resolution state of the scheduler (callback depth, storage, cascades
+   in progress) is stack-shaped and travels with a suspended fiber: [suspend]
+   right after capturing a continuation, [resume] around its resumption. *)
+let suspend = Lwt.Private.scheduler_suspend
+let resume = Lwt.Private.scheduler_resume
+
 [@@@alert "+trespassing"]
 
 (* part 2: effects, performing them *)
@@ -88,8 +94,6 @@ module Storage = struct
   let reset_to_empty () =
     let open Lwt_storage in
     set_current_storage empty_storage
-  let save_current () = Lwt_storage.get_current_storage ()
-  let restore_current saved = Lwt_storage.set_current_storage saved
 end
 
 (* part 3: handling effects *)
@@ -102,18 +106,15 @@ let with_effect_handler (f : unit -> unit) : unit =
   match f () with
   | () -> ()
   | effect Yield, k ->
-    (* [push_task] runs the thunk under the storage current at the push,
-       i.e. this fiber's storage — no explicit capture needed. *)
-    push_task (fun () -> Effect.Deep.continue k ())
+    let st = suspend () in
+    push_task (fun () -> resume st (fun () -> Effect.Deep.continue k ()))
   | effect Await fut, k ->
-    (* The [on_any] callback fires at resolution time, under the RESOLVER's
-       storage: capture this fiber's storage explicitly. *)
-    let storage = Storage.save_current () in
+    let st = suspend () in
     Lwt.on_any fut
       (fun res -> push_task (fun () ->
-        Storage.restore_current storage; Effect.Deep.continue k res))
+        resume st (fun () -> Effect.Deep.continue k res)))
       (fun exn -> push_task (fun () ->
-        Storage.restore_current storage; Effect.Deep.discontinue k exn))
+        resume st (fun () -> Effect.Deep.discontinue k exn)))
 
 (* part 4: putting it all together: running tasks *)
 
@@ -177,16 +178,18 @@ let rec drive (loop : unit -> unit) : unit =
     | () -> `Done
     | effect Yield, k ->
       retire_if_drainer ();
-      push_task (fun () -> ignore (Effect.Deep.continue k ()));
+      let st = suspend () in
+      push_task (fun () ->
+        resume st (fun () -> ignore (Effect.Deep.continue k ())));
       `Suspended
     | effect Await fut, k ->
       retire_if_drainer ();
-      let storage = Storage.save_current () in
+      let st = suspend () in
       Lwt.on_any fut
         (fun res -> push_task (fun () ->
-          Storage.restore_current storage; ignore (Effect.Deep.continue k res)))
+          resume st (fun () -> ignore (Effect.Deep.continue k res))))
         (fun exn -> push_task (fun () ->
-          Storage.restore_current storage; ignore (Effect.Deep.discontinue k exn)));
+          resume st (fun () -> ignore (Effect.Deep.discontinue k exn))));
       `Suspended
   in
   match outcome with
