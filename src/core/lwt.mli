@@ -2188,6 +2188,17 @@ module Private : sig
       the suspended fiber), then puts the resumer's own state back, whether
       [f] returned or raised. *)
 
+  val no_suspend : (unit -> 'a) -> 'a
+  (** [no_suspend f] runs [f ()] in a region where suspending the current
+      task is an error: a direct-style layer that would suspend raises instead
+      (see {!suspension_forbidden}). Regions nest. For [Lwt_react], whose
+      setters open one around the propagation they start, and for
+      [Lwt_direct.no_await]. *)
+
+  val suspension_forbidden : unit -> bool
+  (** Whether the current task is inside a {!no_suspend} region. A
+      direct-style layer consults it right before suspending. *)
+
   val promise_owner_domain : 'a t -> int option
   (** The identifier of the domain that owns [p], or [None] if [p] is already
       resolved and therefore owned by nobody.
