@@ -57,6 +57,19 @@ let await (fut : 'a Lwt.t) : 'a =
 
 let yield () : unit = Effect.perform Yield
 
+(* A region where suspension is forbidden: the nearest handler wins, so an
+   [await] on a pending promise (or a [yield]) anywhere below [f], at any depth,
+   reaches this handler first and is turned into an exception raised at the
+   point of the call. A [spawn] started inside the region only pushes a task; its
+   body runs later, outside the region. *)
+exception Suspension_forbidden
+
+let no_await (f : unit -> 'a) : 'a =
+  match f () with
+  | v -> v
+  | effect Await _, k -> Effect.Deep.discontinue k Suspension_forbidden
+  | effect Yield, k -> Effect.Deep.discontinue k Suspension_forbidden
+
 (* interlude: task-local storage helpers *)
 
 module Storage = struct

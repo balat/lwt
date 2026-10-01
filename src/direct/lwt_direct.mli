@@ -101,6 +101,27 @@ val await : 'a Lwt.t -> 'a
     callbacks of promises are never in that position, only a callback handed
     directly to {!Lwt_engine} is. *)
 
+exception Suspension_forbidden
+(** Raised by {!await} and {!yield} inside a {!no_await} region, at the point
+    of the call, when the awaited promise is not resolved yet. *)
+
+val no_await : (unit -> 'a) -> 'a
+(** [no_await f] runs [f ()] and forbids suspension during it: an {!await} on a
+    promise that is not resolved yet, or a {!yield}, performed by [f] or by
+    anything [f] calls, at any depth, raises {!Suspension_forbidden} at the
+    point of the call instead of suspending the task. An {!await} on a promise
+    that is already resolved returns its value as usual.
+
+    This is for code that must run without interleaving and cannot know what
+    its callbacks do: a reactive update cycle, the critical section of a data
+    structure. Once {!await} is in use, the types no longer say whether a call
+    may suspend; [no_await] says it dynamically, where it matters, and turns a
+    silent interleaving into an exception.
+
+    Tasks started inside the region with {!spawn} or
+    {!spawn_in_the_background} run later, as tasks of their own, and are not
+    affected. *)
+
 (** Local storage.
 
     This storage is the same as the one described with {!Lwt.key},
