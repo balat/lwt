@@ -5,7 +5,7 @@
   * The Lwt core (module Lwt) is reimplemented behind the unchanged lwt.mli:
     existing code, including the ppx and Lwt_react, runs unchanged (the whole
     historical test suite passes identically). A promise is now a flat mutable
-    cell with a flat list of waiters, with no proxy machinery and no callback
+    cell with a doubly-linked list of waiters, with no proxy machinery and no callback
     trees. A bind on an already-resolved promise is a plain application and
     allocates nothing, so it is about twice as fast, with 25 words down to 9;
     tail-recursive bind loops remain O(1) in live memory; and callbacks are
