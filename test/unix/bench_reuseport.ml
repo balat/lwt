@@ -50,7 +50,7 @@ let listener port =
 
 let worker port =
   if (try Sys.getenv "LWT_BENCH_URING" = "1" with Not_found -> false) then
-    Lwt_uring.set ();
+    Reuseport_engine.install ();
   Lwt_main.run
     (listener port >>= fun sock ->
      let rec accept_loop () =
