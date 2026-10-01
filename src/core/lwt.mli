@@ -2132,6 +2132,28 @@ module Private : sig
       ([Lwt_direct]) to schedule their continuations without an
       intermediate task queue. *)
 
+  val scheduler_set_runner : ((unit -> unit) -> unit) -> unit
+  (** [scheduler_set_runner r] makes [scheduler_run] execute the scheduler loop
+      as [r loop] instead of [loop ()]. A direct-style layer installs a runner
+      that runs [loop] under its effect handler, so that an [await] performed by
+      any callback the loop runs is handled, and that calls [loop] again after
+      each suspension of the fiber running it (see {!scheduler_retire_drainer}).
+      Process-wide, like {!Lwt.async_exception_hook}: set it at module
+      initialisation, before any domain is spawned. *)
+
+  val scheduler_drainer_gen : unit -> int
+  (** The generation of the loop pass currently draining this domain's run
+      queue. A runner reads it when it starts a pass, and compares it when the
+      fiber running that pass is suspended: equal means that fiber was the
+      current drainer, and the runner must retire it and start a new pass. *)
+
+  val scheduler_retire_drainer : unit -> unit
+  (** Ends the current loop pass as soon as the task it is running finishes
+      (bumps {!scheduler_drainer_gen}). Called by a runner when it suspends the
+      drainer's fiber and is about to start a new pass; the suspended pass, once
+      resumed, then returns to whoever resumed it instead of draining the queue
+      on top of the new pass. *)
+
   val promise_owner_domain : 'a t -> int option
   (** The identifier of the domain that owns [p], or [None] if [p] is already
       resolved and therefore owned by nobody.
