@@ -248,6 +248,11 @@ and sched = {
        nothing left to wait for. [Lwt_main] installs its own, driving the
        engine. It takes the scheduler so that serving pauses costs one lookup
        per [run] rather than one per lap. *)
+  mutable drainer_gen : int;
+    (* Generation of the pass currently draining the run queue, i.e. of the
+       fiber running [run_scheduler]. Bumped by [retire_drainer] when a
+       direct-style layer suspends that fiber, so that once resumed it ends
+       after its task instead of competing with the new drainer. *)
 }
 
 exception Canceled
@@ -371,6 +376,7 @@ let new_sched () : sched =
     pause_notifier = None;
     on_reset = ignore;
     idle = (fun s -> !default_idle s);
+    drainer_gen = 0;
   }
 
 (* S1 step 3: the record moves into a per-domain slot. This is the whole of the
@@ -1036,6 +1042,22 @@ let abandon_paused () =
   sched.paused <- [];
   sched.paused_n <- 0
 
+(* How [run] executes the scheduler loop. The default runs it plainly. A
+   direct-style layer ([Lwt_direct]) installs a runner that runs the loop under
+   its effect handler and starts a new pass whenever the fiber draining the
+   queue is suspended by an [await]: that is what lets [await] work in any
+   callback, not only inside [Lwt_direct.spawn]. Process-wide and set at module
+   initialisation, like [async_exception_hook]: it is a property of the program,
+   not of a scheduler. The core itself performs no effect, so it still builds
+   and runs on OCaml 4.14, where no layer ever installs a runner. *)
+let runner : ((unit -> unit) -> unit) ref = ref (fun loop -> loop ())
+
+(* Tell the pass currently draining the run queue to stop after its task. The
+   direct-style layer calls this when it suspends the drainer's fiber, right
+   before starting a new pass through [runner]; see [run_scheduler]. *)
+let retire_drainer (sched : sched) : unit =
+  sched.drainer_gen <- sched.drainer_gen + 1
+
 (* ------------------------------------------------------------------ *)
 (* The scheduler loop                                                 *)
 (* ------------------------------------------------------------------ *)
@@ -1067,22 +1089,35 @@ let () = default_idle := core_idle
    so back ends are unaffected; the record is threaded on our side only. *)
 let set_idle (f : unit -> bool) : unit = (self_sched ()).idle <- fun _ -> f ()
 
-let rec run_scheduler (sched : sched) : unit =
-  if Run_queue.is_empty sched.queue then begin
-    (* Run queue drained: advance the world by one lap through the idle hook.
-       The hook serves at most one paused batch (and, for a backend, one engine
-       iteration) before returning here — so under a sustained stream of pauses
-       the engine still runs once per batch instead of after the whole pause
-       cascade settles. Returns [false] only when there is nothing left to do. *)
-    if sched.idle sched then run_scheduler sched
-  end
-  else begin
-    (match Run_queue.pop sched.queue with
-    | Thunk (s, f) ->
-      sched.storage <- s;
-      f ());
-    run_scheduler sched
-  end
+let run_scheduler (sched : sched) : unit =
+  (* One pass of the loop is bound to the fiber that runs it: [gen] identifies
+     that fiber as the current drainer. When a direct-style layer suspends the
+     drainer (an [await] performed by a callback the loop was running), it
+     retires it ([retire_drainer]) and starts a new pass through [runner]; the
+     suspended pass must then end as soon as its fiber is resumed and its task
+     has finished, otherwise two passes would drain the same queue, the resumed
+     one sitting on top of the resumer's stack. The check is one load and one
+     compare per task; without a direct-style layer [gen] never changes. *)
+  let gen = sched.drainer_gen in
+  let rec loop () =
+    if Run_queue.is_empty sched.queue then begin
+      (* Run queue drained: advance the world by one lap through the idle hook.
+         The hook serves at most one paused batch (and, for a backend, one
+         engine iteration) before returning here, so under a sustained stream
+         of pauses the engine still runs once per batch instead of after the
+         whole pause cascade settles. Returns [false] only when there is
+         nothing left to do. *)
+      if sched.idle sched && sched.drainer_gen = gen then loop ()
+    end
+    else begin
+      (match Run_queue.pop sched.queue with
+      | Thunk (s, f) ->
+        sched.storage <- s;
+        f ());
+      if sched.drainer_gen = gen then loop ()
+    end
+  in
+  loop ()
 
 let run (type a) (main : unit -> a t) : a =
   (* ONE lookup for the whole run: everything below is threaded. *)
@@ -1108,7 +1143,7 @@ let run (type a) (main : unit -> a t) : a =
     | exception e when Exception_filter.run e ->
       raw_bt := Some (Printexc.get_raw_backtrace ());
       outcome := Some (Error e));
-  run_scheduler sched;
+  !runner (fun () -> run_scheduler sched);
   match !outcome with
   | Some (Ok v) -> v
   | Some (Error e) ->
@@ -1680,6 +1715,12 @@ module Private = struct
   let scheduler_set_idle = set_idle
   let scheduler_queue_is_empty () = Run_queue.is_empty (self_sched ()).queue
   let scheduler_enqueue = enqueue
+
+  (* The loop runner and the drainer generation, for a direct-style layer that
+     wants [await] to work in any callback: see [run_scheduler] and [runner]. *)
+  let scheduler_set_runner f = runner := f
+  let scheduler_drainer_gen () = (self_sched ()).drainer_gen
+  let scheduler_retire_drainer () = retire_drainer (self_sched ())
 
   (* Which domain owns a PENDING promise, for the one layer that needs to ask:
      adopting a foreign promise means getting its owner to attach the callback,
