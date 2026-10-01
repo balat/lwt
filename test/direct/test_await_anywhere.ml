@@ -169,4 +169,66 @@ let anywhere_suite = suite "await anywhere" [
   end;
 ]
 
-let suites = [anywhere_suite]
+let no_await_suite = suite "no_await" [
+  test "an await on a pending promise raises at the await" begin fun () ->
+    Lwt.pause () >|= fun () ->
+    Lwt_direct.no_await (fun () ->
+      match await (Lwt_unix.sleep 1e-3) with
+      | () -> false
+      | exception Lwt_direct.Suspension_forbidden -> true)
+  end;
+
+  test "an await on a resolved promise is allowed" begin fun () ->
+    Lwt.pause () >|= fun () ->
+    Lwt_direct.no_await (fun () -> await (Lwt.return 3)) = 3
+  end;
+
+  test "yield raises too" begin fun () ->
+    Lwt.pause () >|= fun () ->
+    Lwt_direct.no_await (fun () ->
+      match Lwt_direct.yield () with
+      | () -> false
+      | exception Lwt_direct.Suspension_forbidden -> true)
+  end;
+
+  test "uncaught, the exception leaves the region" begin fun () ->
+    Lwt.pause () >|= fun () ->
+    match Lwt_direct.no_await (fun () -> await (Lwt.pause ())) with
+    | () -> false
+    | exception Lwt_direct.Suspension_forbidden -> true
+  end;
+
+  test "it applies at any depth, through a callback of a stdlib iterator" begin fun () ->
+    Lwt.pause () >|= fun () ->
+    let h = Hashtbl.create 3 in
+    Hashtbl.replace h 1 (); Hashtbl.replace h 2 ();
+    match Lwt_direct.no_await (fun () ->
+      Hashtbl.iter (fun _ () -> await (Lwt_unix.sleep 1e-3)) h) with
+    | () -> false
+    | exception Lwt_direct.Suspension_forbidden -> true
+  end;
+
+  test "inside a spawn body, the region still wins" begin fun () ->
+    Lwt_direct.spawn (fun () ->
+      Lwt_direct.no_await (fun () ->
+        match await (Lwt_unix.sleep 1e-3) with
+        | () -> false
+        | exception Lwt_direct.Suspension_forbidden -> true))
+  end;
+
+  test "a task spawned inside the region is not affected" begin fun () ->
+    Lwt.pause () >>= fun () ->
+    let p = Lwt_direct.no_await (fun () ->
+      Lwt_direct.spawn (fun () -> await (Lwt_unix.sleep 1e-3); 5)) in
+    p >|= fun v -> v = 5
+  end;
+
+  test "the region ends with its function" begin fun () ->
+    Lwt.pause () >|= fun () ->
+    Lwt_direct.no_await (fun () -> ());
+    await (Lwt_unix.sleep 1e-3);
+    true
+  end;
+]
+
+let suites = [anywhere_suite; no_await_suite]
