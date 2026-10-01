@@ -31,6 +31,12 @@ let[@inline] push_task f : unit =
 let suspend = Lwt.Private.scheduler_suspend
 let resume = Lwt.Private.scheduler_resume
 
+(* Resumptions go through the queue unprotected: an exception escaping a
+   resumed callback propagates out of the pass, hence out of [Lwt_main.run],
+   as an exception escaping any callback does in Lwt. A spawned task catches
+   its own, in its wrapper, before it can get here. *)
+let push_resume f : unit = Lwt.Private.scheduler_enqueue f
+
 [@@@alert "+trespassing"]
 
 (* part 2: effects, performing them *)
@@ -111,13 +117,13 @@ let with_effect_handler (f : unit -> unit) : unit =
   | () -> ()
   | effect Yield, k ->
     let st = suspend () in
-    push_task (fun () -> resume st (fun () -> Effect.Deep.continue k ()))
+    push_resume (fun () -> resume st (fun () -> Effect.Deep.continue k ()))
   | effect Await fut, k ->
     let st = suspend () in
     Lwt.on_any fut
-      (fun res -> push_task (fun () ->
+      (fun res -> push_resume (fun () ->
         resume st (fun () -> Effect.Deep.continue k res)))
-      (fun exn -> push_task (fun () ->
+      (fun exn -> push_resume (fun () ->
         resume st (fun () -> Effect.Deep.discontinue k exn)))
 
 (* part 4: putting it all together: running tasks *)
@@ -187,16 +193,16 @@ let rec drive (loop : unit -> unit) : unit =
     | effect Yield, k ->
       retire_if_drainer ();
       let st = suspend () in
-      push_task (fun () ->
+      push_resume (fun () ->
         resume st (fun () -> ignore (Effect.Deep.continue k ())));
       `Suspended
     | effect Await fut, k ->
       retire_if_drainer ();
       let st = suspend () in
       Lwt.on_any fut
-        (fun res -> push_task (fun () ->
+        (fun res -> push_resume (fun () ->
           resume st (fun () -> ignore (Effect.Deep.continue k res))))
-        (fun exn -> push_task (fun () ->
+        (fun exn -> push_resume (fun () ->
           resume st (fun () -> ignore (Effect.Deep.discontinue k exn))));
       `Suspended
   in
