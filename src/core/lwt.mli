@@ -2161,8 +2161,8 @@ module Private : sig
       that task alone. For the idle hook of a backend; {!wakeup_paused} keeps
       resolving the batch synchronously. *)
 
-  val scheduler_defer_fills : (unit -> 'a) -> 'a
-  (** [scheduler_defer_fills f] runs [f ()] with every promise resolution it
+  val scheduler_defer_fills : ('a -> unit) -> 'a -> unit
+  (** [scheduler_defer_fills f x] runs [f x] with every promise resolution it
       performs queuing its callbacks as a task of the run queue, FIFO, instead
       of running them on the spot (the promise's state is still set at once).
       A backend wraps its engine iteration in it: an engine callback may run on

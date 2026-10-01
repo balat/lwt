@@ -1108,13 +1108,11 @@ let serve_paused_sched (sched : sched) =
    still set at once; only its callbacks move to the queue, in FIFO order, which
    is within what [wakeup_later] promises and invisible to [wakeup]'s callers
    inside the engine. *)
-let defer_fills (sched : sched) (f : unit -> 'a) : 'a =
+let defer_fills (sched : sched) (f : 'a -> unit) (x : 'a) : unit =
   let saved = sched.defer_fills in
   sched.defer_fills <- true;
-  match f () with
-  | v ->
-    sched.defer_fills <- saved;
-    v
+  match f x with
+  | () -> sched.defer_fills <- saved
   | exception e ->
     sched.defer_fills <- saved;
     raise e
@@ -1875,7 +1873,7 @@ module Private = struct
      await without freezing its neighbours or sitting on a C frame; see
      [serve_paused_sched] and [defer_fills]. *)
   let scheduler_serve_paused () = serve_paused_sched (self_sched ())
-  let scheduler_defer_fills f = defer_fills (self_sched ()) f
+  let scheduler_defer_fills f x = defer_fills (self_sched ()) f x
 
   (* The resolution state a suspended fiber takes with it; see [suspend]. *)
   type nonrec resolution_state = resolution_state
