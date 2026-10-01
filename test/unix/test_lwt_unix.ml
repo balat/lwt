@@ -1277,10 +1277,59 @@ let signal_tests = [
   end;
 ]
 
+let fork_tests = [
+  (* The child of a fork keeps everything its loop had set up before: a signal
+     handler, the job pool (run_in_main needs it), and the subscription to
+     SIGCHLD that reaps the child's own children. All of them are notification
+     ids made before the fork, so the child's channel must keep naming them;
+     a child that retired its channel for a fresh one dropped them all, in
+     silence: no signal, no run_in_main, no waitpid. The child continues under
+     the loop it inherited, which is this suite's, and ends with _exit so that
+     the suite's own exit hooks run once, in the parent. *)
+  test "fork: the child keeps its notifications" ~sequential:true
+      ~only_if:(fun () -> not Sys.win32) begin fun () ->
+    let got, resolve_got = Lwt.wait () in
+    let id =
+      Lwt_unix.on_signal Sys.sigurg (fun _ ->
+        if Lwt.is_sleeping got then Lwt.wakeup resolve_got ())
+    in
+    match Lwt_unix.fork () with
+    | 0 ->
+      let outcome =
+        Lwt.catch
+          (fun () ->
+             Unix.kill (Unix.getpid ()) Sys.sigurg;
+             let timeout = Lwt_unix.sleep 2. >|= fun () -> false in
+             Lwt.pick [ (got >|= fun () -> true); timeout ] >>= fun signalled ->
+             let in_main =
+               Lwt_preemptive.detach
+                 (fun () ->
+                    Lwt_preemptive.run_in_main (fun () -> Lwt.return_true))
+                 ()
+             in
+             Lwt.pick [ in_main; Lwt_unix.sleep 2. >|= fun () -> false ]
+             >>= fun ran_in_main ->
+             let reaped =
+               Lwt_process.exec ("", [| "true" |]) >|= fun _ -> true
+             in
+             Lwt.pick [ reaped; Lwt_unix.sleep 2. >|= fun () -> false ]
+             >|= fun reaped ->
+             signalled && ran_in_main && reaped)
+          (fun _ -> Lwt.return_false)
+      in
+      outcome >|= fun ok -> Unix._exit (if ok then 0 else 1)
+    | child ->
+      Lwt_unix.waitpid [] child >|= fun (_, status) ->
+      Lwt_unix.disable_signal_handler id;
+      status = Lwt_unix.WEXITED 0
+  end;
+]
+
 let suite =
   suite "lwt_unix"
     (wait_tests @
      signal_tests @
+     fork_tests @
      openfile_tests @
      utimes_tests @
      readdir_tests @
