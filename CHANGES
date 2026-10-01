@@ -67,6 +67,27 @@
     completion-based I/O backend (such as lwt_uring) to take over read/write and
     connect.
 
+  * Lwt_direct.await works in any callback the event loop runs, not only
+    inside Lwt_direct.spawn: in a bind continuation, an on_success callback,
+    a completion handler. A function written in direct style can then be
+    called from monadic code with no wrapping. An await suspends the current
+    task, that is the callback and whatever called it synchronously; the
+    event loop runs each pause, I/O completion and timer as a task of its
+    own, so an awaiting callback never delays the callbacks of other events,
+    while a callback run synchronously by Lwt.wakeup shares its task with
+    the resolver, which resumes once the await is over. The core still
+    performs no effect: it exposes a loop runner and a generation counter
+    under Lwt.Private, and Lwt_direct installs its handler around each pass
+    of the scheduler loop. With no event loop running on the domain, or from
+    a callback invoked from C (the libev engine does so for callbacks handed
+    directly to Lwt_engine), await and yield raise Failure.
+
+  * Lwt_direct.main, the entry point of a program written in direct style
+    (Lwt_main.run (spawn f)); and Lwt_direct.no_await, a region in which an
+    await on a pending promise, or a yield, raises Suspension_forbidden at
+    the point of the call instead of suspending, for code that must run
+    without interleaving, such as a reactive update cycle.
+
 ====== Fixes ======
 
   * Lwt.key: the sequence-associated storage no longer routes values through a
