@@ -676,6 +676,19 @@ void lwt_unix_send_notification(intnat id) {
     return;
   }
   lwt_unix_mutex_lock(&chan->mutex);
+  /* Checked again under the mutex: the loop may have retired its channel
+     between the lookup above and here. Retiring takes this same mutex, so
+     from this point the transport is ours until we release it. Without this,
+     a sender racing with a loop's exit wrote to a closed descriptor (EBADF
+     out of send_notification, from a thread with no runtime if it was a job
+     worker) or, worse, to whatever file had reused the number. */
+  if (chan->in_use == 0 || chan->generation != LWT_NOTIFICATION_GEN(id)) {
+    lwt_unix_mutex_unlock(&chan->mutex);
+#if !defined(LWT_ON_WINDOWS)
+    pthread_sigmask(SIG_SETMASK, &old_mask, NULL);
+#endif
+    return;
+  }
   if (chan->index > 0) {
     /* There is already a pending notification in the buffer, no
        need to signal the main thread. */
@@ -990,12 +1003,29 @@ CAMLprim value lwt_unix_new_notification_channel(value unit) {
 CAMLprim value lwt_unix_free_notification_channel(value val_index) {
   int i = Int_val(val_index);
   struct notification_channel *chan;
+#if !defined(LWT_ON_WINDOWS)
+  sigset_t new_mask;
+  sigset_t old_mask;
+#endif
   lwt_unix_mutex_lock(&notification_channels_mutex);
   chan = notification_channels[i];
   if (chan != NULL && chan->in_use) {
+    /* Under the channel's own mutex, with signals masked as every taker of
+       that mutex must: a sender that found the channel still in use waits
+       here rather than writing to a closed descriptor, and sees it retired
+       when it gets the mutex. */
+#if !defined(LWT_ON_WINDOWS)
+    sigfillset(&new_mask);
+    pthread_sigmask(SIG_SETMASK, &new_mask, &old_mask);
+#endif
+    lwt_unix_mutex_lock(&chan->mutex);
     chan->in_use = 0;
     chan->index = 0;
     channel_close_transport(chan);
+    lwt_unix_mutex_unlock(&chan->mutex);
+#if !defined(LWT_ON_WINDOWS)
+    pthread_sigmask(SIG_SETMASK, &old_mask, NULL);
+#endif
   }
   lwt_unix_mutex_unlock(&notification_channels_mutex);
   return Val_unit;

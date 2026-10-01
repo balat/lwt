@@ -50,5 +50,47 @@ let () =
   check "the channel still works after the loop restarts"
     (Atomic.get ours = 2);
 
+  (* Sending to a loop that is exiting. Retiring a channel closes its
+     descriptor; a sender that looked the channel up just before must not
+     write to the closed descriptor (EBADF out of send_notification, which from
+     a job worker is a raise with no runtime), nor to whatever reused the
+     number. One domain sends as fast as it can to the current loop's id while
+     loops come and go: no error may come out, and no handler may run on the
+     wrong domain. *)
+  let current : Lwt_unix.notification option Atomic.t = Atomic.make None in
+  let stop = Atomic.make false in
+  let errors = Atomic.make 0 in
+  let sent = Atomic.make 0 in
+  let wrong_domain = Atomic.make 0 in
+  let sender =
+    Domain.spawn (fun () ->
+      while not (Atomic.get stop) do
+        match Atomic.get current with
+        | None -> Domain.cpu_relax ()
+        | Some id ->
+          (match Lwt_unix.send_notification id with
+           | () -> Atomic.incr sent
+           | exception _ -> Atomic.incr errors)
+      done)
+  in
+  for _ = 1 to 300 do
+    Domain.join
+      (Domain.spawn (fun () ->
+         let me = (Domain.self () :> int) in
+         let id =
+           Lwt_unix.make_notification (fun () ->
+             if (Domain.self () :> int) <> me then Atomic.incr wrong_domain)
+         in
+         Atomic.set current (Some id);
+         Lwt_main.run (Lwt.pause ())))
+  done;
+  Atomic.set stop true;
+  Domain.join sender;
+  check "a sender racing with the exit of loops never gets an error"
+    (Atomic.get errors = 0);
+  check "and it did send" (Atomic.get sent > 0);
+  check "no handler ran on another domain than its own"
+    (Atomic.get wrong_domain = 0);
+
   if !failures > 0 then exit 1;
   print_endline "per-domain notification channels: ok"
