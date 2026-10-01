@@ -31,3 +31,12 @@ let () =
    | () -> fail "yield with no loop returned"
    | exception Failure msg when String.length msg > 16 && String.sub msg 0 16 = "Lwt_direct.yield" ->
      ok "yield with no loop raises Failure naming itself")
+
+let () =
+  (* An exception escaping a resumed callback escapes Lwt_main.run, as an
+     exception escaping any callback does in Lwt. *)
+  let p = Lwt.pause () in
+  Lwt.on_success p (fun () -> Lwt_direct.await (Lwt_unix.sleep 1e-3); raise Exit);
+  match Lwt_main.run (Lwt_unix.sleep 0.05) with
+  | () -> fail "the exception out of the resumed callback did not escape"
+  | exception Exit -> ok "an exception out of a resumed callback escapes Lwt_main.run"
