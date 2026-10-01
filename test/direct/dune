@@ -3,7 +3,7 @@
  (modules main test_lwt_direct test_await_anywhere)
  (package lwt_direct)
  (build_if
-  (>= %{ocaml_version} "5.0"))
+  (>= %{ocaml_version} "5.3"))
  (libraries lwt_direct lwt.unix lwttester))
 
 (test
@@ -11,7 +11,7 @@
  (modules test_backtrace)
  (package lwt_direct)
  (build_if
-  (>= %{ocaml_version} "5.0"))
+  (>= %{ocaml_version} "5.3"))
  (libraries lwt_direct lwt.unix))
 
 (test
