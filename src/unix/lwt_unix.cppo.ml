@@ -57,6 +57,8 @@ external new_notification_channel : unit -> Unix.file_descr * int
 
 external free_notification_channel : int -> unit
   = "lwt_unix_free_notification_channel"
+external reset_notification_channel : int -> Unix.file_descr
+  = "lwt_unix_reset_notification_channel"
 
 external send_notification : int -> unit = "lwt_unix_send_notification_stub"
 
@@ -2656,23 +2658,24 @@ let fork () =
     Lwt_engine.fork ();
     (* Reset threading. *)
     reset_after_fork ();
-    (* Replace this domain's notification channel: the inherited descriptors are
+    (* Reset this domain's notification channel: the inherited descriptors are
        the parent's, and its buffer may hold ids the parent will service. The
-       old channel is retired first, which closes those descriptors.
+       channel keeps its slot and its generation, so that the ids handed out
+       before the fork (the signal subscriptions, SIGCHLD included, the job
+       pool's notification, anything made before) still name it in the child.
 
        Only THIS domain's channel is dealt with, which is enough: [fork] is
        refused off the loading domain, and the runtime does not support forking
-       with several domains running, so there is one channel to replace. *)
+       with several domains running, so there is one channel to reset. *)
     let old = Lwt_dls.get notif_slot in
     Lwt_engine.stop_event old.event;
-    free_notification_channel old.chan;
-    let fd, chan = new_notification_channel () in
+    let fd = reset_notification_channel old.chan in
     let event =
-      Lwt_engine.on_readable fd (fun _ -> !drain_notifications chan)
+      Lwt_engine.on_readable fd (fun _ -> !drain_notifications old.chan)
     in
     (* The child keeps the parent's job sequence, which the lines below empty and
-       cancel; only the channel is replaced. *)
-    Lwt_dls.set notif_slot { old with chan; event };
+       cancel; only the transport is replaced. *)
+    Lwt_dls.set notif_slot { old with event };
     (* Collect all pending jobs. *)
     let jobs = (self_notif ()).jobs in
     let l = Lwt_sequence.fold_l (fun (_, f) l -> f :: l) jobs [] in

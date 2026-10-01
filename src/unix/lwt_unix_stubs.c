@@ -1001,6 +1001,33 @@ CAMLprim value lwt_unix_free_notification_channel(value val_index) {
   return Val_unit;
 }
 
+/* For the child of a fork. The transport it inherited is the parent's, and the
+   buffer may hold ids the parent will service, so both are replaced; but the
+   channel keeps its slot and its GENERATION, so that every id handed out before
+   the fork still names it. The subscriptions to signals, the notification of
+   the job pool and every notification made before the fork keep working in the
+   child, as they do upstream with a single channel per process. Retiring the
+   channel and creating a new one instead gave the slot a new generation, and
+   the child silently dropped all of them: a handler for SIGTERM installed
+   before the fork never ran, and SIGCHLD never reached waitpid.
+
+   No mutex: the child has a single thread, and the mutex may have been held by
+   a thread of the parent at the moment of the fork. */
+CAMLprim value lwt_unix_reset_notification_channel(value val_index) {
+  CAMLparam1(val_index);
+  CAMLlocal1(fd);
+  struct notification_channel transport;
+  struct notification_channel *chan = notification_channels[Int_val(val_index)];
+  if (chan == NULL || chan->in_use == 0)
+    caml_failwith("Lwt_unix: resetting a notification channel that is gone");
+  memset((void *)&transport, 0, sizeof(struct notification_channel));
+  fd = channel_open_transport(&transport);
+  channel_close_transport(chan);
+  channel_adopt_transport(chan, &transport);
+  chan->index = 0;
+  CAMLreturn(fd);
+}
+
 /* +-----------------------------------------------------------------+
    | Signals                                                         |
    +-----------------------------------------------------------------+ */
