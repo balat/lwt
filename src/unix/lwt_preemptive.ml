@@ -151,7 +151,15 @@ let pool_slot : pool Lwt_dls.t =
         stopping = Atomic.make false;
         quit = Lwt_unix.make_notification (fun () -> ()) }
     in
-    Lwt_dls.at_domain_exit (fun () -> !shutdown_pool pool);
+    (* Not on the main domain. There, this would run at the exit of the PROCESS,
+       and wait for every detached computation still running, for ever if one
+       of them blocks: a program that detached a read_line or an accept and
+       moved on could never exit. Upstream never waited, and the process does
+       not need to: the kernel ends the threads. A spawned domain has no such
+       way out, since a running thread pins its domain, so there the workers
+       are joined. *)
+    if not (Lwt_dls.is_main_domain ()) then
+      Lwt_dls.at_domain_exit (fun () -> !shutdown_pool pool);
     pool)
 
 let[@inline] self_pool () = Lwt_dls.get pool_slot

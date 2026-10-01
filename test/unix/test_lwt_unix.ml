@@ -6,11 +6,19 @@
 open Test
 open Lwt.Infix
 
-(* An instance of the tester for the wait/waitpid tests. *)
+(* An instance of the tester for the wait/waitpid tests, and one for the
+   busy-detach test: the latter leaves a detached computation running and ends
+   normally, at_exit hooks included. *)
 let () =
   match Sys.argv with
   | [|_; "--child"|] ->
     exit 42
+  | [|_; "--busy-detach"|] ->
+    Lwt_main.run
+      (Lwt.pick
+         [ Lwt_preemptive.detach (fun () -> Unix.sleepf 5.) ();
+           Lwt_unix.sleep 0.05 ]);
+    exit 0
   | _ ->
     ()
 
@@ -1012,6 +1020,25 @@ let dir_tests = [
 ]
 
 let lwt_preemptive_tests = [
+  (* The process must not wait for a detached computation still running when
+     it exits: a program that detached a read_line or an accept and moved on
+     could otherwise never exit. Upstream never waited. The per-loop pool joins
+     its workers at the exit of a SPAWNED domain, which cannot end while a
+     thread runs, but on the main domain that join ran at the exit of the
+     process. Measured on a child process, since the exit is the thing under
+     test. *)
+  test "exit does not wait for a busy detach" ~sequential:true
+      ~only_if:(fun () -> not Sys.win32) begin fun () ->
+    let t0 = Unix.gettimeofday () in
+    let child =
+      Unix.create_process Sys.executable_name
+        [| Sys.executable_name; "--busy-detach" |]
+        Unix.stdin Unix.stdout Unix.stderr
+    in
+    Lwt_unix.waitpid [] child >|= fun (_, status) ->
+    let elapsed = Unix.gettimeofday () -. t0 in
+    status = Lwt_unix.WEXITED 0 && elapsed < 3.
+  end;
   test "run_in_main" begin fun () ->
     let f () =
       Lwt_preemptive.run_in_main (fun () ->
