@@ -612,9 +612,18 @@ static lwt_unix_mutex notification_channels_mutex;
    built here, and OCaml calls this once from [Lwt_unix]'s module initialisation:
    that runs on the main domain, at program startup, before any other domain can
    exist. A no-op wherever the static initialiser did the job. */
+/* The mutex of the signal table, declared here because the Windows initialiser
+   below builds it; what it guards is explained with the table, further down. */
+#if defined(HAVE_PTHREAD)
+static lwt_unix_mutex signal_table_mutex = PTHREAD_MUTEX_INITIALIZER;
+#else
+static lwt_unix_mutex signal_table_mutex;
+#endif
+
 CAMLprim value lwt_unix_init_notifications(value unit) {
 #if !defined(LWT_NOTIFICATION_MUTEX_IS_STATIC)
   lwt_unix_mutex_init(&notification_channels_mutex);
+  lwt_unix_mutex_init(&signal_table_mutex);
 #endif
   return Val_unit;
 }
@@ -1007,8 +1016,18 @@ static void handle_signal(int signum) {
   }
 }
 
-/* How many loops are subscribed to this signal. Called with the runtime lock, so
-   the count is consistent with the writes below. */
+/* Serialises the changes of subscription across loops. Whether a loop is the
+   first subscriber (and installs the process-wide handler) or the last one to
+   leave (and uninstalls it) is decided by counting the table, and the count,
+   the write and the installation must be one step: two loops changing their
+   subscriptions at the same time could otherwise leave a subscribed loop with
+   no handler, SIGCHLD included. The runtime lock orders nothing here, since in
+   OCaml 5 every domain has its own. [handle_signal] never takes this mutex: it
+   only reads the table, one word at a time. The mutex itself is declared next
+   to [lwt_unix_init_notifications], which initialises it on Windows. */
+
+/* How many loops are subscribed to this signal. Called under
+   [signal_table_mutex]. */
 static int signal_subscriber_count(int signum) {
   int i, n = 0;
   for (i = 0; i < LWT_NOTIFICATION_CHANNELS; i++)
@@ -1109,6 +1128,7 @@ CAMLprim value lwt_unix_set_signal(value val_signum, value val_notification, val
   /* The id names the subscribing loop's channel, so it also says where to record
      the subscription. */
   slot = LWT_NOTIFICATION_INDEX(notification);
+  lwt_unix_mutex_lock(&signal_table_mutex);
   first = (signal_subscriber_count(signum) == 0);
   signal_notifications[signum][slot] = notification;
 
@@ -1118,6 +1138,7 @@ CAMLprim value lwt_unix_set_signal(value val_signum, value val_notification, val
     error = install_process_handler(signum, &name);
     if (error != 0) signal_notifications[signum][slot] = 0;
   }
+  lwt_unix_mutex_unlock(&signal_table_mutex);
 
   if (error != 0) raise_handler_error(error, name);
   return Val_unit;
@@ -1132,9 +1153,11 @@ CAMLprim value lwt_unix_remove_signal(value val_signum, value val_notification,
   int signum = caml_convert_signal_number(Int_val(val_signum));
   int slot = LWT_NOTIFICATION_INDEX(Long_val(val_notification));
 
+  lwt_unix_mutex_lock(&signal_table_mutex);
   signal_notifications[signum][slot] = 0;
   if (!Bool_val(val_forwarded) && signal_subscriber_count(signum) == 0)
     uninstall_process_handler(signum);
+  lwt_unix_mutex_unlock(&signal_table_mutex);
   return Val_unit;
 }
 
@@ -1151,8 +1174,10 @@ CAMLprim value lwt_unix_reinstall_signal(value val_signum) {
   if (signum < 0 || signum >= NSIG)
     caml_invalid_argument("Lwt_unix.reinstall_signal_handler: unavailable signal");
 
+  lwt_unix_mutex_lock(&signal_table_mutex);
   if (signal_subscriber_count(signum) > 0)
     error = install_process_handler(signum, &name);
+  lwt_unix_mutex_unlock(&signal_table_mutex);
 
   if (error != 0) raise_handler_error(error, name);
   return Val_unit;
