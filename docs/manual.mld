@@ -630,6 +630,73 @@ let () = Lwt_main.run (Lwt_io.printl "Hello, world!")
   per domain: one loop per domain, and as many domains as you like, which is the
   subject of the next section.
 
+{1:direct_style Direct style with [Lwt_direct] }
+
+  The library [lwt_direct] (OCaml 5.3 or later) lets you write parts of an
+  Lwt program in direct style: with loops, exception handlers and ordinary
+  functions, where a promise is turned into its value by [Lwt_direct.await]
+  instead of being bound with [>>=]. Nothing changes for the rest of the
+  program: [Lwt.bind] and the other primitives are untouched, and a function
+  that may have to wait still returns a promise.
+
+{[
+val Lwt_direct.spawn : (unit -> 'a) -> 'a Lwt.t
+val Lwt_direct.await : 'a Lwt.t -> 'a
+val Lwt_direct.main : (unit -> 'a) -> 'a
+]}
+
+  [await p] returns the value of [p], or raises the exception [p] was rejected
+  with. If [p] is still pending, it suspends the {e current task} until [p] is
+  resolved; other tasks run in the meantime. [spawn f] starts [f ()] as a task
+  of its own and returns a promise of its result, which is how direct-style
+  code is handed to the rest of an Lwt program. [main f] is the entry point of
+  a program written in direct style: [Lwt_main.run (spawn f)].
+
+  [await] can be called from inside a [spawn], and also from any callback the
+  event loop runs: a [bind] continuation, an [on_success] callback. So a
+  function written in direct style is usable from monadic code, and a
+  function expecting ordinary callbacks is usable with promises:
+
+{[
+(* A direct-style function; its type does not say that it waits. *)
+let read_config path =
+  Lwt_direct.await (Lwt_io.with_file ~mode:Input path Lwt_io.read)
+
+(* Called from a bind continuation: no spawn needed. *)
+let main () =
+  Lwt_unix.sleep 1.0 >>= fun () ->
+  let cfg = read_config "server.conf" in
+  start_server cfg
+
+(* Promises with a library that only takes plain callbacks. *)
+let iter_s f h = Lwt_direct.spawn (fun () ->
+  Hashtbl.iter (fun k v -> Lwt_direct.await (f k v)) h)
+]}
+
+  What the current task is decides what an [await] suspends: the callback
+  itself, together with whatever called it synchronously and is still on the
+  stack. The event loop runs the callbacks of each pause, I/O completion and
+  timer as a task of their own, so an awaiting callback never delays the
+  callbacks of other events. A callback run synchronously by [Lwt.wakeup]
+  shares its task with the code that resolved the promise: that code resumes
+  once the await is over. When that matters, start a task with [spawn] inside
+  the callback.
+
+  The price of direct style is that the types no longer say whether a call
+  may suspend. Code that must run without interleaving, such as a reactive
+  update cycle or the critical section of a data structure, can say so
+  dynamically with [Lwt_direct.no_await f]: during [f ()], an [await] on a
+  pending promise, or a [yield], raises [Lwt_direct.Suspension_forbidden] at
+  the point of the call instead of suspending. A program that never calls
+  [await] keeps exactly the guarantees it had.
+
+  [await] needs an event loop running on the current domain, that is a
+  surrounding [Lwt_main.run] or [main]; otherwise it raises [Failure]. It also
+  raises [Failure] from a callback that the engine invokes from C, as the
+  libev engine does for callbacks handed directly to [Lwt_engine], because an
+  effect cannot cross a C frame. The callbacks of promises are never in that
+  position.
+
 {1:several_loops Several loops, one per domain }
 
   An Lwt program may run several loops at once, one per OCaml domain, and use
