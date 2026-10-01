@@ -35,8 +35,7 @@
   (ppxlib (>= 0.36))
   (lwt (>= 6)))
  (conflicts
-  (lwt (= 6.0.0~alpha00))
-  (lwt (= 6.0.0-beta01))))
+  (lwt (or (= 6.0.0~alpha00) (= 6.0.0-beta01)))))
 
 (package
  (name lwt_ppx__ppx_let_tests)
