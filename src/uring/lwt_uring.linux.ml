@@ -122,10 +122,13 @@ let submit_timer ring tr =
 (* Cancel an in-flight submission. The original operation still produces a
    completion (with [ECANCELED]), which is dropped because its event is no
    longer active; the cancel submission itself produces a [Cancel] completion,
-   which is ignored. *)
+   which is ignored. A cancel is a submission like any other, so it goes through
+   [submit]: dropping it when the queue is full would leave the operation in
+   the kernel, holding its file open. *)
 let cancel ring job =
-  try ignore (U.cancel ring job Cancel)
-  with Invalid_argument _ -> ()
+  match submit ring Cancel (fun ring data -> U.cancel ring job data) with
+  | (_ : req U.job) -> ()
+  | exception Invalid_argument _ -> ()
   (* The job was already collected: nothing to cancel. *)
 
 let dispatch st result data =

@@ -97,6 +97,35 @@ let test_pause_and_timer () =
   end;
   check "pause and timers interleave correctly" (!steps = 3)
 
+(* Stopping more events in one lap than the submission queue holds: every
+   cancel reaches the kernel, so every closed socket is really closed and its
+   peer sees end of file. *)
+let test_cancel_storm () =
+  Lwt_engine.set (new Lwt_uring.uring ~queue_depth:4 ());
+  let n = 64 in
+  let pairs =
+    List.init n (fun _ -> Unix.socketpair Unix.PF_UNIX Unix.SOCK_STREAM 0)
+  in
+  let fds = List.map (fun (a, _) -> Lwt_unix.of_unix_file_descr a) pairs in
+  List.iter
+    (fun fd ->
+      Lwt.async (fun () ->
+        Lwt.catch (fun () -> Lwt_unix.wait_read fd) (fun _ -> Lwt.return_unit)))
+    fds;
+  Lwt_main.run (Lwt.pause ());
+  Lwt_main.run (Lwt_list.iter_p Lwt_unix.close fds);
+  Lwt_main.run (Lwt_unix.sleep 0.2);
+  let at_eof (_, peer) =
+    match Unix.select [ peer ] [] [] 0. with
+    | [], _, _ -> false
+    | _ -> Unix.read peer (Bytes.create 1) 0 1 = 0
+  in
+  let closed = List.length (List.filter at_eof pairs) in
+  List.iter (fun (_, peer) -> Unix.close peer) pairs;
+  Lwt_uring.set ();
+  if closed <> n then Printf.printf "# %d of %d sockets closed\n%!" closed n;
+  check "a storm of cancels larger than the queue loses none" (closed = n)
+
 (* Completion-based I/O (Lwt_uring.Io): the kernel performs the transfer; no
    readiness wait. *)
 let test_io_socketpair () =
@@ -304,6 +333,7 @@ let test_available () =
   test_socketpair ();
   test_cancel ();
   test_pause_and_timer ();
+  test_cancel_storm ();
   test_io_socketpair ();
   test_io_regular_file ();
   test_io_bigarray ();
