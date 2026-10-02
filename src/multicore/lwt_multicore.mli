@@ -189,7 +189,11 @@ val adopt : 'a Lwt.t -> 'a Lwt.t
     What it does instead is ask the OWNER to attach the callback, on its own
     domain, and hand the outcome over as data. So it costs one round trip, and it
     requires the owner's loop to be running: a promise whose owner has stopped
-    running a loop will never resolve here either.
+    running a loop will never resolve here either, unless that loop is retired
+    first, which rejects the adoption with {!Cannot_adopt}.
+
+    Cancelling the local promise withdraws this side's interest only: [p] is not
+    cancelled, and the owner keeps resolving it.
 
     Returns [p] itself when it is already resolved, or already ours: both are
     correct and free.
@@ -293,7 +297,11 @@ module Stream : sig
   (** [create ~capacity] is an empty stream holding at most [capacity] items
       before producers have to wait. [capacity] must be at least 1: an unbounded
       channel is a memory leak waiting to happen, so this module does not offer
-      one. *)
+      one.
+
+      The bound is exceeded transiently by an item handed to a consumer whose
+      promise was cancelled meanwhile: the item comes back to the front rather
+      than being lost, even when the stream is full by then. *)
 
   val push : 'a t -> 'a -> unit Lwt.t
   (** Adds an item, waiting while the stream is full. That wait is the
@@ -347,7 +355,8 @@ module Service : sig
   val call : ('req, 'res) t -> 'req -> 'res Lwt.t
   (** [call t req] asks the service and waits for its answer, as a local promise.
       An exception raised by the handler comes back as a rejection, on this side.
-      Callable from any domain. *)
+      Callable from any domain. Cancelling the promise withdraws the caller's
+      interest only: the request is still served, and its answer dropped. *)
 
   val shutdown : ('req, 'res) t -> unit Lwt.t
   (** Closes the request channel, waits for the service to finish what it has, and
@@ -383,6 +392,9 @@ module Pool : sig
       may: not the caller's promises, not the caller's channels, mutexes, streams
       or descriptors. Pass it data, get data back. The ownership check will say so
       if this is got wrong, which is the point of it being always on.
+
+      Cancelling the promise withdraws the caller's interest only: [f] runs to
+      completion on its worker, and its result is dropped.
 
       Work is handed round-robin, and a caller waits when the chosen worker's queue
       is full: that back-pressure is what keeps a producer from filling memory with
