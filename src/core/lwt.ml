@@ -71,6 +71,7 @@ module Run_queue = struct
 
   let create sentinel = { a = Array.make 16 sentinel; head = 0; len = 0; sentinel }
   let is_empty q = q.len = 0
+  let length q = q.len
 
   let grow q =
     let cap = Array.length q.a in
@@ -1275,7 +1276,16 @@ let register_pause_notifier f = (self_sched ()).pause_notifier <- Some f
 let abandon_paused () =
   let sched = self_sched () in
   sched.paused <- [];
-  sched.paused_n <- 0
+  sched.paused_n <- 0;
+  (* The pauses the idle lap already turned into tasks are abandoned too (the
+     child of a fork must not run the parent's); one pass over the queue,
+     which happens once per fork. *)
+  let n = Run_queue.length sched.queue in
+  for _ = 1 to n do
+    match Run_queue.pop sched.queue with
+    | Paused _ -> ()
+    | task -> Run_queue.push sched.queue task
+  done
 
 (* How [run] executes the scheduler loop. The default runs it plainly. A
    direct-style layer ([Lwt_direct]) installs a runner that runs the loop under
