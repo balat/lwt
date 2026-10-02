@@ -2,16 +2,24 @@
 
 ====== Additions ======
 
-  * lwt_uring: a new optional, Linux-only package providing an io_uring-based
-    Lwt_engine and completion-based I/O. Installing it ([Lwt_uring.set ()])
-    transparently routes Lwt_unix read/write — including the bigarray path used
-    by Lwt_io, and therefore libraries built on it — through io_uring (recv/send
-    for sockets, positioned read/write for files), as well as connect, so
-    existing code is accelerated with no source change.
+  * lwt_uring: a new package providing an Lwt engine on io_uring. Calling
+    Lwt_uring.set_if_available () before Lwt_main.run installs it where
+    io_uring is available, and Lwt_unix read, write, their bigarray variants
+    used by Lwt_io (and so by the libraries built on it) and connect are then
+    performed by io_uring, with no other change to the code. The package
+    installs on every system: elsewhere, set_if_available returns false and
+    the default engine stays. LWT_URING=0 turns io_uring off at run time.
 
-  * Lwt_unix.set_completion_io and Lwt_unix.fd_kind: hooks allowing a
-    completion-based I/O backend (such as lwt_uring) to take over read/write and
-    connect.
+  * Lwt_unix.completion_io, set_completion_io and fd_kind: hooks that let a
+    completion-based I/O backend, such as lwt_uring, take over read, write and
+    connect, and learn when a descriptor is closed, aborted or replaced by
+    dup2.
+
+====== Fixes ======
+
+  * Lwt_engine: stopping an event through the handle its registration returned
+    works after any number of engine replacements. From the second one on, it
+    stopped nothing, and libev could then abort on a closed descriptor.
 
 ===== 6.1.2 =====
 
