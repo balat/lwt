@@ -206,9 +206,12 @@ let run p =
   | result ->
     finished ();
     result
-  | exception exn when Lwt.Exception_filter.run exn ->
+  | exception exn ->
+    (* Every exception, the runtime's included: the flag must not survive
+       the run, or every later Lwt_main.run reports a nested call. *)
+    let bt = Printexc.get_raw_backtrace () in
     finished ();
-    raise exn
+    Printexc.raise_with_backtrace exn bt
 
 let rec call_hooks () =
   match Lwt_sequence.take_opt_l (exit_hooks ()) with
