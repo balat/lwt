@@ -71,6 +71,12 @@ exception Suspension_forbidden
 let check_suspension_allowed () =
   if Lwt.Private.suspension_forbidden () then raise Suspension_forbidden
 
+(* Before suspending on a promise of another domain: the owner check that
+   attaching the continuation would make, made here so that Foreign_promise
+   is raised at the call site rather than out of the handler, where it would
+   escape Lwt_main.run with the continuation lost. *)
+let check_owner = Lwt.Private.check_owner
+
 let no_await (f : unit -> 'a) : 'a = Lwt.Private.no_suspend f
 
 [@@@alert "+trespassing"]
@@ -81,6 +87,7 @@ let await (fut : 'a Lwt.t) : 'a =
   | Lwt.Fail exn -> raise exn
   | Lwt.Sleep -> (
     check_suspension_allowed ();
+    check_owner fut;
     match Effect.perform (Await fut) with
     | v -> v
     | exception Effect.Unhandled (Await _) -> no_handler "Lwt_direct.await")
