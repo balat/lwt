@@ -113,7 +113,8 @@ script separates from a test that merely failed.
 
 `test/tsan/suppressions.txt`, with a reason on every entry. In short: libev and
 liburing share memory with the kernel, and TSan cannot see the barriers that order
-those accesses. **Nothing in Lwt's own OCaml code is suppressed**, so a report
+those accesses; and the OCaml runtime takes its own locks in an order TSan reads as
+a potential deadlock. **Nothing in Lwt's own OCaml code is suppressed**, so a report
 pointing there is a finding.
 
 ## C stubs

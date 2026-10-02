@@ -23,3 +23,12 @@ race:^ev_
 # inline helpers. TSan sees one side of a happens-before edge it cannot know about.
 called_from_lib:liburing
 race:^io_uring_
+
+# The OCaml runtime's own locks. Entering and leaving a blocking section takes the
+# systhreads master lock and the domain lock in an order TSan reads as a cycle, in
+# every program that uses threads and domains together; the runtime avoids the
+# deadlock by protocol. Lwt only calls caml_enter_blocking_section around its
+# engine's wait. Checked on domain_signals: every acquisition site of every
+# reported cycle is one of these two runtime functions, and no Lwt mutex is in any.
+deadlock:caml_plat_lock_blocking
+deadlock:st_masterlock_release
