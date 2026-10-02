@@ -31,8 +31,10 @@ let make_stream () =
     push @@ Some Flush
   in
   let fmt = Format.make_formatter out_string flush in
-  (* Not sure about that one *)
-  Gc.finalise (fun _ -> push None) fmt ;
+  (* Through [Lwt_gc], which runs the function on the loop that registered it:
+     a plain finaliser may run on another domain once this one has gone, and
+     pushing to the stream from there would raise inside the finaliser. *)
+  Lwt_gc.finalise (fun _ -> push None; Lwt.return_unit) fmt;
   let commit () = Lwt.return_unit in
   stream, make_formatter ~commit ~fmt ()
 

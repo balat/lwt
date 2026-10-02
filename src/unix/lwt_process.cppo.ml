@@ -203,7 +203,10 @@ let rusage (_pid, _status, rusage) = rusage
 external cast_chan : 'a Lwt_io.channel -> unit Lwt_io.channel = "%identity"
 (* Transform a channel into a channel that only support closing. *)
 
-let ignore_close chan = ignore (Lwt_io.close chan)
+(* Only from the channel's own domain: a finaliser adopted by another domain,
+   once this one has gone, must not raise. *)
+let ignore_close chan =
+  if (Lwt_io.owned [@alert "-lwt_internal"]) chan then ignore (Lwt_io.close chan)
 
 class virtual common timeout proc channels =
   let wait = waitproc proc in
@@ -370,7 +373,7 @@ let exec ?timeout ?env ?cwd ?stdin ?stdout ?stderr cmd =
   (open_process_none ?timeout ?env ?cwd ?stdin ?stdout ?stderr cmd)#close
 
 let ignore_close ch =
-  ignore (Lwt_io.close ch)
+  if (Lwt_io.owned [@alert "-lwt_internal"]) ch then ignore (Lwt_io.close ch)
 
 let read_opt read ic =
   Lwt.catch

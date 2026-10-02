@@ -827,6 +827,12 @@ val default_buffer_size : unit -> int
   (** Return the default size for buffers. Channels that are created
       without a specific buffer use new buffer of this size. *)
 
+val owned : 'mode channel -> bool
+  [@@alert lwt_internal "Internal to the Lwt packages, keep away."]
+(** Whether the channel belongs to the calling domain. For a finaliser, which
+    may run on another domain once the channel's own has gone: closing there
+    would raise from inside the finaliser. *)
+
 val set_default_buffer_size : int -> unit
   (** Change the default buffer size.
 
