@@ -88,6 +88,10 @@ jobs:
       - run: opam install ./lwt_runtime_events.opam --deps-only --with-test
         if: ${{ fromJSON(steps.configpackages.outputs.runtime_events) }}
 
+      # lwt_uring installs everywhere: the real engine where opam provides
+      # ocaml-uring (Linux), a stub reporting io_uring as unavailable elsewhere.
+      - run: opam install ./lwt_uring.opam --deps-only --with-test
+
       - run: opam exec -- dune build --only-packages lwt,lwt_react,lwt_retry
 
       - run: opam exec -- dune build --only-packages lwt,lwt_ppx__ppx_let_tests
@@ -99,6 +103,8 @@ jobs:
       - run: opam exec -- dune build --only-packages lwt,lwt_runtime_events
         if: ${{ fromJSON(steps.configpackages.outputs.runtime_events) }}
 
+      - run: opam exec -- dune build --only-packages lwt,lwt_uring
+
       - run: opam exec -- dune runtest --only-packages lwt,lwt_react,lwt_retry,lwt_ppx
 
       - run: opam exec -- dune runtest --only-packages lwt,lwt_ppx__ppx_let_tests
@@ -109,3 +115,5 @@ jobs:
 
       - run: opam exec -- dune runtest --only-packages lwt,lwt_runtime_events
         if: ${{ fromJSON(steps.configpackages.outputs.runtime_events) }}
+
+      - run: opam exec -- dune runtest --only-packages lwt,lwt_uring
