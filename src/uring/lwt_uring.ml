@@ -163,12 +163,12 @@ class uring ?(queue_depth = 256) () = object
        nothing outstanding there is nothing to wait for, so we never block. *)
     if block && U.active_ops ring > 0 then begin
       match U.wait ring with
-      | U.Some { result; data } -> dispatch ring result data
+      | U.Some { result; data } -> dispatch ring (result :> int) data
       | U.None -> ()
     end;
     let rec drain () =
       match U.get_cqe_nonblocking ring with
-      | U.Some { result; data } -> dispatch ring result data; drain ()
+      | U.Some { result; data } -> dispatch ring (result :> int) data; drain ()
       | U.None -> ()
     in
     drain ()

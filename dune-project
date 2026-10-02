@@ -77,7 +77,7 @@
   (ocaml (>= 4.14))
   base-unix
   (lwt (>= 6))
-  (uring (>= 0.9))))
+  (uring (>= 2.14))))
 
 (package
  (name lwt_runtime_events)
