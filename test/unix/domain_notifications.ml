@@ -143,5 +143,24 @@ let () =
   check "the table of notifiers does not grow with departed loops"
     (w1 - w0 < rounds * 8);
 
+  (* Two notifications in one batch, the first handler raising: the second must
+     run anyway. The receive empties the channel's buffer, so a handler skipped
+     after an exception is a completion or a signal lost for good. The
+     exception still comes out of the loop, once the batch is done. *)
+  let second_ran = ref false in
+  let first = Lwt_unix.make_notification (fun () -> failwith "first") in
+  let second = Lwt_unix.make_notification (fun () -> second_ran := true) in
+  Lwt_unix.send_notification first;
+  Lwt_unix.send_notification second;
+  let raised =
+    match Lwt_main.run (Lwt_unix.sleep 0.05) with
+    | () -> false
+    | exception Failure _ -> true
+  in
+  Lwt_unix.stop_notification first;
+  Lwt_unix.stop_notification second;
+  check "a handler that raises does not lose the rest of the batch" !second_ran;
+  check "and its exception still comes out of the loop" raised;
+
   if !failures > 0 then exit 1;
   print_endline "per-domain notification channels: ok"
