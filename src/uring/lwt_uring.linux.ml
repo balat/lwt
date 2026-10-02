@@ -236,10 +236,14 @@ class uring ?(queue_depth = 256) () = object
       if live then
         match pr.job with Some job -> cancel st.ring job | None -> ())
 
+  (* The timespec holds int64 nanoseconds, about 292 years: a longer delay,
+     [infinity] or [nan] would overflow the conversion and expire at once. It
+     never expires instead, as with the other engines: nothing is submitted. A
+     negative delay expires at once. *)
   method private register_timer delay repeat f =
-    let ns = Int64.of_float (delay *. 1e9) in
+    let ns = Int64.of_float (Float.max 0. delay *. 1e9) in
     let tr = { ns; repeat; t_callback = f; t_active = true; t_job = None } in
-    submit_timer st.ring tr;
+    if delay < 9e9 then submit_timer st.ring tr;
     lazy (
       tr.t_active <- false;
       if live then

@@ -32,6 +32,18 @@ let test_timer_order () =
   Lwt_main.run (Lwt.join [record 0.06 (); record 0.01 (); record 0.03 ()]);
   check "timers resolve in delay order" (!order = [0.06; 0.03; 0.01])
 
+(* A huge or infinite delay never expires, instead of overflowing the
+   nanosecond conversion and expiring at once. *)
+let test_huge_timers () =
+  let outcome delay =
+    Lwt_main.run
+      (Lwt.pick
+         [ (Lwt_unix.sleep delay >|= fun () -> `Fired);
+           (Lwt_unix.sleep 0.05 >|= fun () -> `Not_fired) ])
+  in
+  check "sleep 1e10 and sleep infinity do not fire at once"
+    (outcome 1e10 = `Not_fired && outcome infinity = `Not_fired)
+
 (* Descriptor readiness: a socketpair round-trip exercises both
    register_readable and register_writable. *)
 let test_socketpair () =
@@ -288,6 +300,7 @@ let test_available () =
    | _ -> check "uring engine installed" false);
   test_timer ();
   test_timer_order ();
+  test_huge_timers ();
   test_socketpair ();
   test_cancel ();
   test_pause_and_timer ();
