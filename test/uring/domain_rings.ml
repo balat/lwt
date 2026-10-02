@@ -100,6 +100,17 @@ let () =
     check "and ours still works afterwards" (socket_roundtrip ());
     check "a descriptor of this domain is refused on another one"
       (foreign_refused ());
+    (* SINGLE_ISSUER is legitimate with one ring per domain: two domains, two
+       rings, each with one submitting task. Checked by doing real I/O on both
+       with the deferred flags on. *)
+    check "two domains each run a ring with the deferred flags"
+      (Domain.join
+         (Domain.spawn (fun () ->
+            Lwt_uring.set ~deferred:true ();
+            let ok = socket_roundtrip () in
+            Lwt_engine.set (new Lwt_engine.select);
+            ok))
+       && socket_roundtrip ());
 
     if !failures > 0 then exit 1;
     print_endline "per-domain rings: ok"
