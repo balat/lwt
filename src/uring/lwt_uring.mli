@@ -28,7 +28,8 @@
 
 val available : unit -> bool
 (** [available ()] is [true] if an io_uring ring can be created on this system
-    (a recent enough Linux kernel). It never raises. *)
+    (a recent enough Linux kernel, which does not forbid io_uring). It never
+    raises. *)
 
 val set : ?queue_depth:int -> unit -> unit
 (** [set ?queue_depth ()] installs a fresh io_uring engine as the current Lwt
@@ -50,8 +51,9 @@ type Lwt_engine.engine_id += Engine_id__uring
 
 (** The io_uring engine. Creating an instance allocates a ring; it is released
     when the engine is {{!Lwt_engine.abstract.destroy} destroyed}. Raises
-    {!Lwt_sys.Not_available} (wrapping the underlying error) if io_uring is not
-    available on this system. *)
+    [Lwt_sys.Not_available "io_uring"] if the system has no io_uring
+    ([ENOSYS]) or forbids it ([EPERM]); other failures, such as [ENOMEM] for a
+    queue too deep for the locked-memory limit, raise {!Unix.Unix_error}. *)
 class uring : ?queue_depth:int -> unit -> object
   inherit Lwt_engine.t
 end

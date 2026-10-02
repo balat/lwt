@@ -156,10 +156,19 @@ let dispatch st result data =
    another keeps the pointer on the live ring). *)
 let installed : state option ref = ref None
 
+(* [io_uring_setup] fails with ENOSYS where the kernel has no io_uring, and with
+   EPERM where it is forbidden: by the [kernel.io_uring_disabled] sysctl, or by
+   a seccomp filter such as the default profile of Docker and containerd. *)
+let create_ring ~queue_depth =
+  match U.create ~queue_depth () with
+  | ring -> ring
+  | exception Unix.Unix_error ((Unix.ENOSYS | Unix.EPERM), _, _) ->
+    raise (Lwt_sys.Not_available "io_uring")
+
 class uring ?(queue_depth = 256) () = object
   inherit Lwt_engine.abstract
 
-  val st = { ring = U.create ~queue_depth (); in_flight = [||]; count = 0 }
+  val st = { ring = create_ring ~queue_depth; in_flight = [||]; count = 0 }
 
   (* [false] in the child of a [Lwt_unix.fork]: the ring then belongs to the
      parent (see [fork]) and nothing here may touch it any more, neither to
@@ -438,9 +447,9 @@ let completion_backend : Lwt_unix.completion_io =
 let () = Lwt_unix.set_completion_io (Some completion_backend)
 
 let available () =
-  match U.create ~queue_depth:1 () with
+  match create_ring ~queue_depth:1 with
   | ring -> U.exit ring; true
-  | exception _ -> false
+  | exception (Lwt_sys.Not_available _ | Unix.Unix_error _) -> false
 
 let set ?queue_depth () =
   Lwt_engine.set (new uring ?queue_depth ())
