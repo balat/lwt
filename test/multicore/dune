@@ -119,3 +119,14 @@
  (build_if
   (>= %{ocaml_version} "5.0"))
  (libraries lwt_multicore qcheck-lin.domain))
+
+; Lwt_unix notifications across domains and threads: the table of notifiers is
+; linearisable (qcheck-lin), and every send is delivered exactly once (QCheck).
+
+(test
+ (name notifications)
+ (package lwt_multicore)
+ (modules notifications)
+ (build_if
+  (>= %{ocaml_version} "5.0"))
+ (libraries lwt.unix threads.posix qcheck-lin.domain))

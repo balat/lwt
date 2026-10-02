@@ -56,6 +56,7 @@ test/multicore/departed_loop.exe
 test/multicore/service_fatal.exe
 test/multicore/cancel_storm.exe
 test/multicore/lin_shared_value.exe
+test/multicore/notifications.exe
 test/direct/main.exe
 test/uring/domain_rings.exe
 test/uring/test_lwt_uring.exe
