@@ -808,6 +808,12 @@ CAMLprim value lwt_unix_encode_notification(value val_index, value val_local) {
                   local);
 }
 
+/* The channel an id names, for the OCaml side, which purges a retired
+   channel's entries from its table by this. */
+CAMLprim value lwt_unix_notification_channel_index(value val_id) {
+  return Val_int(LWT_NOTIFICATION_INDEX(Long_val(val_id)));
+}
+
 #if defined(LWT_ON_WINDOWS)
 
 static int windows_notification_send(struct notification_channel *chan) {

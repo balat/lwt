@@ -92,5 +92,56 @@ let () =
   check "no handler ran on another domain than its own"
     (Atomic.get wrong_domain = 0);
 
+  (* A departed loop's notifications go with it. Its entries were left in the
+     process-wide table, about forty words per domain that ever ran a loop, for
+     ever; and a channel slot's generation is eight bits wide, so once the slot
+     had been reused 256 times a stale id named the slot's current owner again,
+     and that loop ran the dead domain's handler. The handler below must never
+     run: not even when the slot has come round. *)
+  let ran_on = Atomic.make (-1) in
+  let stale =
+    Domain.join
+      (Domain.spawn (fun () ->
+         Lwt_unix.make_notification (fun () ->
+           Atomic.set ran_on (Domain.self () :> int))))
+  in
+  for _ = 1 to 255 do
+    Domain.join
+      (Domain.spawn (fun () -> ignore (Lwt_unix.make_notification ignore)))
+  done;
+  let ready = Atomic.make false in
+  let victim =
+    Domain.spawn (fun () ->
+      ignore (Lwt_unix.make_notification ignore);
+      Atomic.set ready true;
+      Lwt_main.run (Lwt_unix.sleep 0.1))
+  in
+  while not (Atomic.get ready) do Domain.cpu_relax () done;
+  Lwt_unix.send_notification stale;
+  Domain.join victim;
+  check "a departed loop's handler never runs again, slot reused 256 times"
+    (Atomic.get ran_on = -1);
+
+  (* And the table does not grow with the domains that came and went. Measured
+     after a warm-up, so that what is allocated once per process is out of the
+     way; a leak per domain showed as forty words each, the budget is well
+     under that. *)
+  let live () = Gc.full_major (); (Gc.quick_stat ()).Gc.live_words in
+  let round () =
+    Domain.join
+      (Domain.spawn (fun () ->
+         Lwt_main.run
+           (Lwt.bind (Lwt_unix.stat ".") (fun _ ->
+              Lwt.bind (Lwt_preemptive.detach (fun () -> ()) ()) (fun () ->
+                Lwt_unix.sleep 0.0001)))))
+  in
+  for _ = 1 to 20 do round () done;
+  let w0 = live () in
+  let rounds = 200 in
+  for _ = 1 to rounds do round () done;
+  let w1 = live () in
+  check "the table of notifiers does not grow with departed loops"
+    (w1 - w0 < rounds * 8);
+
   if !failures > 0 then exit 1;
   print_endline "per-domain notification channels: ok"

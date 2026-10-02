@@ -59,6 +59,8 @@ external free_notification_channel : int -> unit
   = "lwt_unix_free_notification_channel"
 external reset_notification_channel : int -> Unix.file_descr
   = "lwt_unix_reset_notification_channel"
+external notification_channel_index : int -> int
+  = "lwt_unix_notification_channel_index"
 
 external send_notification : int -> unit = "lwt_unix_send_notification_stub"
 
@@ -71,6 +73,10 @@ external encode_notification : int -> int -> int = "lwt_unix_encode_notification
    section. *)
 let drain_notifications : (int -> unit) ref = ref (fun _ -> ())
 let drop_signal_subscriptions : (unit -> unit) ref = ref (fun () -> ())
+
+(* Forward reference too, for the same reason: removes a retired channel's
+   entries from the table of notifiers, defined with that table below. *)
+let purge_notifiers : (int -> unit) ref = ref (fun _ -> ())
 
 (* PER DOMAIN: the channel this loop is woken through, and the engine event that
    watches it. Created on first use, so a domain that never touches Lwt_unix
@@ -160,7 +166,14 @@ let notif_slot : notif Lwt_dls.t =
            last subscriber died would stop dying on SIGTERM. *)
         !drop_signal_subscriptions ();
         Lwt_engine.stop_event event;
-        free_notification_channel chan);
+        free_notification_channel chan;
+        (* And forget every notification this loop made, LAST: a sender that
+           was racing with the retirement above has now failed to find the
+           channel, so nothing can call them any more. Left in the table, they
+           cost about forty words per domain that ever ran a loop, for ever,
+           and once the slot's generation had come round they could be called
+           again, by the loop that had the slot then. *)
+        !purge_notifiers chan);
     { chan;
       event;
       jobs = Lwt_sequence.create ();
@@ -291,6 +304,16 @@ let make_notification ?(once=false) f =
 
 let stop_notification id =
   with_notifiers (fun () -> Notifiers.remove notifiers id)
+
+let () =
+  purge_notifiers :=
+    fun chan ->
+      with_notifiers (fun () ->
+        Notifiers.filter_map_inplace
+          (fun id notifier ->
+             if notification_channel_index id = chan then None
+             else Some notifier)
+          notifiers)
 
 let set_notification id f =
   with_notifiers (fun () ->
