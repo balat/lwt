@@ -753,6 +753,13 @@ let set_on_cancel (type a) (sched : sched) (p : a t) (f : unit -> unit) : unit =
 let cancel_gen (type a) (sched : sched) (p : a t) : unit =
   match (prj p).st with
   | Pending pe -> (
+    (* Before the hook, not in [fill] after it: the hook of [protected] (or of
+       [wrap_in_cancelable]) unlinks a waiter from ANOTHER pending promise,
+       with the scheduler that promise captured, so it passed its own check
+       and mutated the owner's list from the foreign domain; the mirror then
+       never resolved. [sched] here is the caller's, and every forward hop
+       checks again. *)
+    check_owner sched pe;
     match pe.cancel with
     | Not_cancelable -> ()
     | Cancel_self hook ->
