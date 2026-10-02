@@ -131,5 +131,25 @@ let () =
   check "and leaves no waiter behind to swallow the next signal"
     (Lwt.state real_waiter = Lwt.Return 5);
 
+  (* A switch belongs to the domain that created it: its hooks close that
+     domain's resources. Turning it off from another domain ran the hooks
+     there; adding a hook from there raced with the owner. Both refused. *)
+  let sw = Lwt_switch.create () in
+  let hook_ran_on = Atomic.make (-1) in
+  Lwt_switch.add_hook (Some sw) (fun () ->
+    Atomic.set hook_ran_on (Domain.self () :> int);
+    Lwt.return_unit);
+  check "turning another domain's switch off is refused"
+    (on_other_domain (fun () -> refused (fun () -> Lwt_switch.turn_off sw)));
+  check "adding a hook to another domain's switch is refused"
+    (on_other_domain (fun () ->
+       refused (fun () ->
+         Lwt_switch.add_hook (Some sw) (fun () -> Lwt.return_unit))));
+  check "and the hook ran nowhere"
+    (Atomic.get hook_ran_on = -1 && Lwt_switch.is_on sw);
+  ignore (Lwt_switch.turn_off sw);
+  check "the owner turns it off, and the hook runs here"
+    (Atomic.get hook_ran_on = (Domain.self () :> int));
+
   if !failures > 0 then exit 1;
   print_endline "domain-affine containers: ok"

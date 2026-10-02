@@ -5,6 +5,8 @@
 
 exception Off
 
+[@@@alert "-lwt_internal"]
+
 type on_switch = {
   mutable hooks : (unit -> unit Lwt.t) list;
 }
@@ -13,9 +15,12 @@ type state =
   | St_on of on_switch
   | St_off
 
-type t = { mutable state : state }
+(* A switch belongs to the domain that created it, like the other containers:
+   its hooks close that domain's resources, and its list is mutated with no
+   synchronisation. *)
+type t = { mutable state : state; owner : Lwt_dls.token }
 
-let create () = { state = St_on { hooks = [] } }
+let create () = { state = St_on { hooks = [] }; owner = Lwt_dls.self_token () }
 
 let is_on switch =
   match switch.state with
@@ -23,29 +28,32 @@ let is_on switch =
   | St_off -> false
 
 let check = function
-  | Some{ state = St_off } -> raise Off
-  | Some {state = St_on _} | None -> ()
+  | Some { state = St_off; _ } -> raise Off
+  | Some { state = St_on _; _ } | None -> ()
 
 let add_hook switch hook =
   match switch with
-  | Some { state = St_on os } ->
+  | Some ({ state = St_on os; _ } as sw) ->
+    Lwt_dls.check_owner "Lwt_switch.add_hook" sw.owner;
     os.hooks <- hook :: os.hooks
-  | Some { state = St_off } ->
+  | Some { state = St_off; _ } ->
     raise Off
   | None ->
     ()
 
 let add_hook_or_exec switch hook =
   match switch with
-  | Some { state = St_on os } ->
+  | Some ({ state = St_on os; _ } as sw) ->
+    Lwt_dls.check_owner "Lwt_switch.add_hook_or_exec" sw.owner;
     os.hooks <- hook :: os.hooks;
     Lwt.return_unit
-  | Some { state = St_off } ->
+  | Some { state = St_off; _ } ->
     hook ()
   | None ->
     Lwt.return_unit
 
 let turn_off switch =
+  Lwt_dls.check_owner "Lwt_switch.turn_off" switch.owner;
   match switch.state with
   | St_on { hooks = hooks } ->
     switch.state <- St_off;
