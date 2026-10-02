@@ -368,22 +368,13 @@ let gen_outcome =
 let gen_index = Gen.int_bound 7
 let gen_indexes = Gen.list_size (Gen.int_range 1 3) gen_index
 
-(* The class of programs left out by default: merging. When a bind's callback
-   returns an existing pending promise, the waiters of that promise and of the
-   bind result end up in one list, and the cores were found to run them in
-   different orders.
-
-   The default run leaves out what produces it (callbacks that return an
-   existing promise), so that it checks everything else and stays green.
-   DIFFERENTIAL_ALL=1 puts it back, to see the difference or to check a change
-   that aligns the cores. DIFFERENTIAL_COUNT sets the number of programs.
-
-   Cancellation used to be the other known class: the historical core marks
-   every promise a cancel reaches as cancelled first, then runs their callbacks
-   in reverse order of discovery, and the current core now does the same, so
-   cancel, pick and npick are part of the default run. *)
-let all_classes = Sys.getenv_opt "DIFFERENTIAL_ALL" <> None
-let known w = if all_classes then w else 0
+(* Every operation is generated. Two classes of programs used to be left out,
+   because the cores differed on them: merging (a bind's callback returning an
+   existing pending promise, whose waiters then join the bind result's), and
+   cancellation (cancel, and pick and npick, which cancel their losers). Both
+   now run the same, the first since the waiter list keeps Lwt's merge order,
+   the second since cancel marks everything it reaches before running any of
+   it. DIFFERENTIAL_COUNT sets the number of programs. *)
 
 let count =
   match Option.bind (Sys.getenv_opt "DIFFERENTIAL_COUNT") int_of_string_opt with
@@ -393,7 +384,7 @@ let count =
 let gen_produce =
   Gen.oneof_weighted
     [ 3, Gen.return Produce_value;
-      known 2, Gen.map (fun i -> Produce_promise i) gen_index;
+      2, Gen.map (fun i -> Produce_promise i) gen_index;
       1, Gen.map (fun e -> Produce_raise e) (Gen.int_bound 3) ]
 
 (* Callbacks nest up to [depth]; the leaves have an empty body. *)
