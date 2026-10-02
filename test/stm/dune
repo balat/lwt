@@ -1,0 +1,11 @@
+; Models of the domain-local containers, checked by qcheck-stm. Sequential: these
+; containers belong to one domain, and what is worth searching is the order of
+; operations, waits, hand-overs and cancellations, which a model explores better
+; than examples. The parallel models of the shared containers are in
+; test/multicore.
+
+(tests
+ (names stm_mutex stm_mvar stm_condition stm_pool)
+ (package lwt)
+ (modules handles stm_mutex stm_mvar stm_condition stm_pool)
+ (libraries lwt qcheck-stm.sequential))

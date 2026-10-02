@@ -27,6 +27,7 @@ depends: [
   "ocamlfind" {dev & >= "1.7.3-1"}
   "odoc" {with-doc & >= "2.3"}
   "qcheck-core" {with-test & >= "0.90"}
+  "qcheck-stm" {with-test & >= "0.7"}
   "dune-configurator"
   "ocplib-endian"
 ]
