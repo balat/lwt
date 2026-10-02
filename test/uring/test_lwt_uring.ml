@@ -126,6 +126,37 @@ let test_cancel_storm () =
   if closed <> n then Printf.printf "# %d of %d sockets closed\n%!" closed n;
   check "a storm of cancels larger than the queue loses none" (closed = n)
 
+(* More descriptors ready at once than the submission queue holds (256 by
+   default), each watched by an event that stays active and fires on every lap
+   while its descriptor is ready, as a level-triggered engine does. The loop
+   must still return to run other work, here a timer. An alarm turns a hang
+   into a failure. *)
+let test_many_ready () =
+  let n = 300 in
+  let pairs =
+    List.init n (fun _ -> Unix.socketpair Unix.PF_UNIX Unix.SOCK_STREAM 0)
+  in
+  List.iter (fun (_, b) -> ignore (Unix.write_substring b "x" 0 1)) pairs;
+  let fired = ref 0 in
+  let events =
+    List.map (fun (a, _) -> Lwt_engine.on_readable a (fun _ -> incr fired)) pairs
+  in
+  let previous =
+    Sys.signal Sys.sigalrm
+      (Sys.Signal_handle
+         (fun _ ->
+           print_endline "FAIL - more ready descriptors than the queue: hang";
+           exit 1))
+  in
+  ignore (Unix.alarm 10);
+  Lwt_main.run (Lwt_unix.sleep 0.05);
+  ignore (Unix.alarm 0);
+  Sys.set_signal Sys.sigalrm previous;
+  List.iter Lwt_engine.stop_event events;
+  List.iter (fun (a, b) -> Unix.close a; Unix.close b) pairs;
+  check "more ready descriptors than the queue holds do not stall the loop"
+    (!fired >= n)
+
 (* Completion-based I/O (Lwt_uring.Io): the kernel performs the transfer; no
    readiness wait. *)
 let test_io_socketpair () =
@@ -334,6 +365,7 @@ let test_available () =
   test_cancel ();
   test_pause_and_timer ();
   test_cancel_storm ();
+  test_many_ready ();
   test_io_socketpair ();
   test_io_regular_file ();
   test_io_bigarray ();

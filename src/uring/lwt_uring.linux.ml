@@ -262,13 +262,22 @@ class uring ?(queue_depth = 256) () = object
       | U.Some { result; data } -> dispatch st (result :> int) data
       | U.None -> ()
     end;
-    let rec drain () =
-      if not released then
+    (* Bounded to one ring's worth of completions per lap. A poll that fires is
+       re-armed at once while its event is still active, and Lwt_unix stops it
+       only after a pause, that is after this lap; with more descriptors ready
+       than the submission queue holds, re-arming flushed the queue, the polls
+       completed at once on descriptors still ready, and an unbounded loop never
+       ended. What is left goes to the next lap, which is what a level-triggered
+       engine does anyway. *)
+    let rec drain budget =
+      if budget > 0 && not released then
         match U.get_cqe_nonblocking st.ring with
-        | U.Some { result; data } -> dispatch st (result :> int) data; drain ()
+        | U.Some { result; data } ->
+          dispatch st (result :> int) data;
+          drain (budget - 1)
         | U.None -> ()
     in
-    drain ()
+    drain queue_depth
 
   (* Called by [Lwt_unix.fork] in the child, before anything else. The child
      inherits the ring's memory, which is shared with the parent, and its own
