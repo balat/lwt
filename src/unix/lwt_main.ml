@@ -94,19 +94,26 @@ let abandon_yielded_and_paused () =
    loop lap (enter hooks, one engine iteration, fulfil paused promises, leave
    hooks) and reports whether to keep going — [false] exactly when [p] is
    resolved, which makes the scheduler return [p]'s outcome. *)
+let run_hooks hooks = Lwt_sequence.iter_l (fun f -> f ()) hooks
+
 let run (type a) (p : a Lwt.t) : a =
-  let idle () =
+  (* One lap: iteration hooks, engine, pause service. The leave hooks of a lap
+     run at the start of the next call, once the run queue is empty, so that
+     they see the effect of every callback of their lap, as in the classic
+     loop where callbacks ran inside the engine iteration; here they run as
+     tasks after it. Both hook sequences run under [scheduler_defer_fills]: a
+     hook may resolve promises, and their callbacks must run as tasks, where
+     they may await, not inside the lap, where nothing may. *)
+  let lap_open = ref false in
+  let lap () =
     Lwt_rte.emit_sch_lap ();
     Lwt_unix.write_job_count_runtimte_event ();
     Lwt_rte.emit_paused_count (Lwt.paused_count ());
     if not (Lwt.is_sleeping p) then false
     else begin
-      (* Call enter hooks. *)
-      Lwt_sequence.iter_l (fun f -> f ()) (enter_iter_hooks ());
-
-      (* Do the main loop call. Block only if nothing became ready meanwhile:
-         the enter hooks may have resolved promises (e.g. Lwt_direct pumps its
-         task queue from them) — possibly [p] itself — and the core scheduler
+      Lwt.Private.scheduler_defer_fills run_hooks (enter_iter_hooks ());
+      (* Block only if nothing became ready meanwhile: the enter hooks may
+         have resolved promises, [p] itself included, and the core scheduler
          must run that work now, not after an unbounded engine wait. *)
       let should_block_waiting_for_io =
         Lwt.is_sleeping p
@@ -114,15 +121,19 @@ let run (type a) (p : a Lwt.t) : a =
         && Lwt.Private.scheduler_queue_is_empty ()
       in
       Lwt.Private.scheduler_defer_fills Lwt_engine.iter should_block_waiting_for_io;
-
-      (* Fulfill paused promises. *)
       Lwt.Private.scheduler_serve_paused ();
-
-      (* Call leave hooks. *)
-      Lwt_sequence.iter_l (fun f -> f ()) (leave_iter_hooks ());
-
+      lap_open := true;
       true
     end
+  in
+  let idle () =
+    if !lap_open then begin
+      lap_open := false;
+      Lwt.Private.scheduler_defer_fills run_hooks (leave_iter_hooks ());
+      (* What the leave hooks resolved runs before the next lap. *)
+      if Lwt.Private.scheduler_queue_is_empty () then lap () else true
+    end
+    else lap ()
   in
 
   Lwt_rte.emit_sch_call_begin ();
