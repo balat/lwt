@@ -56,3 +56,19 @@ let () =
   | () -> fail "the runtime exception out of the resumed callback did not escape"
   | exception Stack_overflow ->
     ok "a runtime exception out of a resumed callback escapes Lwt_main.run"
+
+let () =
+  (* After a runtime exception escaped Lwt_main.run, the next run must work:
+     the running flag is cleared on every exception. *)
+  match Lwt_main.run (Lwt.return 7) with
+  | 7 -> ok "Lwt_main.run works again after a runtime exception escaped it"
+  | _ -> fail "unexpected value"
+  | exception Failure _ -> fail "Lwt_main.run still thinks it is running"
+
+let () =
+  (* Exit hooks run as tasks of the loop, the first one included, so they may
+     await. Printed at exit. *)
+  Lwt_main.at_exit (fun () ->
+    Lwt_direct.await (Lwt_unix.sleep 1e-3);
+    ok "an exit hook can await, from the first one on";
+    Lwt.return_unit)
