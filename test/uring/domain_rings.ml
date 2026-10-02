@@ -71,6 +71,17 @@ let foreign_refused () =
   (try Lwt_main.run (Lwt_unix.close fb) with _ -> ());
   refused
 
+(* A domain on io_uring whose loop ends with a read still in flight: its exit
+   destroys its engine, which must cancel the read rather than wait for it. *)
+let domain_exit_in_flight () =
+  Domain.join
+    (Domain.spawn (fun () ->
+       Lwt_uring.set ();
+       let c, _d = Lwt_unix.socketpair Unix.PF_UNIX Unix.SOCK_STREAM 0 in
+       ignore (Lwt_unix.read c (Bytes.create 8) 0 8);
+       Lwt_main.run (Lwt_unix.sleep 0.02);
+       true))
+
 let () =
   if not (Lwt_uring.available ()) then
     print_endline "per-domain rings: skipped (no io_uring here)"
@@ -112,6 +123,10 @@ let () =
             ok))
        && socket_roundtrip ());
 
+    ignore (Unix.alarm 10);
+    check "a domain on uring exits with a read still in flight"
+      (domain_exit_in_flight ());
+    ignore (Unix.alarm 0);
     if !failures > 0 then exit 1;
     print_endline "per-domain rings: ok"
   end

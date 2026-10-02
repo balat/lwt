@@ -157,6 +157,73 @@ let test_many_ready () =
   check "more ready descriptors than the queue holds do not stall the loop"
     (!fired >= n)
 
+(* Fail rather than hang: [f] runs under an alarm of [seconds]. *)
+let under_alarm seconds name f =
+  let previous =
+    Sys.signal Sys.sigalrm
+      (Sys.Signal_handle
+         (fun _ ->
+           Printf.printf "FAIL - %s: the loop hung\n%!" name;
+           exit 1))
+  in
+  ignore (Unix.alarm seconds);
+  let v = f () in
+  ignore (Unix.alarm 0);
+  Sys.set_signal Sys.sigalrm previous;
+  v
+
+(* More descriptors ready at once than the submission queue holds, each with a
+   Lwt_unix.wait_read: where the core defers wakeups, the event a waiter leaves
+   stays active through the lap, so this is the livelock through the plain
+   Lwt_unix API. Every waiter must be woken, and the loop must go on. *)
+let test_many_ready_polls () =
+  let n = 300 in
+  let pairs =
+    List.init n (fun _ -> Lwt_unix.socketpair Unix.PF_UNIX Unix.SOCK_STREAM 0)
+  in
+  let woken =
+    under_alarm 10 "300 ready wait_read" (fun () ->
+      Lwt_main.run
+        (Lwt.pick
+           [ (let waits = List.map (fun (a, _) -> Lwt_unix.wait_read a) pairs in
+              Lwt_unix.sleep 0.02 >>= fun () ->
+              List.iter
+                (fun (_, b) ->
+                  ignore
+                    (Unix.write_substring (Lwt_unix.unix_file_descr b) "x" 0 1))
+                pairs;
+              Lwt.join waits >|= fun () -> true);
+             (Lwt_unix.sleep 5. >|= fun () -> false) ]))
+  in
+  List.iter
+    (fun (a, b) ->
+      Lwt_main.run (Lwt_unix.close a >>= fun () -> Lwt_unix.close b))
+    pairs;
+  check "more ready descriptors than the queue holds: all woken" woken
+
+(* Tearing the engine down while a recv on an idle socket and an accept wait:
+   the teardown must return, and the read's promise be rejected. *)
+let test_teardown_in_flight () =
+  let a, b = Lwt_unix.socketpair Unix.PF_UNIX Unix.SOCK_STREAM 0 in
+  let pending_read = Lwt_unix.read a (Bytes.create 8) 0 8 in
+  let listener = Lwt_unix.socket Unix.PF_INET Unix.SOCK_STREAM 0 in
+  Lwt_main.run
+    (Lwt_unix.bind listener (Unix.ADDR_INET (Unix.inet_addr_loopback, 0))
+     >>= fun () ->
+     Lwt_unix.listen listener 8;
+     let (_ : (Lwt_unix.file_descr * Unix.sockaddr) Lwt.t) =
+       Lwt_unix.accept listener
+     in
+     Lwt_unix.sleep 0.02);
+  under_alarm 10 "teardown" (fun () ->
+    Lwt_engine.set (new Lwt_engine.select);
+    Lwt_main.run (Lwt_unix.sleep 0.01));
+  check "and the read in flight is rejected"
+    (match Lwt.state pending_read with Lwt.Fail _ -> true | _ -> false);
+  Lwt_uring.set ();
+  Lwt_main.run
+    (Lwt_list.iter_p Lwt_unix.close [ a; b; listener ])
+
 (* Completion-based I/O (Lwt_uring.Io): the kernel performs the transfer; no
    readiness wait. *)
 let test_io_socketpair () =
@@ -612,6 +679,7 @@ let test_available () =
   test_pause_and_timer ();
   test_cancel_storm ();
   test_many_ready ();
+  test_many_ready_polls ();
   test_io_socketpair ();
   test_io_bounds ();
   test_io_regular_file ();
@@ -626,6 +694,7 @@ let test_available () =
   test_deferred ();
   test_replace_busy_engine ();
   test_replace_from_callback ();
+  test_teardown_in_flight ();
   test_fork ()
 
 let () =
