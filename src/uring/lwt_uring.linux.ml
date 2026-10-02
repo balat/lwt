@@ -359,27 +359,38 @@ module Io = struct
   type bigarray =
     (char, Bigarray.int8_unsigned_elt, Bigarray.c_layout) Bigarray.Array1.t
 
+  (* The same checks as [Lwt_unix.read] and friends, made before submitting:
+     the bytes read path blits in the completion handler, where an index out of
+     bounds would raise inside [iter] and leave the promise pending. *)
+  let check name length pos len =
+    if pos < 0 || len < 0 || pos > length - len then
+      invalid_arg ("Lwt_uring.Io." ^ name)
+
   (* Positioned read/write at the descriptor's current offset, suited to regular
      files and general use. For sockets, prefer the transparent {!Lwt_unix} path
      (which uses [recv]/[send]). *)
   let read fd buf pos len =
+    check "read" (Bytes.length buf) pos len;
     let cs = Cstruct.create_unsafe len in
     submit_io (get_state ()) "read"
       (fun n -> Cstruct.blit_to_bytes cs 0 buf pos n; n)
       (fun ring data -> U.read ring ~file_offset:current_offset fd cs data)
 
   let write fd buf pos len =
+    check "write" (Bytes.length buf) pos len;
     let cs = Cstruct.create_unsafe len in
     Cstruct.blit_from_bytes buf pos cs 0 len;
     submit_io (get_state ()) "write" int_result (fun ring data ->
       U.write ring ~file_offset:current_offset fd cs data)
 
   let read_bigarray fd buf pos len =
+    check "read_bigarray" (Bigarray.Array1.dim buf) pos len;
     let cs = Cstruct.of_bigarray ~off:pos ~len buf in
     submit_io (get_state ()) "read" int_result (fun ring data ->
       U.read ring ~file_offset:current_offset fd cs data)
 
   let write_bigarray fd buf pos len =
+    check "write_bigarray" (Bigarray.Array1.dim buf) pos len;
     let cs = Cstruct.of_bigarray ~off:pos ~len buf in
     submit_io (get_state ()) "write" int_result (fun ring data ->
       U.write ring ~file_offset:current_offset fd cs data)

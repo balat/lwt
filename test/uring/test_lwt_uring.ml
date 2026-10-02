@@ -176,6 +176,21 @@ let test_io_socketpair () =
   Unix.close a;
   Unix.close b
 
+(* Out-of-bounds positions are rejected before anything is submitted. *)
+let test_io_bounds () =
+  let a, b = Unix.socketpair Unix.PF_UNIX Unix.SOCK_STREAM 0 in
+  let rejected f =
+    match f () with
+    | (_ : int Lwt.t) -> false
+    | exception Invalid_argument _ -> true
+  in
+  let buf = Bytes.create 4 in
+  check "Io.read and Io.write check their bounds"
+    (rejected (fun () -> Lwt_uring.Io.read a buf 2 8)
+     && rejected (fun () -> Lwt_uring.Io.write b buf (-1) 1));
+  Unix.close a;
+  Unix.close b
+
 (* io_uring can read a regular file asynchronously — readiness engines cannot
    poll regular files at all. *)
 let test_io_regular_file () =
@@ -367,6 +382,7 @@ let test_available () =
   test_cancel_storm ();
   test_many_ready ();
   test_io_socketpair ();
+  test_io_bounds ();
   test_io_regular_file ();
   test_io_bigarray ();
   test_connect ();
