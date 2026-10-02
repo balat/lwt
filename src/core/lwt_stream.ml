@@ -388,7 +388,7 @@ let create_bounded size =
 (* Wait for a new element to be added to the queue of pending element
    of the stream. *)
 let feed s =
-  Lwt_dls.check_owner "Lwt_stream.feed" s.owner;
+  Lwt_dls.check_owner "Lwt_stream (reading)" s.owner;
   match s.source with
   | From from ->
     (* There is already a thread started to create a new element,
@@ -434,7 +434,7 @@ let feed s =
    Precondition: node.data <> None
 *)
 let consume s node =
-  Lwt_dls.check_owner "Lwt_stream.consume" s.owner;
+  Lwt_dls.check_owner "Lwt_stream (reading)" s.owner;
   if node == s.node then begin
     s.node <- node.next;
     match s.source with
