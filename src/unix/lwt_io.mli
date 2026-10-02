@@ -46,7 +46,7 @@ type 'mode channel
       raises [Invalid_argument] rather than corrupting the buffer. {!stdout},
       {!stderr} and {!stdin} are created when this module is initialised, so they
       belong to that domain; another domain writing to standard output makes its
-      own channel over the same descriptor with {!of_fd}. *)
+      own channel over the same descriptor with {!of_unix_fd} [Unix.stdout]. *)
 
 type input
   (** Input mode *)

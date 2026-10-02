@@ -17,31 +17,17 @@ open Lwt.Infix
    +-----------------------------------------------------------------+ *)
 
 (* Jobs, signal handlers and child waiting reach Lwt through a notification
-   channel. There is now ONE PER LOOP: the C side keeps a table of channels and a
-   notification id carries the index of the one it belongs to, so a completion
-   wakes the loop that asked for the work.
+   channel, and there is ONE PER LOOP: the C side keeps a table of channels, and
+   a notification id carries the index of the one it belongs to, so a completion
+   wakes the loop that asked for the work, a signal wakes every loop that
+   subscribed to it, and a child's exit wakes the loop waiting for it.
 
-   Jobs have caught up: they are per loop, and a completion wakes the loop that
-   submitted the work. What has not, and is the rest of this phase: the signal
-   handlers and child waiting, which keep the owner check below because a signal
-   is a process-wide resource and needs a policy rather than a channel.
-
-   So this module has an owner, and it is the domain that initialised it. On
-   another domain, submitting a job would have the completion wake a promise the
-   submitter owns from a domain that does not own it: a cross-domain wakeup, with
-   no synchronisation, into another domain's run queue. That does not work, and
-   it fails silently. The operations that need the owner therefore check, and say
-   so.
-
-   This is a temporary state of affairs, and the check is what makes it visible
-   rather than mysterious: giving every domain its own notification descriptor
-   means emptying the C singleton, which is the next phase's work. There is no
-   inter-domain API here either way -- the restriction only ever gets weaker.
-
-   The marker is a per-domain slot set to [true] exactly once, at module
-   initialisation, which is more accurate than asking whether we are the main
-   domain: the owner is whoever loaded the module. In the single-domain case,
-   which is every existing program, it reads [true] and nothing changes. *)
+   What remains per domain is this module's slot below: the channel, the jobs in
+   flight, the signal subscriptions and the children awaited. Nothing here is
+   shared between loops but the C table and the table of notifiers, each under
+   its own lock. The one operation that is still reserved to the domain that
+   loaded the module is [fork], for the runtime's reason: it does not support
+   forking while other domains are running. *)
 [@@@alert "-lwt_internal"]
 
 (* Builds the lock that guards the channel table, where the platform has no static
