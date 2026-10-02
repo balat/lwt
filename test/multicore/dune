@@ -99,3 +99,13 @@
  (build_if
   (>= %{ocaml_version} "5.0"))
  (libraries lwt.unix lwt_multicore))
+
+; Many waiters cancelled in a row: must be linear, and leave nothing behind.
+
+(test
+ (name cancel_storm)
+ (package lwt_multicore)
+ (modules cancel_storm)
+ (build_if
+  (>= %{ocaml_version} "5.0"))
+ (libraries lwt.unix lwt_multicore))

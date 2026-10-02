@@ -149,6 +149,8 @@ type 'a waiter = {
   w_loop : loop;
   w_promise : 'a Lwt.t;
   w_resolver : 'a Lwt.u;
+  (* Set when the waiter's promise is cancelled; see [waiters] below. *)
+  mutable w_withdrawn : bool;
 }
 
 (* Built OUTSIDE any critical section, always: a promise is an allocation and an
@@ -156,7 +158,8 @@ type 'a waiter = {
    section holds neither. *)
 let new_waiter () =
   let promise, resolver = Lwt.task () in
-  { w_loop = self (); w_promise = promise; w_resolver = resolver }
+  { w_loop = self (); w_promise = promise; w_resolver = resolver;
+    w_withdrawn = false }
 
 (* [w]'s promise belongs to [w]'s domain, so this has to happen there. Returns
    whether it actually resolved it: a waiter whose promise was cancelled
@@ -184,13 +187,96 @@ let wake w v ~on_dead =
     | () -> ()
     | exception Loop_terminated -> on_dead ()
 
+(* A first-in, first-out queue kept as a pair of lists. Short by nature: these are
+   domain boundaries, not hot paths. Holds waiters below, and stream items too. *)
+type 'a queue = { mutable front : 'a list; mutable back : 'a list }
+
+let queue_create () = { front = []; back = [] }
+let queue_push q x = q.back <- x :: q.back
+let queue_push_front q x = q.front <- x :: q.front
+
+let rec queue_pop q =
+  match q.front with
+  | x :: rest -> q.front <- rest; Some x
+  | [] -> (
+    match q.back with
+    | [] -> None
+    | back -> q.front <- List.rev back; q.back <- []; queue_pop q)
+
+(* Empties the queue in constant time, handing the two lists to the caller, who
+   assembles them OUTSIDE the lock. Building the list under it would allocate
+   there, which the rule for these locks forbids, and a broadcast is exactly where
+   the list is longest. *)
+let queue_take_all q =
+  let front = q.front and back = q.back in
+  q.front <- [];
+  q.back <- [];
+  (front, back)
+
+let queue_assemble (front, back) = front @ List.rev back
+
+(* A queue of waiters, with cancellation handled lazily: a cancelled waiter is
+   marked rather than removed, and dropped when it reaches the front. That makes
+   withdrawing O(1) under the lock and without allocation, where filtering the
+   queue made a storm of cancellations quadratic: every [Lwt.pick [lock m;
+   timeout]] that times out is one. Marked waiters are compacted away once they
+   outnumber the live ones, so a queue that is signalled rarely does not grow
+   with what was cancelled from it. The compaction is the one allocation under
+   a lock in this module, and it happens at most once per doubling. *)
+type 'a waiters = {
+  wq : 'a waiter queue;
+  mutable live : int;
+  mutable withdrawn : int;
+}
+
+let waiters_create () = { wq = queue_create (); live = 0; withdrawn = 0 }
+
+let waiters_push ws w =
+  queue_push ws.wq w;
+  ws.live <- ws.live + 1
+
+let rec waiters_pop ws =
+  match queue_pop ws.wq with
+  | None -> None
+  | Some w when w.w_withdrawn ->
+    ws.withdrawn <- ws.withdrawn - 1;
+    waiters_pop ws
+  | Some w ->
+    ws.live <- ws.live - 1;
+    Some w
+
+let waiters_withdraw ws w =
+  if not w.w_withdrawn then begin
+    w.w_withdrawn <- true;
+    ws.live <- ws.live - 1;
+    ws.withdrawn <- ws.withdrawn + 1;
+    if ws.withdrawn > 8 && ws.withdrawn > ws.live then begin
+      let live = List.filter (fun w -> not w.w_withdrawn) in
+      ws.wq.front <- live ws.wq.front;
+      ws.wq.back <- live ws.wq.back;
+      ws.withdrawn <- 0
+    end
+  end
+
+(* Empties the queue in constant time; the withdrawn waiters are dropped by
+   [waiters_assemble], outside the lock. *)
+let waiters_take_all ws =
+  let taken = queue_take_all ws.wq in
+  ws.live <- 0;
+  ws.withdrawn <- 0;
+  taken
+
+let waiters_assemble taken =
+  List.filter (fun w -> not w.w_withdrawn) (queue_assemble taken)
+
 type 'a t = {
   mutex : Mutex.t;
   mutable state : 'a state;
-  mutable waiters : 'a waiter list;
+  waiters : 'a waiters;
 }
 
-let create () = { mutex = Mutex.create (); state = Pending; waiters = [] }
+let create () =
+  { mutex = Mutex.create (); state = Pending; waiters = waiters_create () }
 
 let is_pending t =
   Mutex.lock t.mutex;
@@ -235,10 +321,9 @@ let settle t state =
   match t.state with
   | Pending ->
     t.state <- state;
-    let waiters = t.waiters in
-    t.waiters <- [];
+    let taken = waiters_take_all t.waiters in
     Mutex.unlock t.mutex;
-    Some waiters
+    Some (waiters_assemble taken)
   | Fulfilled _ | Rejected _ ->
     Mutex.unlock t.mutex;
     None
@@ -260,7 +345,7 @@ let cancel t =
 
 let withdraw t w =
   Mutex.lock t.mutex;
-  t.waiters <- List.filter (fun w' -> w' != w) t.waiters;
+  waiters_withdraw t.waiters w;
   Mutex.unlock t.mutex
 
 let await t =
@@ -269,10 +354,13 @@ let await t =
      domains. If [t] turns out to be settled, this promise is simply resolved at
      once. *)
   let promise, resolver = Lwt.task () in
-  let w = { w_loop = self (); w_promise = promise; w_resolver = resolver } in
+  let w =
+    { w_loop = self (); w_promise = promise; w_resolver = resolver;
+      w_withdrawn = false }
+  in
   Mutex.lock t.mutex;
   let state = t.state in
-  (match state with Pending -> t.waiters <- w :: t.waiters | _ -> ());
+  (match state with Pending -> waiters_push t.waiters w | _ -> ());
   Mutex.unlock t.mutex;
   match state with
   | Fulfilled v -> Lwt.wakeup resolver v; promise
@@ -342,49 +430,15 @@ let adopt (p : 'a Lwt.t) : 'a Lwt.t =
    terminates. That is what the [~on_dead] argument of [wake] is for, and it is
    the only subtle thing in these hundred lines. *)
 
-(* A first-in, first-out queue kept as a pair of lists. Short by nature: these are
-   domain boundaries, not hot paths. Holds waiters below, and stream items too. *)
-type 'a queue = { mutable front : 'a list; mutable back : 'a list }
-
-let queue_create () = { front = []; back = [] }
-let queue_push q x = q.back <- x :: q.back
-let queue_push_front q x = q.front <- x :: q.front
-
-let rec queue_pop q =
-  match q.front with
-  | x :: rest -> q.front <- rest; Some x
-  | [] -> (
-    match q.back with
-    | [] -> None
-    | back -> q.front <- List.rev back; q.back <- []; queue_pop q)
-
-(* Empties the queue in constant time, handing the two lists to the caller, who
-   assembles them OUTSIDE the lock. Building the list under it would allocate
-   there, which the rule for these locks forbids, and a broadcast is exactly where
-   the list is longest. *)
-let queue_take_all q =
-  let front = q.front and back = q.back in
-  q.front <- [];
-  q.back <- [];
-  (front, back)
-
-let queue_assemble (front, back) = front @ List.rev back
-
-(* Drops an element that has been withdrawn, by identity. O(n), on a queue that is
-   short. *)
-let queue_remove q x =
-  q.front <- List.filter (fun y -> y != x) q.front;
-  q.back <- List.filter (fun y -> y != x) q.back
-
 module Mutex = struct
   type t = {
     guard : Stdlib.Mutex.t;
     mutable held : bool;
-    waiters : unit waiter queue;
+    waiters : unit waiters;
   }
 
   let create () =
-    { guard = Stdlib.Mutex.create (); held = false; waiters = queue_create () }
+    { guard = Stdlib.Mutex.create (); held = false; waiters = waiters_create () }
 
   let is_locked t =
     Stdlib.Mutex.lock t.guard;
@@ -396,7 +450,7 @@ module Mutex = struct
      when a served waiter turns out to have been cancelled. *)
   let rec hand_over t =
     Stdlib.Mutex.lock t.guard;
-    match queue_pop t.waiters with
+    match waiters_pop t.waiters with
     | None ->
       t.held <- false;
       Stdlib.Mutex.unlock t.guard
@@ -418,7 +472,7 @@ module Mutex = struct
     let w = new_waiter () in
     Stdlib.Mutex.lock t.guard;
     let taken =
-      if t.held then (queue_push t.waiters w; false)
+      if t.held then (waiters_push t.waiters w; false)
       else (t.held <- true; true)
     in
     Stdlib.Mutex.unlock t.guard;
@@ -426,7 +480,7 @@ module Mutex = struct
     else begin
       Lwt.on_cancel w.w_promise (fun () ->
         Stdlib.Mutex.lock t.guard;
-        queue_remove t.waiters w;
+        waiters_withdraw t.waiters w;
         Stdlib.Mutex.unlock t.guard);
       w.w_promise
     end
@@ -440,12 +494,12 @@ module Semaphore = struct
   type t = {
     guard : Stdlib.Mutex.t;
     mutable count : int;
-    waiters : unit waiter queue;
+    waiters : unit waiters;
   }
 
   let create count =
     if count < 0 then invalid_arg "Lwt_multicore.Semaphore.create";
-    { guard = Stdlib.Mutex.create (); count; waiters = queue_create () }
+    { guard = Stdlib.Mutex.create (); count; waiters = waiters_create () }
 
   let available t =
     Stdlib.Mutex.lock t.guard;
@@ -456,7 +510,7 @@ module Semaphore = struct
   (* Gives the unit to the next live waiter, or puts it back in the count. *)
   let rec release t =
     Stdlib.Mutex.lock t.guard;
-    match queue_pop t.waiters with
+    match waiters_pop t.waiters with
     | None ->
       t.count <- t.count + 1;
       Stdlib.Mutex.unlock t.guard
@@ -469,14 +523,14 @@ module Semaphore = struct
     Stdlib.Mutex.lock t.guard;
     let taken =
       if t.count > 0 then (t.count <- t.count - 1; true)
-      else (queue_push t.waiters w; false)
+      else (waiters_push t.waiters w; false)
     in
     Stdlib.Mutex.unlock t.guard;
     if taken then Lwt.return_unit
     else begin
       Lwt.on_cancel w.w_promise (fun () ->
         Stdlib.Mutex.lock t.guard;
-        queue_remove t.waiters w;
+        waiters_withdraw t.waiters w;
         Stdlib.Mutex.unlock t.guard);
       w.w_promise
     end
@@ -487,16 +541,16 @@ module Semaphore = struct
 end
 
 module Condition = struct
-  type 'a t = { guard : Stdlib.Mutex.t; waiters : 'a waiter queue }
+  type 'a t = { guard : Stdlib.Mutex.t; waiters : 'a waiters }
 
-  let create () = { guard = Stdlib.Mutex.create (); waiters = queue_create () }
+  let create () = { guard = Stdlib.Mutex.create (); waiters = waiters_create () }
 
   (* Nothing is handed over by a signal, so a cancelled waiter is simply not
      there any more and the value is dropped, exactly as [Lwt_condition] does
      when nobody is waiting. *)
   let rec signal t v =
     Stdlib.Mutex.lock t.guard;
-    let w = queue_pop t.waiters in
+    let w = waiters_pop t.waiters in
     Stdlib.Mutex.unlock t.guard;
     match w with
     | None -> ()
@@ -504,20 +558,20 @@ module Condition = struct
 
   let broadcast t v =
     Stdlib.Mutex.lock t.guard;
-    let taken = queue_take_all t.waiters in
+    let taken = waiters_take_all t.waiters in
     Stdlib.Mutex.unlock t.guard;
     List.iter
       (fun w -> wake w v ~on_dead:(fun () -> ()))
-      (queue_assemble taken)
+      (waiters_assemble taken)
 
   let wait ?mutex t =
     let w = new_waiter () in
     Stdlib.Mutex.lock t.guard;
-    queue_push t.waiters w;
+    waiters_push t.waiters w;
     Stdlib.Mutex.unlock t.guard;
     Lwt.on_cancel w.w_promise (fun () ->
       Stdlib.Mutex.lock t.guard;
-      queue_remove t.waiters w;
+      waiters_withdraw t.waiters w;
       Stdlib.Mutex.unlock t.guard);
     (* Same discipline as [Lwt_condition.wait]: release the mutex while waiting
        and take it again afterwards, so that a signaller can get in. *)
@@ -536,10 +590,10 @@ module Stream = struct
     items : 'a queue;
     (* Loops waiting to take. Each expects an option, [None] meaning "closed and
        drained", so that a consumer learns the end rather than waiting for it. *)
-    takers : 'a option waiter queue;
+    takers : 'a option waiters;
     (* Loops waiting for room. They carry nothing: a woken pusher retries, which
        is what keeps cancellation from having to give a value back. *)
-    room : unit waiter queue;
+    room : unit waiters;
     (* Kept rather than counted: [queue_length] walks the lists, and walking them
        under the lock would be O(capacity) on every push. No allocation and no
        system call either way, so the rule for these locks was satisfied, but
@@ -553,8 +607,8 @@ module Stream = struct
     { guard = Stdlib.Mutex.create ();
       capacity;
       items = queue_create ();
-      takers = queue_create ();
-      room = queue_create ();
+      takers = waiters_create ();
+      room = waiters_create ();
       size = 0;
       closed = false }
 
@@ -575,7 +629,7 @@ module Stream = struct
      back rather than being lost, and goes to the FRONT so that order is kept. *)
   let rec deposit t v =
     Stdlib.Mutex.lock t.guard;
-    match queue_pop t.takers with
+    match waiters_pop t.takers with
     | Some w ->
       Stdlib.Mutex.unlock t.guard;
       wake w (Some v) ~on_dead:(fun () -> deposit t v)
@@ -587,7 +641,7 @@ module Stream = struct
   (* One unit of room has appeared: let the first waiting pusher retry. *)
   let rec offer_room t =
     Stdlib.Mutex.lock t.guard;
-    match queue_pop t.room with
+    match waiters_pop t.room with
     | None -> Stdlib.Mutex.unlock t.guard
     | Some w ->
       Stdlib.Mutex.unlock t.guard;
@@ -601,7 +655,7 @@ module Stream = struct
       Lwt.fail Closed
     end
     else
-      match queue_pop t.takers with
+      match waiters_pop t.takers with
       | Some taker ->
         (* Straight to a waiting consumer, without touching the buffer. *)
         Stdlib.Mutex.unlock t.guard;
@@ -618,11 +672,11 @@ module Stream = struct
           (* Full: this is the back-pressure. Wait for room and RETRY rather than
              leaving the value with the queue, which is what makes cancelling a
              push harmless: nothing has been handed over. *)
-          queue_push t.room w;
+          waiters_push t.room w;
           Stdlib.Mutex.unlock t.guard;
           Lwt.on_cancel w.w_promise (fun () ->
             Stdlib.Mutex.lock t.guard;
-            queue_remove t.room w;
+            waiters_withdraw t.room w;
             Stdlib.Mutex.unlock t.guard);
           Lwt.bind w.w_promise (fun () -> push t v)
         end
@@ -643,11 +697,11 @@ module Stream = struct
         Lwt.return_none
       end
       else begin
-        queue_push t.takers w;
+        waiters_push t.takers w;
         Stdlib.Mutex.unlock t.guard;
         Lwt.on_cancel w.w_promise (fun () ->
           Stdlib.Mutex.lock t.guard;
-          queue_remove t.takers w;
+          waiters_withdraw t.takers w;
           Stdlib.Mutex.unlock t.guard);
         w.w_promise
       end
@@ -657,12 +711,12 @@ module Stream = struct
     let taken_takers = ref ([], []) and taken_room = ref ([], []) in
     if not t.closed then begin
       t.closed <- true;
-      taken_takers := queue_take_all t.takers;
-      taken_room := queue_take_all t.room
+      taken_takers := waiters_take_all t.takers;
+      taken_room := waiters_take_all t.room
     end;
     Stdlib.Mutex.unlock t.guard;
-    let takers = ref (queue_assemble !taken_takers) in
-    let room = ref (queue_assemble !taken_room) in
+    let takers = ref (waiters_assemble !taken_takers) in
+    let room = ref (waiters_assemble !taken_room) in
     (* Consumers learn the end; producers waiting for room learn there will be
        none, since pushing to a closed stream fails. *)
     List.iter (fun w -> wake w None ~on_dead:(fun () -> ())) !takers;
