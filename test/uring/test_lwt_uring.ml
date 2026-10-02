@@ -257,6 +257,24 @@ let test_dup2_kind () =
   check "dup2 forgets the cached kind of the replaced file"
     (written = 4 && contents = "file")
 
+(* A routed write to a socket whose peer has closed fails with EPIPE, and does
+   not raise SIGPIPE, which by default would kill the process. *)
+let test_epipe () =
+  let a, b = Unix.socketpair Unix.PF_UNIX Unix.SOCK_STREAM 0 in
+  Unix.close b;
+  let a = Lwt_unix.of_unix_file_descr a in
+  let outcome =
+    Lwt_main.run
+      (Lwt.catch
+         (fun () -> Lwt_unix.write_string a "x" 0 1 >|= fun _ -> `Written)
+         (function
+           | Unix.Unix_error (Unix.EPIPE, _, _) -> Lwt.return `Epipe
+           | _ -> Lwt.return `Other))
+  in
+  Lwt_main.run (Lwt_unix.close a);
+  check "a write to a closed peer fails with EPIPE, without SIGPIPE"
+    (outcome = `Epipe)
+
 (* Lwt_unix.connect routed through io_uring (IORING_OP_CONNECT): a loopback TCP
    connection is established through the ring (the accept side uses the default
    path, whose readiness already runs on the engine), then exchanges data. *)
@@ -480,6 +498,7 @@ let test_available () =
   test_io_regular_file ();
   test_io_bigarray ();
   test_connect ();
+  test_epipe ();
   test_dup2_kind ();
   test_close_fails_io ();
   test_close_then_reuse ();

@@ -3,30 +3,64 @@
 
 
 
-(** An {{:https://en.wikipedia.org/wiki/Io_uring} io_uring}-based Lwt engine,
-    where Linux provides it.
+(** Lwt engine on {{:https://en.wikipedia.org/wiki/Io_uring} io_uring}, where
+    Linux provides it.
 
-    This module provides an alternative {!Lwt_engine} implementation backed by
-    Linux's io_uring interface, in place of the default libev/select engines. It
-    is a drop-in replacement: installing it with {!set} (or
-    [Lwt_engine.set (new Lwt_uring.uring ())]) makes the whole of [Lwt_unix]
-    run on io_uring, without any change to application code.
+    io_uring is the Linux interface for asynchronous system calls. This module
+    provides an {!Lwt_engine} engine that runs on it, and makes [Lwt_unix]
+    perform its common I/O through it, without any change to the code that
+    uses [Lwt_unix], [Lwt_io] or the libraries built on them.
 
-    {b This is the readiness-based engine (stage 1).} File-descriptor waits are
-    implemented with io_uring {e poll} submissions ([IORING_OP_POLL_ADD]) and
-    timers with io_uring {e timeout} submissions; [Lwt_unix] still performs the
-    actual [read]/[write]/… syscalls once a descriptor is reported ready, exactly
-    as with libev or select. The benefit over libev/select is that readiness and
-    timer registrations are {e batched} into a single [io_uring_enter] system
-    call per loop iteration. A later, completion-based stage will additionally
-    offload the [read]/[write]/[accept]/[connect] syscalls to the ring.
+    {2 Use}
 
-    {b Availability.} The package installs on every system, but io_uring
-    exists only on Linux, in a kernel that provides it and does not forbid it.
-    Elsewhere, and in an opam switch without the [uring] library, this module
-    has the same interface, with {!available} returning [false] and {!set}
-    raising [Lwt_sys.Not_available]: a program links the same way everywhere
-    and decides at run time. *)
+    Call {!set_if_available} once, before {!Lwt_main.run}:
+    {[
+      let () =
+        ignore (Lwt_uring.set_if_available ());
+        Lwt_main.run (main ())
+    ]}
+
+    The package installs on every system. Where io_uring is missing, that is
+    on any system but Linux, in an opam switch without the [uring] library, or
+    on a kernel that lacks or forbids io_uring, {!set_if_available} returns
+    [false] and the default engine stays. A program therefore links the same
+    way everywhere and decides at run time. Setting the environment variable
+    [LWT_URING] to [0] turns io_uring off without recompiling.
+
+    {2 What runs on io_uring}
+
+    Once the engine is installed:
+    - waits for a descriptor to become readable or writable, and timers, are
+      io_uring submissions, batched into one system call per iteration of the
+      loop;
+    - [Lwt_unix.read], [write], [read_bigarray] and [write_bigarray], which is
+      the path of [Lwt_io], and [connect] are completion-based: the kernel
+      performs the operation, and the promise resolves when it completes.
+      Sockets use [recv] and [send], regular files and block devices read and
+      write at the current position, other descriptors without a position;
+    - the other operations of [Lwt_unix], such as [accept], [recv], [send],
+      [pread] or [writev], keep their default implementation, whose waits run on
+      the ring.
+
+    {2 Differences from the default engines}
+
+    - Cancelling a completion-based operation, with [Lwt.cancel], [Lwt.pick]
+      or a timeout, rejects its promise with [Lwt.Canceled] at once and cancels
+      it in the kernel. If the kernel had already performed it, its effect
+      stands: bytes read are lost to the next read, bytes written are written.
+    - Closing or aborting a descriptor fails the completion-based operations
+      in flight on it, unless they completed first, with what the default path
+      raises: [Unix.Unix_error (EBADF, _, _)] for {!Lwt_unix.close}, the
+      exception for {!Lwt_unix.abort}.
+    - Replacing the engine, for instance with {!Lwt_engine.set}, cancels the
+      completion-based operations in flight: their promises are rejected with
+      [Lwt.Canceled], unless they completed first.
+    - Writing to a socket whose peer has closed fails with [EPIPE], and raises
+      no [SIGPIPE].
+    - Timers count the time the system spends suspended.
+    - In the child of {!Lwt_unix.fork}, the engine continues on a ring of its
+      own. The operations the parent had in flight are lost to the child, as
+      its pending jobs are. *)
 
 (** {2 Installing the engine} *)
 
@@ -40,14 +74,17 @@ val set : ?queue_depth:int -> unit -> unit
     engine, transferring the events registered on the previous engine (see
     {!Lwt_engine.set}).
 
+    Raises [Lwt_sys.Not_available "io_uring"] where io_uring is missing or
+    forbidden; {!set_if_available} falls back instead.
+
     @param queue_depth
-      the io_uring submission-queue depth, rounded up to a power of two by the
-      kernel. This is a batching/memory tuning knob, {e not} a hard limit on the
-      number of monitored descriptors: when the submission queue is momentarily
-      full it is flushed and the submission retried, and the kernel backlogs
-      completions if the completion queue overflows. A larger value batches more
-      registrations per system call at the cost of more locked memory (very
-      large values can fail with [ENOMEM]). Defaults to [256]. *)
+      the depth of the submission queue, rounded up to a power of two by the
+      kernel. It bounds how many submissions are batched into one system call,
+      not how many descriptors or operations can be in flight: a full queue is
+      flushed and the submission retried, and an iteration of the loop handles
+      at most that many completions, leaving the others to the next one. A
+      larger value costs locked memory, and a very large one can fail with
+      [ENOMEM]. Defaults to [256]. *)
 
 val set_if_available : ?queue_depth:int -> unit -> bool
 (** [set_if_available ?queue_depth ()] installs the io_uring engine as {!set}
@@ -73,24 +110,23 @@ type Lwt_engine.engine_id += Engine_id__uring
     when the engine is {{!Lwt_engine.abstract.destroy} destroyed}. Raises
     [Lwt_sys.Not_available "io_uring"] if the system has no io_uring
     ([ENOSYS]) or forbids it ([EPERM]); other failures, such as [ENOMEM] for a
-    queue too deep for the locked-memory limit, raise {!Unix.Unix_error}. *)
+    queue too deep for the locked-memory limit, raise [Unix.Unix_error]. *)
 class uring : ?queue_depth:int -> unit -> object
   inherit Lwt_engine.t
 end
 
-(** {2 Completion-based I/O}
+(** {2 Completion-based I/O on raw descriptors}
 
-    {b This is stage 2.} Unlike {!Lwt_unix}'s default operations — which wait for
-    a descriptor to become ready and then perform the syscall — these submit the
-    actual [read]/[write] to io_uring and resolve their promise on completion.
-    The kernel performs the transfer, so there is no separate readiness syscall,
-    and this works on regular files too (where readiness polling does not).
+    These operations submit a read or a write to the ring of the installed
+    engine and resolve when it completes. They work on any descriptor,
+    including regular files, which readiness cannot wait for. A [Unix.close]
+    of the descriptor does not stop the operations in flight on it; closing it
+    through [Lwt_unix] does.
 
-    They require a {!uring} engine to be installed (via {!set}); otherwise they
-    raise [Failure]. The descriptor is the raw {!Unix.file_descr} (use
-    {!Lwt_unix.unix_file_descr} to obtain it). For now this is an explicit API;
-    a later step will route {!Lwt_unix}'s own operations through it transparently
-    when the io_uring engine is active. *)
+    They raise [Failure] if no io_uring engine is installed, and
+    [Lwt_sys.Not_available] where io_uring is missing. They raise
+    [Invalid_argument] if [pos] and [len] do not designate a valid range of
+    the buffer. *)
 module Io : sig
   type bigarray =
     (char, Bigarray.int8_unsigned_elt, Bigarray.c_layout) Bigarray.Array1.t
