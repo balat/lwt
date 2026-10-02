@@ -49,6 +49,28 @@ let no_ring_here () =
   (try Sys.remove path with _ -> ());
   refused
 
+(* A descriptor belongs to the domain that created it. Used from another domain
+   that runs io_uring too, the routed path must refuse it as the default path
+   does, rather than submit it to the other domain's ring. *)
+let foreign_refused () =
+  let fa, fb = Lwt_unix.socketpair Unix.PF_UNIX Unix.SOCK_STREAM 0 in
+  ignore (Lwt_main.run (Lwt_unix.write_string fb "ping" 0 4));
+  let refused =
+    Domain.join
+      (Domain.spawn (fun () ->
+         Lwt_uring.set ();
+         let r =
+           match Lwt_main.run (Lwt_unix.read fa (Bytes.create 4) 0 4) with
+           | _ -> false
+           | exception Invalid_argument _ -> true
+         in
+         Lwt_engine.set (new Lwt_engine.select);
+         r))
+  in
+  (try Lwt_main.run (Lwt_unix.close fa) with _ -> ());
+  (try Lwt_main.run (Lwt_unix.close fb) with _ -> ());
+  refused
+
 let () =
   if not (Lwt_uring.available ()) then
     print_endline "per-domain rings: skipped (no io_uring here)"
@@ -76,6 +98,8 @@ let () =
             Lwt_engine.set (new Lwt_engine.select);
             ok)));
     check "and ours still works afterwards" (socket_roundtrip ());
+    check "a descriptor of this domain is refused on another one"
+      (foreign_refused ());
 
     if !failures > 0 then exit 1;
     print_endline "per-domain rings: ok"

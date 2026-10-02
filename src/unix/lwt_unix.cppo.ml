@@ -911,10 +911,11 @@ let read ch buf pos len =
       | false ->
         wrap_syscall Read ch (fun () -> stub_read ch.fd buf pos len)
     in
-    (* Only route an open descriptor to the completion backend; for a closed or
-       aborted one the default path raises the expected exception. *)
+    (* Only route an open descriptor of this domain to the completion backend;
+       for a closed, aborted or foreign one the default path raises the expected
+       exception. *)
     match ch.state, !completion_io with
-    | Opened, Some io ->
+    | Opened, Some io when ch.owner = Lwt_dls.self_token () ->
       (match io.read ch buf pos len with Some p -> p | None -> default ())
     | _ -> default ()
 
@@ -949,7 +950,7 @@ let read_bigarray function_name fd buf pos len =
           stub_read_bigarray (unix_file_descr fd) buf pos len)
     in
     match fd.state, !completion_io with
-    | Opened, Some io ->
+    | Opened, Some io when fd.owner = Lwt_dls.self_token () ->
       (match io.read_bigarray fd buf pos len with Some p -> p | None -> default ())
     | _ -> default ()
 
@@ -983,10 +984,11 @@ let write ch buf pos len =
       | false ->
         wrap_syscall Write ch (fun () -> stub_write ch.fd buf pos len)
     in
-    (* Only route an open descriptor to the completion backend; for a closed or
-       aborted one the default path raises the expected exception. *)
+    (* Only route an open descriptor of this domain to the completion backend;
+       for a closed, aborted or foreign one the default path raises the expected
+       exception. *)
     match ch.state, !completion_io with
-    | Opened, Some io ->
+    | Opened, Some io when ch.owner = Lwt_dls.self_token () ->
       (match io.write ch buf pos len with Some p -> p | None -> default ())
     | _ -> default ()
 
@@ -1029,7 +1031,7 @@ let write_bigarray function_name fd buf pos len =
           stub_write_bigarray (unix_file_descr fd) buf pos len)
     in
     match fd.state, !completion_io with
-    | Opened, Some io ->
+    | Opened, Some io when fd.owner = Lwt_dls.self_token () ->
       (match io.write_bigarray fd buf pos len with
        | Some p -> p
        | None -> default ())
@@ -2072,7 +2074,7 @@ let connect ch addr =
       end
   in
   match ch.state, !completion_io with
-  | Opened, Some io ->
+  | Opened, Some io when ch.owner = Lwt_dls.self_token () ->
     (match io.connect ch addr with Some p -> p | None -> default ())
   | _ -> default ()
 
