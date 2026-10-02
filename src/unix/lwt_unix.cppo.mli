@@ -1499,40 +1499,6 @@ val set_affinity : ?pid : int -> int list -> unit
 
 (** {2 Completion-based I/O backend} *)
 
-type completion_io = {
-  read : file_descr -> bytes -> int -> int -> int Lwt.t option;
-  write : file_descr -> bytes -> int -> int -> int Lwt.t option;
-  read_bigarray :
-    file_descr ->
-    (char, Bigarray.int8_unsigned_elt, Bigarray.c_layout) Bigarray.Array1.t ->
-    int -> int -> int Lwt.t option;
-  write_bigarray :
-    file_descr ->
-    (char, Bigarray.int8_unsigned_elt, Bigarray.c_layout) Bigarray.Array1.t ->
-    int -> int -> int Lwt.t option;
-  connect : file_descr -> Unix.sockaddr -> unit Lwt.t option;
-  on_close : Unix.file_descr -> unit;
-  on_abort : Unix.file_descr -> exn -> unit;
-}
-(** A completion-based I/O backend (e.g. io_uring), installed by a library such
-    as [lwt_uring]. Each function may return [Some promise] to perform the
-    operation through the backend, or [None] to decline, in which case Lwt's
-    default readiness/job path is used. The bigarray variants cover the path
-    taken by {!Lwt_io} (and hence most higher-level libraries).
-
-    [connect] resolves once the connection completes (or fails); it is only
-    consulted for sockets. ([accept] is intentionally not part of this hook:
-    routing single-shot [accept] through completion measured slower than the
-    readiness path, which already runs on the io_uring engine.)
-
-    [on_close] is called when {!close} closes a descriptor, or {!dup2}
-    replaces the file it names, before the file is closed. The backend fails
-    the operations it has in flight on the descriptor, as the default path
-    fails its waiters, and submits what it has prepared: once the file is
-    closed, the number may name another one. [on_abort] is called when
-    {!abort} aborts a descriptor; the backend fails the operations it has in
-    flight on it with the exception. *)
-
 val fd_kind : file_descr -> Unix.file_kind
 (** [fd_kind fd] is the [Unix.fstat] kind of [fd] (whether it is a socket, a
     regular file, a pipe, …), computed once and cached. A completion-based I/O
@@ -1540,12 +1506,45 @@ val fd_kind : file_descr -> Unix.file_kind
     [send]/[recv] for sockets vs positioned [read]/[write] for files). Defaults
     to [Unix.S_CHR] if [fstat] fails. *)
 
-val set_completion_io : completion_io option -> unit
-(** [set_completion_io backend] installs (or, with [None], removes) a
-    completion-based I/O backend. When one is installed, {!read} and {!write}
-    consult it first and fall back to the default path when it declines. This is
-    intended for engine providers (such as [lwt_uring]); ordinary applications
-    do not need to call it. *)
+val set_completion_io :
+  ?read:(file_descr -> bytes -> int -> int -> int Lwt.t option) ->
+  ?write:(file_descr -> bytes -> int -> int -> int Lwt.t option) ->
+  ?read_bigarray:
+    (file_descr ->
+     (char, Bigarray.int8_unsigned_elt, Bigarray.c_layout) Bigarray.Array1.t ->
+     int -> int -> int Lwt.t option) ->
+  ?write_bigarray:
+    (file_descr ->
+     (char, Bigarray.int8_unsigned_elt, Bigarray.c_layout) Bigarray.Array1.t ->
+     int -> int -> int Lwt.t option) ->
+  ?connect:(file_descr -> Unix.sockaddr -> unit Lwt.t option) ->
+  ?on_close:(Unix.file_descr -> unit) ->
+  ?on_abort:(Unix.file_descr -> exn -> unit) ->
+  unit -> unit
+(** [set_completion_io ?read ?write ?read_bigarray ?write_bigarray ?connect
+    ?on_close ?on_abort ()] installs a completion-based I/O backend, such as
+    the io_uring one of [lwt_uring], in place of any previous one; called with
+    no function, it removes the backend. This is intended for engine providers;
+    ordinary applications do not need it.
+
+    {!read}, {!write}, {!Lwt_bytes.read}, {!Lwt_bytes.write}, which are the
+    path of {!Lwt_io} and so of most higher-level libraries, and {!connect}
+    call the corresponding function on an open descriptor. It returns
+    [Some promise] to perform the operation through the backend, or [None] to
+    decline, in which case Lwt's default path runs. [connect] is only called
+    for sockets.
+
+    [on_close] is called when {!close} closes a descriptor, or {!dup2}
+    replaces the file it names, before the file is closed. The backend fails
+    the operations it has in flight on the descriptor, as the default path
+    fails its waiters, and must not submit anything more for it: once the file
+    is closed, the number may name another one. [on_abort] is called when
+    {!abort} aborts a descriptor; the backend fails the operations it has in
+    flight on it with the exception.
+
+    An omitted function declines, or does nothing. Later versions of Lwt may
+    add functions to this list, as further optional arguments, so that a
+    backend written for this one keeps compiling and working. *)
 
 (** {2 Versioned interfaces} *)
 

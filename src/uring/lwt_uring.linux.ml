@@ -647,7 +647,7 @@ end
    fully overwrite [0,len) and reads only expose the [n] bytes the kernel
    wrote), and the result post-processing runs inside the completion handler
    ([submit_io]'s [post]), so a read costs one promise, not two. *)
-let completion_backend : Lwt_unix.completion_io =
+let () =
   (* Without an engine, a read still gets the bytes a cancelled read kept, if
      the engine that kept them has been replaced. *)
   let read ch buf pos len =
@@ -722,10 +722,8 @@ let completion_backend : Lwt_unix.completion_io =
      [uring] API surface used here) would batch and might flip that verdict. *)
   let on_close fd = stop_descriptor fd closed in
   let on_abort fd e = stop_descriptor fd e in
-  { Lwt_unix.read; write; read_bigarray; write_bigarray; connect; on_close;
-    on_abort }
-
-let () = Lwt_unix.set_completion_io (Some completion_backend)
+  Lwt_unix.set_completion_io ~read ~write ~read_bigarray ~write_bigarray
+    ~connect ~on_close ~on_abort ()
 
 let available () =
   match create_ring ~queue_depth:1 with

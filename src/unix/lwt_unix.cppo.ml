@@ -425,7 +425,7 @@ type bigarray =
    +-----------------------------------------------------------------+ *)
 
 (* An optional completion-based I/O backend, installed by a library such as
-   [lwt_uring]. When present, the basic read/write operations (including the
+   [lwt_uring] through [set_completion_io]. When present, the basic read/write operations (including the
    bigarray ones used by [Lwt_io]) consult it before falling back to the default
    readiness/job path. Each function returns [Some promise] to take over the
    operation, or [None] to decline (e.g. when its engine is not currently
@@ -440,8 +440,8 @@ type completion_io = {
   on_close : Unix.file_descr -> unit;
   (* Called when a descriptor is closed, or replaced by [dup2], BEFORE
      close(2): the backend fails the operations it has in flight on it, as
-     the readiness path fails its waiters, and submits what it has prepared,
-     while the number still names the file. *)
+     the readiness path fails its waiters, and submits nothing more for it,
+     since the number may then name another file. *)
   on_abort : Unix.file_descr -> exn -> unit;
   (* Called when a descriptor is aborted: the backend fails the operations it
      has in flight on it with the exception. *)
@@ -449,7 +449,21 @@ type completion_io = {
 
 let completion_io : completion_io option ref = ref None
 
-let set_completion_io backend = completion_io := backend
+let set_completion_io ?read ?write ?read_bigarray ?write_bigarray ?connect
+    ?on_close ?on_abort () =
+  match read, write, read_bigarray, write_bigarray, connect, on_close, on_abort with
+  | None, None, None, None, None, None, None -> completion_io := None
+  | _ ->
+    let decline _ _ _ _ = None in
+    completion_io :=
+      Some
+        { read = Option.value read ~default:decline;
+          write = Option.value write ~default:decline;
+          read_bigarray = Option.value read_bigarray ~default:decline;
+          write_bigarray = Option.value write_bigarray ~default:decline;
+          connect = Option.value connect ~default:(fun _ _ -> None);
+          on_close = Option.value on_close ~default:ignore;
+          on_abort = Option.value on_abort ~default:(fun _ _ -> ()) }
 
 let abort ch e =
   if ch.state <> Closed then begin

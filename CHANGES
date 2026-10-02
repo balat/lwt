@@ -10,10 +10,11 @@
     installs on every system: elsewhere, set_if_available returns false and
     the default engine stays. LWT_URING=0 turns io_uring off at run time.
 
-  * Lwt_unix.completion_io, set_completion_io and fd_kind: hooks that let a
+  * Lwt_unix.set_completion_io and Lwt_unix.fd_kind: hooks that let a
     completion-based I/O backend, such as lwt_uring, take over read, write and
     connect, and learn when a descriptor is closed, aborted or replaced by
-    dup2.
+    dup2. Its functions are optional arguments, so that later versions can
+    add some without breaking existing backends.
 
 ====== Fixes ======
 
