@@ -114,13 +114,18 @@ class uring ?(queue_depth = 256) () = object
 
   val ring : req U.t = U.create ~queue_depth ()
 
+  (* [false] in the child of a [Lwt_unix.fork]: [ring] then belongs to the
+     parent (see [fork]) and nothing here may touch it any more, neither to
+     cancel, submit nor exit. *)
+  val mutable live = true
+
   initializer the_ring := Some ring
 
   method id = Engine_id__uring
 
   method private cleanup =
     (match !the_ring with Some r when r == ring -> the_ring := None | _ -> ());
-    U.exit ring
+    if live then U.exit ring
 
   method private register_readable fd f =
     let pr =
@@ -129,7 +134,8 @@ class uring ?(queue_depth = 256) () = object
     submit_poll ring pr;
     lazy (
       pr.active <- false;
-      match pr.job with Some job -> cancel ring job | None -> ())
+      if live then
+        match pr.job with Some job -> cancel ring job | None -> ())
 
   method private register_writable fd f =
     let pr =
@@ -138,7 +144,8 @@ class uring ?(queue_depth = 256) () = object
     submit_poll ring pr;
     lazy (
       pr.active <- false;
-      match pr.job with Some job -> cancel ring job | None -> ())
+      if live then
+        match pr.job with Some job -> cancel ring job | None -> ())
 
   method private register_timer delay repeat f =
     let ns = Int64.of_float (delay *. 1e9) in
@@ -146,7 +153,8 @@ class uring ?(queue_depth = 256) () = object
     submit_timer ring tr;
     lazy (
       tr.t_active <- false;
-      match tr.t_job with Some job -> cancel ring job | None -> ())
+      if live then
+        match tr.t_job with Some job -> cancel ring job | None -> ())
 
   method iter block =
     ignore (U.submit ring);
@@ -164,6 +172,21 @@ class uring ?(queue_depth = 256) () = object
       | U.None -> ()
     in
     drain ()
+
+  (* Called by [Lwt_unix.fork] in the child, before anything else. The child
+     inherits the ring's memory, which is shared with the parent, and its own
+     copy of liburing's bookkeeping: as soon as the parent submits again, that
+     copy is stale and every submission from the child sees a full ring (or
+     worse, writes into entries the parent owns). So the child abandons the
+     inherited ring without touching it, which the [live] flag guarantees, and
+     carries on with a fresh engine on a ring of its own: [Lwt_engine.set]
+     re-registers every event on it. The parent's in-flight operations are
+     lost to the child, like its pending [Lwt_unix] jobs: the child's copies of
+     their promises stay pending. The inherited mapping and descriptor are not
+     released in the child; they go with it at exit or exec. *)
+  method! fork =
+    live <- false;
+    Lwt_engine.set ~destroy:false (new uring ~queue_depth ())
 end
 
 let get_ring () =

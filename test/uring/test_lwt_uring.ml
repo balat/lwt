@@ -173,6 +173,37 @@ let test_connect () =
   check "connect routed through io_uring" (read = n && Bytes.equal got msg);
   Lwt_main.run (Lwt_unix.close lsock)
 
+(* The child of [Lwt_unix.fork] gets a ring of its own and keeps running on
+   io_uring (here a timer and a routed write), while the parent goes on using
+   the inherited ring to read the child's reply. *)
+let test_fork () =
+  let r, w = Unix.pipe () in
+  match Lwt_unix.fork () with
+  | 0 ->
+    Unix.close r;
+    let w = Lwt_unix.of_unix_file_descr w in
+    let reply =
+      match Lwt_engine.id () with
+      | Lwt_uring.Engine_id__uring -> "uring"
+      | _ -> "other"
+    in
+    Lwt_main.run begin
+      Lwt_unix.sleep 0.01 >>= fun () ->
+      Lwt_unix.write_string w reply 0 (String.length reply) >>= fun _ ->
+      Lwt_unix.close w
+    end;
+    Unix._exit 0
+  | pid ->
+    Unix.close w;
+    let r = Lwt_unix.of_unix_file_descr r in
+    let buf = Bytes.create 5 in
+    let n = Lwt_main.run (Lwt_unix.read r buf 0 5) in
+    let _, status = Unix.waitpid [] pid in
+    Lwt_main.run (Lwt_unix.close r);
+    check "the child of a fork runs Lwt on a ring of its own"
+      (n = 5 && Bytes.sub_string buf 0 n = "uring" && status = Unix.WEXITED 0)
+
+
 let () =
   check "io_uring is available" (Lwt_uring.available ());
   Lwt_uring.set ();
@@ -188,6 +219,7 @@ let () =
   test_io_regular_file ();
   test_io_bigarray ();
   test_connect ();
+  test_fork ();
   if !failures = 0 then Printf.printf "\nAll tests passed.\n%!"
   else begin
     Printf.printf "\n%d test(s) failed.\n%!" !failures;
