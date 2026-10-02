@@ -2584,7 +2584,23 @@ let tcflow ch act =
    drains that channel. *)
 let () =
   drain_notifications :=
-    fun chan -> Array.iter call_notification (recv_notifications chan)
+    fun chan ->
+      (* Every handler of the batch runs, even if one raises: the buffer was
+         emptied by the receive, so a handler skipped here is a job completion
+         or a signal lost for good. The first exception is raised again once
+         the batch is done, with its backtrace. *)
+      let first = ref None in
+      Array.iter
+        (fun id ->
+           match call_notification id with
+           | () -> ()
+           | exception exn ->
+             if !first = None then
+               first := Some (exn, Printexc.get_raw_backtrace ()))
+        (recv_notifications chan);
+      match !first with
+      | None -> ()
+      | Some (exn, bt) -> Printexc.raise_with_backtrace exn bt
 
 (* +-----------------------------------------------------------------+
    | Signals                                                         |
