@@ -417,6 +417,22 @@ let review_suite = suite "review findings" [
     !timer
   end;
 
+  test "a wakeup_later in a spawn body does not run the waiter on the body's stack" begin fun () ->
+    (* The waiter awaits what the body does afterwards: run on the body's
+       stack, it would park the body, and nothing would resolve q. *)
+    let q, rq = Lwt.wait () in
+    let p, r = Lwt.wait () in
+    let waiter = p >|= fun () -> await q in
+    let body =
+      Lwt_direct.spawn (fun () ->
+        Lwt.wakeup_later r ();
+        Lwt.wakeup rq ();
+        await waiter;
+        true)
+    in
+    Lwt.pick [body; (Lwt_unix.sleep 1.0 >|= fun () -> false)]
+  end;
+
   test "abandon_paused also drops the pauses already queued as tasks" begin fun () ->
     let pz = Lwt.pause () in
     Lwt.Private.scheduler_serve_paused ();

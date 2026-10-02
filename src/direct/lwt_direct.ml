@@ -42,6 +42,12 @@ let push_resume f : unit = Lwt.Private.scheduler_enqueue f
    not keep the engine, the timers and the pauses from running. *)
 let push_next_lap f : unit = Lwt.Private.scheduler_enqueue_next_lap f
 
+(* The body of a task runs as a callback runs, at depth 1 of the resolution
+   loop, so that a [wakeup_later] it performs never runs the awakened
+   continuation on its stack: deferred to the end of the body, or handed to
+   the run queue at its next suspension. *)
+let in_resolution_loop = Lwt.Private.in_resolution_loop
+
 [@@@alert "+trespassing"]
 
 (* part 2: effects, performing them *)
@@ -147,10 +153,11 @@ let with_effect_handler (f : unit -> unit) : unit =
 
 let run_inside_effect_handler_and_resolve_ (type a) (promise : a Lwt.u) f () : unit =
   with_effect_handler (fun () ->
-    Storage.reset_to_empty();
-    match f () with
-    | res -> Lwt.wakeup promise res
-    | exception exc -> Lwt.wakeup_exn promise exc)
+    in_resolution_loop (fun () ->
+      Storage.reset_to_empty();
+      match f () with
+      | res -> Lwt.wakeup promise res
+      | exception exc -> Lwt.wakeup_exn promise exc))
 
 let spawn f : _ Lwt.t =
   let lwt, resolve = Lwt.wait () in
@@ -161,11 +168,12 @@ let spawn f : _ Lwt.t =
 
 let run_inside_effect_handler_in_the_background_ f () : unit =
   with_effect_handler (fun () ->
-    Storage.reset_to_empty();
-    try
-      f ()
-    with exn ->
-      !Lwt.async_exception_hook exn)
+    in_resolution_loop (fun () ->
+      Storage.reset_to_empty();
+      try
+        f ()
+      with exn ->
+        !Lwt.async_exception_hook exn))
 
 let spawn_in_the_background f : unit =
   push_task (run_inside_effect_handler_in_the_background_ f)
