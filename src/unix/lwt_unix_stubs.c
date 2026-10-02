@@ -1117,7 +1117,15 @@ CAMLprim value lwt_unix_reset_notification_channel(value val_index) {
    A table rather than a list, deliberately: [handle_signal] runs in
    async-signal context, where allocating, locking and following a freed pointer
    are all forbidden. Reading a static array of integers is none of those. An
-   entry is written by OCaml, one word at a time, and 0 means nobody. */
+   entry is written by OCaml, one word at a time, and 0 means nobody.
+
+   Written under [signal_table_mutex] by the loop that subscribes, and read by
+   the handler on whatever thread the signal interrupted, without the mutex: so
+   with release stores and acquire loads, as the notification table above. A
+   plain read there is a data race, which ThreadSanitizer reports once Lwt's C
+   code is instrumented, and the acquire is what makes the channel the id names
+   visible to the handler on a weakly ordered processor. Lock-free atomic loads
+   are async-signal-safe. */
 static intnat signal_notifications[NSIG][LWT_NOTIFICATION_CHANNELS];
 
 CAMLextern int caml_convert_signal_number(int);
@@ -1139,7 +1147,7 @@ static void handle_signal(int signum) {
     signal(signum, handle_signal);
 #endif
     for (i = 0; i < LWT_NOTIFICATION_CHANNELS; i++) {
-      intnat id = signal_notifications[signum][i];
+      intnat id = LWT_LOAD_ACQUIRE(&signal_notifications[signum][i]);
       if (id != 0) lwt_unix_send_notification(id);
     }
   }
@@ -1233,7 +1241,7 @@ static BOOL WINAPI handle_break(DWORD event) {
   int i, sent = 0;
   if (event != CTRL_C_EVENT && event != CTRL_BREAK_EVENT) return FALSE;
   for (i = 0; i < LWT_NOTIFICATION_CHANNELS; i++) {
-    intnat id = signal_notifications[SIGINT][i];
+    intnat id = LWT_LOAD_ACQUIRE(&signal_notifications[SIGINT][i]);
     if (id != 0) {
       lwt_unix_send_notification(id);
       sent = 1;
@@ -1260,13 +1268,13 @@ CAMLprim value lwt_unix_set_signal(value val_signum, value val_notification, val
   slot = LWT_NOTIFICATION_INDEX(notification);
   lwt_unix_mutex_lock(&signal_table_mutex);
   first = (signal_subscriber_count(signum) == 0);
-  signal_notifications[signum][slot] = notification;
+  LWT_STORE_RELEASE(&signal_notifications[signum][slot], notification);
 
   /* The process-wide handler is installed by the FIRST subscriber only; a second
      loop subscribing must not reinstall it, and must not be told it failed. */
   if (!Bool_val(val_forwarded) && first) {
     error = install_process_handler(signum, &name);
-    if (error != 0) signal_notifications[signum][slot] = 0;
+    if (error != 0) LWT_STORE_RELEASE(&signal_notifications[signum][slot], 0);
   }
   lwt_unix_mutex_unlock(&signal_table_mutex);
 
@@ -1284,7 +1292,7 @@ CAMLprim value lwt_unix_remove_signal(value val_signum, value val_notification,
   int slot = LWT_NOTIFICATION_INDEX(Long_val(val_notification));
 
   lwt_unix_mutex_lock(&signal_table_mutex);
-  signal_notifications[signum][slot] = 0;
+  LWT_STORE_RELEASE(&signal_notifications[signum][slot], 0);
   if (!Bool_val(val_forwarded) && signal_subscriber_count(signum) == 0)
     uninstall_process_handler(signum);
   lwt_unix_mutex_unlock(&signal_table_mutex);
