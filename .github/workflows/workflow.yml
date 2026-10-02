@@ -90,7 +90,7 @@ jobs:
 
       # lwt_uring installs everywhere: the real engine where opam provides
       # ocaml-uring (Linux), a stub reporting io_uring as unavailable elsewhere.
-      - run: opam install ./lwt_uring.opam --deps-only --with-test
+      - run: opam install ./lwt.opam ./lwt_uring.opam --deps-only --with-test
 
       - run: opam exec -- dune build --only-packages lwt,lwt_react,lwt_retry
 

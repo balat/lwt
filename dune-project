@@ -71,12 +71,14 @@
 
 (package
  (name lwt_uring)
- (version 6.0.0)
+ (version 1.0.0)
  (synopsis "Lwt engine based on io_uring, where Linux provides it")
  (depends
   (ocaml (>= 4.14))
   base-unix
-  (lwt (>= 6))
+  ; The first lwt with the completion backend of Lwt_unix (set_completion_io,
+  ; fd_kind), whose optional arguments let later versions extend it.
+  (lwt (>= 6.2.0))
   ; Only where ocaml-uring exists. Elsewhere lwt_uring builds a stub that
   ; reports io_uring as unavailable (see src/uring/dune).
   (uring (and (>= 2.14) (= :os linux)))
