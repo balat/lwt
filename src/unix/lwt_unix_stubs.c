@@ -1122,9 +1122,16 @@ static intnat signal_notifications[NSIG][LWT_NOTIFICATION_CHANNELS];
 
 CAMLextern int caml_convert_signal_number(int);
 
-/* Send a notification to every loop subscribed to this signal. */
+/* Send a notification to every loop subscribed to this signal.
+
+   [errno] is saved and restored: sending writes to an eventfd or a pipe and
+   masks signals, any of which may set it, and the handler may have interrupted
+   a thread between a failing system call and its reading of [errno], which
+   would then read ours. ThreadSanitizer reports it as "signal handler spoils
+   errno". */
 static void handle_signal(int signum) {
   int i;
+  int saved_errno = errno;
   if (signum >= 0 && signum < NSIG) {
 #if defined(LWT_ON_WINDOWS)
     /* The signal handler must be reinstalled if we use the signal
@@ -1136,6 +1143,7 @@ static void handle_signal(int signum) {
       if (id != 0) lwt_unix_send_notification(id);
     }
   }
+  errno = saved_errno;
 }
 
 /* Serialises the changes of subscription across loops. Whether a loop is the
