@@ -50,6 +50,12 @@ val spawn : (unit -> 'a) -> 'a Lwt.t
     Cancelling the promise returned by [spawn] has no effect: the execution of
     [f ()] continues and the promise is not cancelled.
 
+    The task runs as a callback does, at depth 1 of Lwt's resolution loop: a
+    {!Lwt.wakeup_later} it performs defers the callbacks of the promise to the
+    end of the task, or to its next suspension, so they never run on the
+    task's stack. {!Lwt.wakeup} runs them at once, as documented, and if one
+    of them awaits, the task waits with it.
+
     When [f ()] terminates (successfully or not), the promise
     [spawn f] is resolved with [f ()]'s result, or the exception
     raised by [f ()]. *)

@@ -2014,6 +2014,12 @@ module Private = struct
   let scheduler_next_lap_pending () =
     let sched = self_sched () in
     sched.paused_n > 0 || sched.yielded <> []
+
+  (* Run [f] as a callback runs, at depth 1 of the resolution loop: a
+     [wakeup_later] inside defers its callbacks to the end of [f], or to its
+     next suspension, which hands them to the run queue; they never run on
+     [f]'s stack. For the bodies of direct-style tasks. *)
+  let in_resolution_loop f = run_in_resolution_loop (self_sched ()) f
   let scheduler_defer_fills f x = defer_fills (self_sched ()) f x
 
   (* The resolution state a suspended fiber takes with it; see [suspend]. *)

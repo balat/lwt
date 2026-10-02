@@ -2172,6 +2172,15 @@ module Private : sig
   (** Whether a pause or a next-lap thunk is waiting for the next idle lap. A
       backend's idle hook must then not block on its engine. *)
 
+  val in_resolution_loop : (unit -> unit) -> unit
+  (** Runs the function as a callback runs, at depth 1 of the resolution
+      loop: a {!wakeup_later} inside defers its callbacks to the end of the
+      function, or to its next suspension, which hands them to the run queue;
+      they never run on the function's stack. For the body of a direct-style
+      task, which would otherwise run at depth 0 and have a waiter's
+      continuation run on its stack, a deadlock if that continuation awaited
+      something the task does afterwards. *)
+
   val scheduler_defer_fills : ('a -> unit) -> 'a -> unit
   (** [scheduler_defer_fills f x] runs [f x] with every promise resolution it
       performs queuing its callbacks as a task of the run queue, FIFO, instead
