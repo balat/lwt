@@ -25,6 +25,11 @@ type loop = {
      can be routed to it. *)
   dom : int;
   inbox : job Inbox.t;
+  (* Whether a wake-up is already on its way: N posts before the loop drains
+     send ONE notification, not N notifications and N-1 empty drains, each
+     through the process-wide table of notifiers. Cleared by the drain before
+     it pops, so that a post after that point sends again. *)
+  armed : bool Atomic.t;
   (* Wakes this loop. A notification id names the channel of the domain that
      created it, so sending it from anywhere wakes the right loop; that machinery
      is [Lwt_unix]'s and predates this module. *)
@@ -37,7 +42,8 @@ exception Loop_terminated
    the right domain with nothing held. [pop_opt] raises [Closed] once the queue is
    both closed and empty, which happens only after the domain has gone; there is
    no handler to run then, but the guard keeps the shape obvious. *)
-let drain inbox =
+let drain inbox armed =
+  Atomic.set armed false;
   let rec go () =
     match Inbox.pop_opt inbox with
     | Some job ->
@@ -94,8 +100,11 @@ let self_slot : loop Lwt_dls.t =
   Lwt_dls.new_key (fun () ->
     let dom = (Domain.self () :> int) in
     let inbox = Inbox.create () in
-    let notification = Lwt_unix.make_notification (fun () -> drain inbox) in
-    let l = { dom; inbox; notification } in
+    let armed = Atomic.make false in
+    let notification =
+      Lwt_unix.make_notification (fun () -> drain inbox armed)
+    in
+    let l = { dom; inbox; notification; armed } in
     register l;
     (* Closing the inbox is what makes a later [run_on] fail instead of dropping
        work silently. The notification goes too, so the id stops naming a live
@@ -123,8 +132,10 @@ let post loop job =
    | () -> ()
    | exception Inbox.Closed -> raise Loop_terminated);
   (* Outside the push, and after it: the notification is a system call, and the
-     work must be visible before the wake-up that announces it. *)
-  Lwt_unix.send_notification loop.notification
+     work must be visible before the wake-up that announces it. Only the first
+     post since the last drain sends it. *)
+  if not (Atomic.exchange loop.armed true) then
+    Lwt_unix.send_notification loop.notification
 
 (* The public one carries nothing back, so there is nothing to undo. *)
 let run_on loop f = post loop { run = f; abandon = ignore }
