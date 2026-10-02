@@ -7,8 +7,8 @@ is the class of bug this work is most exposed to: two domains touching the same
 mutable field with no synchronisation between them.
 
 Instrumentation of OCaml code is emitted by `ocamlopt` itself, so this needs a
-switch whose **compiler** was built with TSan. C stubs are instrumented too, since
-dune compiles them through that same `ocamlc`.
+switch whose **compiler** was built with TSan. C stubs are NOT instrumented by
+default, and `run.sh` has to see to it; see "C stubs" below.
 
 ## Building the switch
 
@@ -115,3 +115,27 @@ script separates from a test that merely failed.
 liburing share memory with the kernel, and TSan cannot see the barriers that order
 those accesses. **Nothing in Lwt's own OCaml code is suppressed**, so a report
 pointing there is a finding.
+
+## C stubs
+
+dune compiles C stubs with the compiler's `ocamlc_cflags`, and on a TSan switch
+those do not carry `-fsanitize=thread`: only `native_cflags` do (`ocamlopt -config`
+shows both). So by default Lwt's C code is not instrumented, and that costs three
+things, all of which happened here before it was noticed.
+
+- **Its races are invisible.** TSan sees nothing of the notification table, the
+  signal table or the job pool beyond the libc calls it intercepts.
+- **Its synchronisation is invisible too, which produces false reports.** The
+  notification table is ordered by acquire loads and release stores; uninstrumented,
+  those are plain moves, TSan sees no happens-before edge, and it reports races on
+  the mutex and the descriptor of a channel that is correctly published.
+- **TSan crashes.** When an exception is raised from C, the OCaml runtime unwinds
+  the C frames and calls `__tsan_func_exit` for each, including frames of
+  uninstrumented code that never called `__tsan_func_entry`. TSan's shadow stack
+  underflows, and it later dies hashing a corrupt stack
+  (`SEGV ... MurMur2Hash64Builder::add`), typically in a test that does a lot of
+  non-blocking I/O, since every `EAGAIN` is such a raise.
+
+`run.sh` therefore builds with `--workspace=test/tsan/dune-workspace.tsan`, which
+adds the native flags to `c_flags`. To check that it worked, look for `__tsan_`
+calls in a stub: `objdump -d <exe> | grep -A40 '<lwt_unix_send_notification>:'`.

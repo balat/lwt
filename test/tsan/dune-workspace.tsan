@@ -1,0 +1,12 @@
+(lang dune 3.0)
+
+; Used by run.sh only. dune compiles C stubs with the compiler's ocamlc_cflags,
+; which on a TSan switch do NOT carry -fsanitize=thread (only native_cflags do).
+; Without this, Lwt's C code is invisible to ThreadSanitizer: its accesses are not
+; checked, and its atomic loads and stores, which are what orders the notification
+; table, are not seen either, so TSan reports races where there are none.
+
+(env
+ (_
+  (c_flags
+   (:standard -fsanitize=thread -Wno-tsan --param=tsan-distinguish-volatile=1))))

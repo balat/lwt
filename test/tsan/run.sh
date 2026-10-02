@@ -83,9 +83,11 @@ fi
 # treatment as the tests. It also means dune runs UNDER TSan: exitcode=0 for this
 # step, so that a report about dune's own code cannot fail the build. Reports that
 # matter are the ones from the tests below.
+# The workspace file instruments Lwt's C stubs too, which dune does not do by
+# default on a TSan switch; it says why that matters.
 # shellcheck disable=SC2086
 TSAN_OPTIONS="$base_opts exitcode=0 ${TSAN_OPTIONS:-}" \
-  $noaslr dune build --build-dir="$build" $tests
+  $noaslr dune build --workspace="$here/dune-workspace.tsan" --build-dir="$build" $tests
 
 status=0
 for t in $tests; do
