@@ -15,11 +15,16 @@ module Lwt_sequence = Lwt_sequence
    +-----------------------------------------------------------------+ *)
 
 type _event = {
-  stop : unit Lazy.t;
+  mutable stop : unit Lazy.t;
   (* The stop method of the event. *)
-  node : Obj.t Lwt_sequence.node;
+  mutable node : Obj.t Lwt_sequence.node;
   (* The node in the sequence of registered events. *)
 }
+(* Every handle of one event, the one returned to the user and the one the
+   current engine keeps in its sequence, points to the same record: [transfer]
+   updates that record in place and redirects the new engine's handle to it, so
+   that stopping the event through any handle works after any number of engine
+   replacements. *)
 
 type event = _event ref
 
@@ -70,12 +75,23 @@ class virtual abstract = object(self)
     self#cleanup
 
   method transfer (engine : abstract) =
+    (* [register] creates the event on the new engine under a fresh handle. The
+       new registration is written into the record all handles of the event
+       share, and the fresh handle is pointed at that record (see [_event]). *)
+    let move ev register =
+      stop_event ev;
+      let fresh = register () in
+      let shared = !ev in
+      shared.stop <- !fresh.stop;
+      shared.node <- !fresh.node;
+      fresh := shared
+    in
     Lwt_sequence.iter_l (fun (fd, f, _g, ev) ->
-      stop_event ev; ev := !(engine#on_readable fd f)) readables;
+      move ev (fun () -> engine#on_readable fd f)) readables;
     Lwt_sequence.iter_l (fun (fd, f, _g, ev) ->
-      stop_event ev; ev := !(engine#on_writable fd f)) writables;
+      move ev (fun () -> engine#on_writable fd f)) writables;
     Lwt_sequence.iter_l (fun (delay, repeat, f, _g, ev) ->
-      stop_event ev; ev := !(engine#on_timer delay repeat f)) timers
+      move ev (fun () -> engine#on_timer delay repeat f)) timers
 
   method fake_io fd =
     Lwt_sequence.iter_l (fun (fd', _f, g, _stop) ->

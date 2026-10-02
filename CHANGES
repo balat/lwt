@@ -1,3 +1,11 @@
+===== dev =====
+
+====== Fixes ======
+
+  * Lwt_engine: stopping an event through the handle its registration returned
+    works after any number of engine replacements. From the second one on, it
+    stopped nothing, and libev could then abort on a closed descriptor.
+
 ===== 6.1.2 =====
 
 ====== Fixes ======
