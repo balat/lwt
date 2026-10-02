@@ -162,6 +162,9 @@ type 'a waiter = {
   w_resolver : 'a Lwt.u;
   (* Set when the waiter's promise is cancelled; see [waiters] below. *)
   mutable w_withdrawn : bool;
+  (* The epoch of the queue the waiter is in, or -1 once it has left it, served
+     or taken; see [waiters] below. Under the queue's lock, like the flag. *)
+  mutable w_epoch : int;
 }
 
 (* Built OUTSIDE any critical section, always: a promise is an allocation and an
@@ -170,7 +173,7 @@ type 'a waiter = {
 let new_waiter () =
   let promise, resolver = Lwt.task () in
   { w_loop = self (); w_promise = promise; w_resolver = resolver;
-    w_withdrawn = false }
+    w_withdrawn = false; w_epoch = -1 }
 
 (* [w]'s promise belongs to [w]'s domain, so this has to happen there. Returns
    whether it actually resolved it: a waiter whose promise was cancelled
@@ -233,16 +236,32 @@ let queue_assemble (front, back) = front @ List.rev back
    timeout]] that times out is one. Marked waiters are compacted away once they
    outnumber the live ones, so a queue that is signalled rarely does not grow
    with what was cancelled from it. The compaction is the one allocation under
-   a lock in this module, and it happens at most once per doubling. *)
+   a lock in this module, and it happens at most once per doubling.
+
+   A waiter can be cancelled AFTER it has left the queue: served by [pop], or
+   taken with all the others by [take_all], and not yet woken on its loop. Its
+   withdrawal must then leave the queue alone, or [live] is decremented twice
+   and [withdrawn] counts a waiter that is not there: the counts drift, [live]
+   goes negative, and from then on every withdrawal compacts, which is the
+   quadratic behaviour this structure exists to avoid. It would also write the
+   flag that [waiters_assemble] reads outside the lock, a data race that
+   ThreadSanitizer found. So each waiter records the [epoch] of the queue it
+   entered, [take_all] starts a new epoch and [pop] marks what it serves:
+   a waiter is in the queue exactly when the two agree. What happens to the
+   served or taken waiter is not this structure's business; its waker finds
+   the promise cancelled, on the waiter's own domain. *)
 type 'a waiters = {
   wq : 'a waiter queue;
   mutable live : int;
   mutable withdrawn : int;
+  mutable epoch : int;
 }
 
-let waiters_create () = { wq = queue_create (); live = 0; withdrawn = 0 }
+let waiters_create () =
+  { wq = queue_create (); live = 0; withdrawn = 0; epoch = 0 }
 
 let waiters_push ws w =
+  w.w_epoch <- ws.epoch;
   queue_push ws.wq w;
   ws.live <- ws.live + 1
 
@@ -253,11 +272,12 @@ let rec waiters_pop ws =
     ws.withdrawn <- ws.withdrawn - 1;
     waiters_pop ws
   | Some w ->
+    w.w_epoch <- -1;
     ws.live <- ws.live - 1;
     Some w
 
 let waiters_withdraw ws w =
-  if not w.w_withdrawn then begin
+  if w.w_epoch = ws.epoch && not w.w_withdrawn then begin
     w.w_withdrawn <- true;
     ws.live <- ws.live - 1;
     ws.withdrawn <- ws.withdrawn + 1;
@@ -270,11 +290,13 @@ let waiters_withdraw ws w =
   end
 
 (* Empties the queue in constant time; the withdrawn waiters are dropped by
-   [waiters_assemble], outside the lock. *)
+   [waiters_assemble], outside the lock, which is safe because nothing writes
+   their flag once the epoch has moved on. *)
 let waiters_take_all ws =
   let taken = queue_take_all ws.wq in
   ws.live <- 0;
   ws.withdrawn <- 0;
+  ws.epoch <- ws.epoch + 1;
   taken
 
 let waiters_assemble taken =
@@ -367,7 +389,7 @@ let await t =
   let promise, resolver = Lwt.task () in
   let w =
     { w_loop = self (); w_promise = promise; w_resolver = resolver;
-      w_withdrawn = false }
+      w_withdrawn = false; w_epoch = -1 }
   in
   Mutex.lock t.mutex;
   let state = t.state in

@@ -74,5 +74,38 @@ let () =
   check "cancelled waiters are compacted away without a signal"
     (w1 - w0 < 10_000);
 
+  (* Waiters SERVED by another domain and cancelled by their own before its
+     loop has run: a broadcast from another domain takes them all out of the
+     queue and posts their wake-ups here, and their cancellation finds them
+     gone. That withdrawal used to count each of them out of the queue a second
+     time; the counts drifted by as many, and from then on every withdrawal
+     compacted the whole queue, so the storm that follows was quadratic again.
+     No loop runs here until the end, which keeps the posted wake-ups pending,
+     as a busy loop would. *)
+  let storm c =
+    let t0 = Unix.gettimeofday () in
+    let ps = List.init n (fun _ -> Lwt_multicore.Condition.wait c) in
+    List.iter Lwt.cancel ps;
+    Unix.gettimeofday () -. t0
+  in
+  (* The same storm on a condition whose counts are right, for comparison: an
+     absolute bound would be too loose at a size a test can afford, and the
+     ratio holds on a slow or loaded machine, or under ThreadSanitizer. *)
+  let reference = storm (Lwt_multicore.Condition.create ()) in
+  let c = Lwt_multicore.Condition.create () in
+  let served = List.init n (fun _ -> Lwt_multicore.Condition.wait c) in
+  Domain.join (Domain.spawn (fun () -> Lwt_multicore.Condition.broadcast c 0));
+  List.iter Lwt.cancel served;
+  let after = storm c in
+  check
+    (Printf.sprintf
+       "a storm after served waiters were cancelled is as fast as one before \
+        (%.3fs against %.3fs)"
+       after reference)
+    (after < (5. *. reference) +. 0.05);
+  let got = Lwt_multicore.Condition.wait c in
+  Lwt_multicore.Condition.signal c 7;
+  check "and the condition still works" (Lwt_main.run got = 7);
+
   if !failures > 0 then exit 1;
   print_endline "cancellation storms are linear: ok"
