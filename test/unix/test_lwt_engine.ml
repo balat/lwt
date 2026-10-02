@@ -64,4 +64,32 @@ let run_tests = [
 
 let tests = tests @ run_tests
 
-let suite = suite "lwt_engine" tests
+let transfer_tests = [
+  (* A handle on an event must keep working through transfers to another
+     engine, however many. The new engine records the registration under a
+     handle of its own, and the original handle is made to stop that one. With
+     a copy of it instead, the second transfer updated the new handle only, and
+     stopping through the original did nothing: the registration stayed active
+     on the engine. The child of a fork under io_uring, whose engine is replaced
+     after a first replacement, ran into exactly that. *)
+  test "transfer: an event handle survives several transfers" ~sequential:true
+      ~only_if:(fun () -> not Sys.win32) begin fun () ->
+    let r, w = Unix.pipe ~cloexec:true () in
+    let fired = ref 0 in
+    let ev = Lwt_engine.on_readable r (fun _ -> incr fired) in
+    let before = Lwt_engine.readable_count () in
+    let saved = Lwt_engine.get () in
+    Lwt_engine.set ~destroy:false (new Lwt_engine.select);
+    Lwt_engine.set (new Lwt_engine.select);
+    Lwt_engine.stop_event ev;
+    let after = Lwt_engine.readable_count () in
+    ignore (Unix.write_substring w "x" 0 1);
+    Lwt_unix.sleep 0.05 >|= fun () ->
+    Lwt_engine.set saved;
+    Unix.close r;
+    Unix.close w;
+    after = before - 1 && !fired = 0
+  end;
+]
+
+let suite = suite "lwt_engine" (tests @ transfer_tests)

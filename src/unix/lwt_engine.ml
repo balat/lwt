@@ -77,13 +77,21 @@ class virtual abstract = object(self)
       self#cleanup
     end
 
+  (* Moves every registration to [engine]. The handle the user holds on an
+     event must keep working afterwards, through any number of transfers: it
+     is not the handle the new engine records, so it is made to stop the new
+     one rather than hold a copy of it. With a copy, a second transfer updated
+     the new engine's handle only, and stopping through the original did
+     nothing: the registration stayed active on the engine after that, which is
+     what the child of a fork under io_uring ran into. *)
   method transfer (engine : abstract) =
+    let forward ev ev' = ev := { stop = lazy (stop_event ev'); node = (!ev).node } in
     Lwt_sequence.iter_l (fun (fd, f, _g, ev) ->
-      stop_event ev; ev := !(engine#on_readable fd f)) readables;
+      stop_event ev; forward ev (engine#on_readable fd f)) readables;
     Lwt_sequence.iter_l (fun (fd, f, _g, ev) ->
-      stop_event ev; ev := !(engine#on_writable fd f)) writables;
+      stop_event ev; forward ev (engine#on_writable fd f)) writables;
     Lwt_sequence.iter_l (fun (delay, repeat, f, _g, ev) ->
-      stop_event ev; ev := !(engine#on_timer delay repeat f)) timers
+      stop_event ev; forward ev (engine#on_timer delay repeat f)) timers
 
   method fake_io fd =
     Lwt_sequence.iter_l (fun (fd', _f, g, _stop) ->
