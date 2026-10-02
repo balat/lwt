@@ -173,6 +173,61 @@ let test_connect () =
   check "connect routed through io_uring" (read = n && Bytes.equal got msg);
   Lwt_main.run (Lwt_unix.close lsock)
 
+(* Replacing a uring engine that watches a descriptor and has a completion-based
+   read in flight: the readiness wait moves to the new engine, and the read is
+   cancelled, its promise rejected with [ECANCELED]. *)
+let test_replace_busy_engine () =
+  let a, b = Unix.socketpair Unix.PF_UNIX Unix.SOCK_STREAM 0 in
+  let c, d = Unix.socketpair Unix.PF_UNIX Unix.SOCK_STREAM 0 in
+  let a = Lwt_unix.of_unix_file_descr a
+  and b = Lwt_unix.of_unix_file_descr b
+  and c = Lwt_unix.of_unix_file_descr c
+  and d = Lwt_unix.of_unix_file_descr d in
+  let pending_read = Lwt_unix.read b (Bytes.create 1) 0 1 in
+  let readable = Lwt_unix.wait_read d in
+  let replaced =
+    match Lwt_uring.set () with
+    | () -> true
+    | exception e ->
+      Printf.printf "# replacing the engine raised %s\n%!"
+        (Printexc.to_string e);
+      false
+  in
+  let read_outcome, waited =
+    Lwt_main.run begin
+      Lwt_unix.write_string c "x" 0 1 >>= fun _ ->
+      Lwt.both
+        (Lwt.catch
+           (fun () -> pending_read >|= fun _ -> `Read)
+           (function
+             | Lwt.Canceled -> Lwt.return `Cancelled
+             | e -> Lwt.return (`Failed e)))
+        (readable >|= fun () -> true)
+    end
+  in
+  check "replacing a busy uring engine cancels its in-flight I/O"
+    (replaced && read_outcome = `Cancelled && waited);
+  Lwt_main.run
+    (Lwt_list.iter_p Lwt_unix.close [ a; b; c; d ])
+
+(* A callback run by the engine may replace it: the timer's continuation installs
+   a fresh uring engine, which destroys the one that is reaping. *)
+let test_replace_from_callback () =
+  let ok =
+    match
+      Lwt_main.run begin
+        Lwt_unix.sleep 0.001 >>= fun () ->
+        Lwt_uring.set ();
+        Lwt_unix.sleep 0.001
+      end
+    with
+    | () -> true
+    | exception e ->
+      Printf.printf "# %s\n%!" (Printexc.to_string e);
+      false
+  in
+  check "a uring engine can be replaced from one of its callbacks" ok
+
 (* The child of [Lwt_unix.fork] gets a ring of its own and keeps running on
    io_uring (here a timer and a routed write), while the parent goes on using
    the inherited ring to read the child's reply. *)
@@ -219,6 +274,8 @@ let () =
   test_io_regular_file ();
   test_io_bigarray ();
   test_connect ();
+  test_replace_busy_engine ();
+  test_replace_from_callback ();
   test_fork ();
   if !failures = 0 then Printf.printf "\nAll tests passed.\n%!"
   else begin
