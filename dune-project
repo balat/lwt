@@ -107,8 +107,8 @@
   (lwt (>= 6))
   (saturn (>= 1.0))
   (qcheck-core (and :with-test (>= 0.90)))
-  (qcheck-stm (and :with-test (>= 0.3)))
-  (qcheck-lin (and :with-test (>= 0.3)))))
+  (qcheck-stm (and :with-test (>= 0.7)))
+  (qcheck-lin (and :with-test (>= 0.7)))))
 
 (package
  (name lwt_runtime_events)

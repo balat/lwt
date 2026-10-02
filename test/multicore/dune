@@ -130,3 +130,14 @@
  (build_if
   (>= %{ocaml_version} "5.0"))
  (libraries lwt.unix threads.posix qcheck-lin.domain))
+
+; Semaphore, Mutex and Stream on two real domains at once, against models
+; (qcheck-stm, parallel).
+
+(test
+ (name stm_domain_sync)
+ (package lwt_multicore)
+ (modules stm_domain_sync)
+ (build_if
+  (>= %{ocaml_version} "5.0"))
+ (libraries lwt.unix lwt_multicore qcheck-stm.domain))

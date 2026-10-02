@@ -17,8 +17,8 @@ depends: [
   "lwt" {>= "6"}
   "saturn" {>= "1.0"}
   "qcheck-core" {with-test & >= "0.90"}
-  "qcheck-stm" {with-test & >= "0.3"}
-  "qcheck-lin" {with-test & >= "0.3"}
+  "qcheck-stm" {with-test & >= "0.7"}
+  "qcheck-lin" {with-test & >= "0.7"}
   "odoc" {with-doc}
 ]
 build: [
