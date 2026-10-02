@@ -1666,12 +1666,11 @@ val sigchld_handler_installer : unit Lazy.t
 (** @deprecated Do not force this directly; see {!install_sigchld_handler}. *)
 
 val install_sigchld_handler : unit -> unit
-(** Installs the SIGCHLD handler if it is not installed yet. The handler is
-    process-wide, so this installs it once per PROCESS however many domains call
-    it, and it is safe to call concurrently, which forcing
-    {!sigchld_handler_installer} is not. On a domain that does not own the
-    notification pipe it does nothing, since the handler could neither be
-    delivered there nor safely wake that domain's waiters. For internal use:
+(** Subscribes the calling loop to SIGCHLD, once per loop: each loop reaps the
+    children it waits for, woken by its own subscription. The process-wide
+    handler is installed by the first subscriber and wakes every subscribed
+    loop; subscribing is safe to do concurrently from several domains, which
+    forcing {!sigchld_handler_installer} is not. For internal use:
     [Lwt_main.run] and {!waitpid} call it. *)
 
 val ensure_channel : unit -> unit
