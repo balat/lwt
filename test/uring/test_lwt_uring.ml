@@ -372,6 +372,76 @@ let test_close_then_reuse () =
   check "a write prepared before close does not reach the next owner"
     (not leaked)
 
+(* Cancelled in the lap that requested them, a read and a write never reach the
+   kernel, as with the default engines: no byte is taken or sent, and an Lwt_io
+   channel loses nothing. *)
+let test_cancel_before_submission () =
+  let a, b = Unix.socketpair Unix.PF_UNIX Unix.SOCK_STREAM 0 in
+  ignore (Unix.write_substring b "ping" 0 4);
+  let a = Lwt_unix.of_unix_file_descr a in
+  let buf = Bytes.make 4 '.' in
+  let read = Lwt_unix.read a buf 0 4 in
+  Lwt.cancel read;
+  let write = Lwt_unix.write_string a "pong" 0 4 in
+  Lwt.cancel write;
+  Lwt_main.run (Lwt_unix.sleep 0.05);
+  let peer_got_nothing =
+    match Unix.select [ b ] [] [] 0. with [], _, _ -> true | _ -> false
+  in
+  let ic = Lwt_io.of_fd ~mode:Lwt_io.input a in
+  let first = Lwt_io.read ~count:4 ic in
+  Lwt.cancel first;
+  let next = Lwt_main.run (Lwt_io.read ~count:4 ic) in
+  Lwt_main.run (Lwt_io.close ic);
+  Unix.close b;
+  check "a read or write cancelled before submission never happens"
+    (Bytes.to_string buf = "...." && peer_got_nothing && next = "ping")
+
+(* A read cancelled once in the kernel, while the data arrives: whichever wins,
+   the next read gets the data, even if it is requested before the cancelled
+   read has completed. *)
+let test_cancel_in_flight () =
+  let a, b = Unix.socketpair Unix.PF_UNIX Unix.SOCK_STREAM 0 in
+  let a = Lwt_unix.of_unix_file_descr a in
+  let first = Lwt_unix.read a (Bytes.create 4) 0 4 in
+  Lwt_main.run (Lwt_unix.sleep 0.01);
+  ignore (Unix.write_substring b "ping" 0 4);
+  Lwt.cancel first;
+  let buf = Bytes.make 4 '.' in
+  let next =
+    Lwt_main.run
+      (Lwt.pick
+         [ Lwt_unix.read a buf 0 4;
+           (Lwt_unix.sleep 1. >|= fun () -> -1) ])
+  in
+  check "a read cancelled in the kernel loses no data"
+    (Lwt.state first = Lwt.Fail Lwt.Canceled
+     && next = 4 && Bytes.to_string buf = "ping");
+  (* The same through Lwt_io, with a timeout that cancels a waiting read. *)
+  let ic = Lwt_io.of_fd ~mode:Lwt_io.input a in
+  let timed_out =
+    Lwt_main.run
+      (Lwt.pick
+         [ (Lwt_io.read ~count:4 ic >|= fun _ -> false);
+           (Lwt_unix.sleep 0.05 >|= fun () -> true) ])
+  in
+  ignore (Unix.write_substring b "pong" 0 4);
+  let after = Lwt_main.run (Lwt_io.read ~count:4 ic) in
+  check "an Lwt_io read cut by a timeout leaves the stream intact"
+    (timed_out && after = "pong");
+  (* Closing fails a read held behind a cancelled one. *)
+  let held_first = Lwt_unix.read a (Bytes.create 4) 0 4 in
+  Lwt_main.run (Lwt_unix.sleep 0.01);
+  Lwt.cancel held_first;
+  let held = Lwt_unix.read a (Bytes.create 4) 0 4 in
+  Lwt.async (fun () -> Lwt_unix.close a);
+  let outcome = settled held in
+  Unix.close b;
+  check "close fails a read held behind a cancelled one"
+    (match outcome with
+     | `Rejected (Unix.Unix_error (Unix.EBADF, _, _)) -> true
+     | _ -> false)
+
 (* Replacing a uring engine that watches a descriptor and has a completion-based
    read in flight: the readiness wait moves to the new engine, and the read is
    cancelled, its promise rejected with [ECANCELED]. *)
@@ -502,6 +572,8 @@ let test_available () =
   test_dup2_kind ();
   test_close_fails_io ();
   test_close_then_reuse ();
+  test_cancel_before_submission ();
+  test_cancel_in_flight ();
   test_replace_busy_engine ();
   test_replace_from_callback ();
   test_fork ()

@@ -44,10 +44,13 @@
 
     {2 Differences from the default engines}
 
-    - Cancelling a completion-based operation, with [Lwt.cancel], [Lwt.pick]
-      or a timeout, rejects its promise with [Lwt.Canceled] at once and cancels
-      it in the kernel. If the kernel had already performed it, its effect
-      stands: bytes read are lost to the next read, bytes written are written.
+    - A completion-based operation reaches the kernel when the loop next runs.
+      Cancelled before that, with [Lwt.cancel], [Lwt.pick] or a timeout, it
+      never happens, as with the default engines. Cancelled later, its promise
+      is rejected with [Lwt.Canceled] at once, and the operation is cancelled
+      in the kernel, which may have performed it already. The bytes of such a
+      read are not lost: the next read of the descriptor gets them, waiting if
+      need be for the cancelled read to complete. Such a write stays written.
     - Closing or aborting a descriptor fails the completion-based operations
       in flight on it, unless they completed first, with what the default path
       raises: [Unix.Unix_error (EBADF, _, _)] for {!Lwt_unix.close}, the
