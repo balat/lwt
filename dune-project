@@ -106,6 +106,7 @@
   ; the versions.
   (lwt (>= 6))
   (saturn (>= 1.0))
+  (qcheck-core (and :with-test (>= 0.90)))
   (qcheck-stm (and :with-test (>= 0.3)))))
 
 (package
@@ -138,8 +139,9 @@ synchronization primitives. Code can be run in parallel on an opt-in basis.
   (cppo (and :build (>= 1.1)))
   (ocamlfind (and :dev (>= 1.7.3-1)))
   (odoc (and :with-doc (>= 2.3)))
-  ; the differential test of the core, test/differential
-  (qcheck-core (and :with-test (>= 0.21)))
+  ; the differential test of the core, test/differential (oneof_weighted is
+  ; from qcheck-core 0.90)
+  (qcheck-core (and :with-test (>= 0.90)))
   dune-configurator
   ocplib-endian)
  (depopts base-threads base-unix conf-libev lwt_runtime_events))
