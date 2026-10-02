@@ -50,7 +50,12 @@ let wait ?mutex cvar =
   let waiter = (Lwt.add_task_r [@ocaml.warning "-3"]) cvar.waiters in
   let () =
     match mutex with
-    | Some m -> Lwt_mutex.unlock m
+    | Some m ->
+      (* A mutex that cannot be unlocked here (another domain's) raises; the
+         waiter just queued must go with it, or it would swallow the next
+         signal. Cancelling it removes it from the queue. *)
+      (try Lwt_mutex.unlock m
+       with exn -> Lwt.cancel waiter; raise exn)
     | None -> ()
   in
   Lwt.finalize

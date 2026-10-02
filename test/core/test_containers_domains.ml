@@ -114,5 +114,22 @@ let () =
      | Lwt.Return (), Lwt.Return (Some 1), true -> true
      | _ -> false);
 
+  (* Waiting on our own condition with ANOTHER domain's mutex is refused when
+     the mutex is unlocked, after the waiter was queued: the waiter must go
+     with the refusal, or it swallows the next signal. *)
+  let foreign_mutex =
+    on_other_domain (fun () ->
+      let fm = Lwt_mutex.create () in
+      ignore (Lwt_mutex.lock fm);
+      fm)
+  in
+  let cv : int Lwt_condition.t = Lwt_condition.create () in
+  check "waiting with a foreign mutex is refused"
+    (refused (fun () -> Lwt_condition.wait ~mutex:foreign_mutex cv));
+  let real_waiter = Lwt_condition.wait cv in
+  Lwt_condition.signal cv 5;
+  check "and leaves no waiter behind to swallow the next signal"
+    (Lwt.state real_waiter = Lwt.Return 5);
+
   if !failures > 0 then exit 1;
   print_endline "domain-affine containers: ok"
