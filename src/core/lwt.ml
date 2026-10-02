@@ -1334,6 +1334,25 @@ let run_scheduler (sched : sched) : unit =
      one sitting on top of the resumer's stack. The check is one load and one
      compare per task; without a direct-style layer [gen] never changes. *)
   let gen = sched.drainer_gen in
+  (* The idle lap (iteration hooks, engine iteration, pause service) runs on
+     this pass's stack but belongs to no task: a suspension there would park
+     the engine's own state and the hooks' in the continuation, with the next
+     pass restarting them over it (a select engine re-arming the same timers
+     for ever). It is a region where suspension is an error, on every engine,
+     which a direct-style layer turns into its exception at the call site. The
+     callbacks of the promises the lap resolves are not concerned: they run
+     later, as tasks. *)
+  let idle_lap () =
+    sched.suspension_forbidden <- sched.suspension_forbidden + 1;
+    match sched.idle sched with
+    | more ->
+      sched.suspension_forbidden <- sched.suspension_forbidden - 1;
+      more
+    | exception e ->
+      let bt = Printexc.get_raw_backtrace () in
+      sched.suspension_forbidden <- sched.suspension_forbidden - 1;
+      Printexc.raise_with_backtrace e bt
+  in
   let rec loop () =
     if Run_queue.is_empty sched.queue then begin
       (* Run queue drained: advance the world by one lap through the idle hook.
@@ -1342,7 +1361,7 @@ let run_scheduler (sched : sched) : unit =
          of pauses the engine still runs once per batch instead of after the
          whole pause cascade settles. Returns [false] only when there is
          nothing left to do. *)
-      if sched.idle sched && sched.drainer_gen = gen then loop ()
+      if idle_lap () && sched.drainer_gen = gen then loop ()
     end
     else begin
       (match Run_queue.pop sched.queue with
