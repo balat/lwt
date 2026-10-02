@@ -541,10 +541,29 @@ let test_unavailable () =
   check "set_if_available declines" (not (Lwt_uring.set_if_available ()));
   check "the engine is still left alone" (Lwt_engine.id () = before)
 
+(* An engine that is created but not installed takes no I/O: a read runs on the
+   current engine. *)
+let test_created_not_installed () =
+  let unused = new Lwt_uring.uring () in
+  let a, b = Unix.socketpair Unix.PF_UNIX Unix.SOCK_STREAM 0 in
+  let a = Lwt_unix.of_unix_file_descr a in
+  ignore (Unix.write_substring b "ping" 0 4);
+  let n =
+    Lwt_main.run
+      (Lwt.pick
+         [ Lwt_unix.read a (Bytes.create 4) 0 4;
+           (Lwt_unix.sleep 1. >|= fun () -> -1) ])
+  in
+  unused#destroy;
+  Lwt_main.run (Lwt_unix.close a);
+  Unix.close b;
+  check "an engine created but not installed takes no I/O" (n = 4)
+
 let is_uring () =
   match Lwt_engine.id () with Lwt_uring.Engine_id__uring -> true | _ -> false
 
 let test_available () =
+  test_created_not_installed ();
   Unix.putenv "LWT_URING" "0";
   check "LWT_URING=0 makes set_if_available decline"
     (not (Lwt_uring.set_if_available ()) && not (is_uring ()));

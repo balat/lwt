@@ -321,12 +321,30 @@ let dispatch st result data =
       if tr.repeat && tr.t_active then submit_timer st.ring tr
     end
 
-(* The state of the currently-installed io_uring engine, if any. It is used by
-   the completion-based I/O of {!Io}, which must submit to the same ring that the
-   engine's [iter] reaps. Set when an engine is created, cleared when it is
-   destroyed (using physical equality so that replacing one uring engine with
-   another keeps the pointer on the live ring). *)
-let installed : state option ref = ref None
+(* The live uring engines, with their state. Completion-based I/O must submit to
+   the ring that the current engine's [iter] reaps, and the current engine is
+   what [Lwt_engine.get] returns: an engine that is created but not installed,
+   or not installed any more, gets nothing. An engine is registered when it is
+   created and unregistered when it is destroyed. Atomic, so that domains of a
+   multicore Lwt, each with its own current engine, can share the list. *)
+let engines : (Lwt_engine.t * state option) list Atomic.t = Atomic.make []
+
+let rec update f =
+  let l = Atomic.get engines in
+  if not (Atomic.compare_and_set engines l (f l)) then update f
+
+let register e st = update (fun l -> (e, Some st) :: l)
+let unregister e = update (List.filter (fun (e', _) -> e' != e))
+
+(* The state of the current engine, if it is a uring engine. The option is the
+   one stored at registration, so that this allocates nothing. *)
+let installed () =
+  let e = Lwt_engine.get () in
+  let rec find = function
+    | [] -> None
+    | (e', st) :: rest -> if e' == e then st else find rest
+  in
+  find (Atomic.get engines)
 
 (* [io_uring_setup] fails with ENOSYS where the kernel has no io_uring, and with
    EPERM where it is forbidden: by the [kernel.io_uring_disabled] sysctl, or by
@@ -337,7 +355,7 @@ let create_ring ~queue_depth =
   | exception Unix.Unix_error ((Unix.ENOSYS | Unix.EPERM), _, _) ->
     raise (Lwt_sys.Not_available "io_uring")
 
-class uring ?(queue_depth = 256) () = object
+class uring ?(queue_depth = 256) () = object (self)
   inherit Lwt_engine.abstract
 
   val st =
@@ -355,7 +373,7 @@ class uring ?(queue_depth = 256) () = object
      replace this engine, which destroys it; [iter] must then stop reaping. *)
   val mutable released = false
 
-  initializer installed := Some st
+  initializer register (self :> Lwt_engine.t) st
 
   method id = Engine_id__uring
 
@@ -373,7 +391,7 @@ class uring ?(queue_depth = 256) () = object
      which may start new I/O, run on the engine that replaces this one rather
      than on this one. *)
   method private cleanup =
-    (match !installed with Some s when s == st -> installed := None | _ -> ());
+    unregister (self :> Lwt_engine.t);
     if live then begin
       Hashtbl.iter
         (fun _ d ->
@@ -476,11 +494,12 @@ class uring ?(queue_depth = 256) () = object
      released in the child; they go with it at exit or exec. *)
   method! fork =
     live <- false;
+    unregister (self :> Lwt_engine.t);
     Lwt_engine.set ~destroy:false (new uring ~queue_depth ())
 end
 
 let get_state () =
-  match !installed with
+  match installed () with
   | Some st -> st
   | None ->
     failwith "Lwt_uring.Io: no io_uring engine installed (use Lwt_uring.set)"
@@ -541,7 +560,7 @@ let submit_io st fd ~recovered op_name post make =
    lets go of the file. *)
 let stop_descriptor fd exn =
   Hashtbl.remove unread fd;
-  match !installed with
+  match installed () with
   | None -> ()
   | Some st ->
     (match Hashtbl.find st.descs fd with
@@ -631,8 +650,8 @@ module Io = struct
 end
 
 (* Transparent routing of Lwt_unix.{read,write,…} through io_uring. The backend
-   self-gates on [installed]: it takes over only while a uring engine is
-   installed, and declines (so Lwt_unix uses its default path) otherwise. It is
+   self-gates on [installed ()]: it takes over only while a uring engine is
+   the current one, and declines (so Lwt_unix uses its default path) otherwise. It is
    installed once, when this module is linked; with no uring engine current it
    has no effect. The operation is chosen per descriptor kind (see {!read_op}),
    so sockets, files and pipes are each handled correctly. *)
@@ -651,7 +670,7 @@ let () =
   (* Without an engine, a read still gets the bytes a cancelled read kept, if
      the engine that kept them has been replaced. *)
   let read ch buf pos len =
-    match !installed with
+    match installed () with
     | None when Hashtbl.length unread = 0 -> None
     | None ->
       (match
@@ -669,7 +688,7 @@ let () =
            (read_op kind fd cs))
   in
   let write ch buf pos len =
-    match !installed with
+    match installed () with
     | None -> None
     | Some st ->
       let fd = Lwt_unix.unix_file_descr ch and kind = Lwt_unix.fd_kind ch in
@@ -678,7 +697,7 @@ let () =
       Some (submit_io st fd ~recovered:Cstruct.empty "write" int_result (write_op kind fd cs))
   in
   let read_bigarray ch buf pos len =
-    match !installed with
+    match installed () with
     | None when Hashtbl.length unread = 0 -> None
     | None ->
       (match
@@ -694,7 +713,7 @@ let () =
       Some (submit_io st fd ~recovered:cs "read" int_result (read_op kind fd cs))
   in
   let write_bigarray ch buf pos len =
-    match !installed with
+    match installed () with
     | None -> None
     | Some st ->
       let fd = Lwt_unix.unix_file_descr ch and kind = Lwt_unix.fd_kind ch in
@@ -706,7 +725,7 @@ let () =
      [submit_io]). The descriptor is the user's own socket: no fd is created,
      so no flag policy is involved. *)
   let connect ch addr =
-    match !installed with
+    match installed () with
     | None -> None
     | Some st ->
       let fd = Lwt_unix.unix_file_descr ch in
