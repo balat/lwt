@@ -9,6 +9,12 @@
 open Tester
 
 let () =
+  if not (Lwt_uring.available ()) then begin
+    print_endline
+      "io_uring is not available here: test/unix runs these suites on the \
+       default engine.";
+    exit 0
+  end;
   Lwt_uring.set ();
   (* [Test_lwt_engine] is intentionally omitted: it asserts engine-identity
      details (e.g. that the current engine is the compile-time default), which

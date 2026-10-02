@@ -68,6 +68,10 @@ let measure name =
     (float_of_int total /. dt) total dt
 
 let () =
+  if not (Lwt_uring.available ()) then begin
+    print_endline "io_uring is not available here: nothing to compare.";
+    exit 0
+  end;
   Printf.printf "new-connection rate: %d connections, %d concurrent\n%!" total
     concurrency;
   measure "default engine (libev)";

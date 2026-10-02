@@ -259,8 +259,18 @@ let test_fork () =
       (n = 5 && Bytes.sub_string buf 0 n = "uring" && status = Unix.WEXITED 0)
 
 
-let () =
-  check "io_uring is available" (Lwt_uring.available ());
+(* Where io_uring is unavailable (another system, a switch without the uring
+   library, or a kernel that lacks or forbids io_uring), the package says so and
+   leaves the current engine alone. *)
+let test_unavailable () =
+  let before = Lwt_engine.id () in
+  check "set raises Lwt_sys.Not_available"
+    (match Lwt_uring.set () with
+     | () -> false
+     | exception Lwt_sys.Not_available _ -> true);
+  check "the engine is left alone" (Lwt_engine.id () = before)
+
+let test_available () =
   Lwt_uring.set ();
   (match Lwt_engine.id () with
    | Lwt_uring.Engine_id__uring -> check "uring engine installed" true
@@ -276,7 +286,14 @@ let () =
   test_connect ();
   test_replace_busy_engine ();
   test_replace_from_callback ();
-  test_fork ();
+  test_fork ()
+
+let () =
+  if Lwt_uring.available () then test_available ()
+  else begin
+    print_endline "# io_uring is not available here: testing the fallback";
+    test_unavailable ()
+  end;
   if !failures = 0 then Printf.printf "\nAll tests passed.\n%!"
   else begin
     Printf.printf "\n%d test(s) failed.\n%!" !failures;

@@ -3,8 +3,8 @@
 
 
 
-(** An {{:https://en.wikipedia.org/wiki/Io_uring} io_uring}-based Lwt engine
-    (Linux only).
+(** An {{:https://en.wikipedia.org/wiki/Io_uring} io_uring}-based Lwt engine,
+    where Linux provides it.
 
     This module provides an alternative {!Lwt_engine} implementation backed by
     Linux's io_uring interface, in place of the default libev/select engines. It
@@ -21,8 +21,12 @@
     call per loop iteration. A later, completion-based stage will additionally
     offload the [read]/[write]/[accept]/[connect] syscalls to the ring.
 
-    {b Availability.} The engine requires a Linux kernel with io_uring support.
-    Use {!available} to test at runtime before installing it. *)
+    {b Availability.} The package installs on every system, but io_uring
+    exists only on Linux, in a kernel that provides it and does not forbid it.
+    Elsewhere, and in an opam switch without the [uring] library, this module
+    has the same interface, with {!available} returning [false] and {!set}
+    raising [Lwt_sys.Not_available]: a program links the same way everywhere
+    and decides at run time. *)
 
 (** {2 Installing the engine} *)
 

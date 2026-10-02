@@ -105,6 +105,10 @@ let measure name =
     (float_of_int total /. dt) total dt
 
 let () =
+  if not (Lwt_uring.available ()) then begin
+    print_endline "io_uring is not available here: nothing to compare.";
+    exit 0
+  end;
   Printf.printf "request/response over Lwt_io: %d connections x %d requests\n%!"
     connections requests_per_connection;
   measure "default engine (libev)";

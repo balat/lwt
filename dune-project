@@ -72,12 +72,16 @@
 (package
  (name lwt_uring)
  (version 6.0.0)
- (synopsis "io_uring-based engine for Lwt (Linux only)")
+ (synopsis "Lwt engine based on io_uring, where Linux provides it")
  (depends
   (ocaml (>= 4.14))
   base-unix
   (lwt (>= 6))
-  (uring (>= 2.14))))
+  ; Only where ocaml-uring exists. Elsewhere lwt_uring builds a stub that
+  ; reports io_uring as unavailable (see src/uring/dune).
+  (uring (and (>= 2.14) (= :os linux)))
+  (cstruct (and (>= 6.0.1) (= :os linux)))
+  (optint (and (>= 0.1.0) (= :os linux)))))
 
 (package
  (name lwt_runtime_events)

@@ -114,6 +114,10 @@ let measure name =
     (float_of_int round_trips /. dt)
 
 let () =
+  if not (Lwt_uring.available ()) then begin
+    print_endline "io_uring is not available here: nothing to compare.";
+    exit 0
+  end;
   Printf.printf "ping-pong: %d round-trips, %d-byte payload\n%!"
     round_trips payload;
   measure "default engine (libev)";
