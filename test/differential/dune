@@ -1,0 +1,12 @@
+; Differential test of the promise core: random programs run on the current
+; core and on a vendored copy of the historical core, comparing every
+; observable event. See differential.ml. Not on Windows: it isolates the
+; historical core in forked children and guards each run with an alarm.
+
+(test
+ (name differential)
+ (package lwt)
+ (modules differential lwt_historical)
+ (enabled_if
+  (<> %{os_type} Win32))
+ (libraries lwt unix qcheck-core qcheck-core.runner))
