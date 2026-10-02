@@ -78,3 +78,14 @@
  (build_if
   (>= %{ocaml_version} "5.0"))
  (libraries lwt.unix lwt_multicore))
+
+; Work posted to a loop that leaves before running it: a lock comes back, an
+; adoption is rejected.
+
+(test
+ (name departed_loop)
+ (package lwt_multicore)
+ (modules departed_loop)
+ (build_if
+  (>= %{ocaml_version} "5.0"))
+ (libraries lwt.unix lwt_multicore))

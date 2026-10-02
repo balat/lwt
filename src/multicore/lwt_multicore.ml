@@ -14,11 +14,17 @@
    refused" a property of the data structure rather than a flag of ours. *)
 module Inbox = Saturn.Single_consumer_queue
 
+(* What is posted to a loop: the work, and what to do with it if the loop is
+   retired before it runs. Work that hands a resource over, a lock or a value,
+   must then hand it back, or the resource is lost with the loop; work that
+   carries nothing is simply dropped. *)
+type job = { run : unit -> unit; abandon : unit -> unit }
+
 type loop = {
   (* Which domain this loop belongs to, so that a promise owned by that domain
      can be routed to it. *)
   dom : int;
-  inbox : (unit -> unit) Inbox.t;
+  inbox : job Inbox.t;
   (* Wakes this loop. A notification id names the channel of the domain that
      created it, so sending it from anywhere wakes the right loop; that machinery
      is [Lwt_unix]'s and predates this module. *)
@@ -34,7 +40,20 @@ exception Loop_terminated
 let drain inbox =
   let rec go () =
     match Inbox.pop_opt inbox with
-    | Some f -> f (); go ()
+    | Some job -> job.run (); go ()
+    | None -> ()
+    | exception Inbox.Closed -> ()
+  in
+  go ()
+
+(* The loop is gone: what it had not run yet is abandoned, each item in the
+   way it asked for. Runs on the retiring domain, which is safe: abandoning
+   hands a resource back to a queue or settles a shared value, and touches no
+   promise of this domain. *)
+let abandon_all inbox =
+  let rec go () =
+    match Inbox.pop_opt inbox with
+    | Some job -> job.abandon (); go ()
     | None -> ()
     | exception Inbox.Closed -> ()
   in
@@ -84,19 +103,23 @@ let self_slot : loop Lwt_dls.t =
        process is ending. *)
     Lwt_unix.at_loop_exit (fun () ->
       Inbox.close inbox;
+      abandon_all inbox;
       Lwt_unix.stop_notification notification;
       deregister dom);
     l)
 
 let self () = Lwt_dls.get self_slot
 
-let run_on loop f =
-  (match Inbox.push loop.inbox f with
+let post loop job =
+  (match Inbox.push loop.inbox job with
    | () -> ()
    | exception Inbox.Closed -> raise Loop_terminated);
   (* Outside the push, and after it: the notification is a system call, and the
      work must be visible before the wake-up that announces it. *)
   Lwt_unix.send_notification loop.notification
+
+(* The public one carries nothing back, so there is nothing to undo. *)
+let run_on loop f = post loop { run = f; abandon = ignore }
 
 (* +-----------------------------------------------------------------+
    | A value several loops can wait for                              |
@@ -141,8 +164,14 @@ let wake w v ~on_dead =
   let here = self () in
   if w.w_loop == here then (if not (wake_now w v) then on_dead ())
   else
+    (* Posted with [on_dead] as what to do if the loop is retired before the
+       wake-up runs: the resource had been handed to a waiter that will never
+       take it, and must go back. Without that, a lock handed to a loop that
+       left stayed held for ever. *)
     match
-      run_on w.w_loop (fun () -> if not (wake_now w v) then on_dead ())
+      post w.w_loop
+        { run = (fun () -> if not (wake_now w v) then on_dead ());
+          abandon = on_dead }
     with
     | () -> ()
     | exception Loop_terminated -> on_dead ()
@@ -270,11 +299,16 @@ let adopt (p : 'a Lwt.t) : 'a Lwt.t =
            ourselves is precisely what the ownership check forbids, and is the
            reason this function exists. If the promise resolves before the thunk
            runs, [on_any] fires at once, which is the same outcome. *)
+        (* If the owner's loop is retired before it attaches the callback,
+           the adoption fails rather than waiting for ever. *)
         (match
-           run_on owner_loop (fun () ->
-             Lwt.on_any p
-               (fun v -> resolve shared v)
-               (fun e -> reject shared e))
+           post owner_loop
+             { run =
+                 (fun () ->
+                    Lwt.on_any p
+                      (fun v -> resolve shared v)
+                      (fun e -> reject shared e));
+               abandon = (fun () -> reject shared Cannot_adopt) }
          with
          | () -> ()
          | exception Loop_terminated -> raise Cannot_adopt);
