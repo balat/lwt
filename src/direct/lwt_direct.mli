@@ -90,26 +90,37 @@ val await : 'a Lwt.t -> 'a
     is resolved.
 
     [await] also works outside of {!spawn} and {!spawn_in_the_background},
-    under {!Lwt_main.run}: in a {!Lwt.bind} continuation, in an
-    {!Lwt.on_success} callback, in any callback the event loop runs. What it
-    suspends is then the {e current task}: the callback, together with whatever
-    called it synchronously and is still on the stack. The event loop runs the
-    callbacks of each pause, I/O completion and timer as a task of their own,
-    so an awaiting callback never delays the callbacks of other events. A
-    callback triggered synchronously by {!Lwt.wakeup}, or by {!Lwt.wakeup_later}
-    called from outside any callback, shares its task with the code that
-    resolved the promise: that code, and the other callbacks attached to the
-    same promise, resume only once the await is over. ({!Lwt.wakeup_later}
-    called from inside a callback defers the callbacks instead, so they run as
-    their own task.) When that matters, start a task with {!spawn} inside the
+    under {!Lwt_main.run}: in a {!Lwt.bind} continuation, an {!Lwt.on_success}
+    callback, an {!Lwt_switch} hook, an exit hook, any callback the event loop
+    runs. What it suspends is the {e current task}: the callback, together
+    with whatever called it synchronously and is still on the stack. Every
+    pause, I/O completion and timer has its callbacks run as a task of their
+    own, and the other callbacks attached to the same promise run while one
+    of them waits, so an awaiting callback delays nothing but the code that
+    ran it synchronously: the code that resolved the promise with
+    {!Lwt.wakeup} (not {!Lwt.wakeup_later}, which inside the loop always
+    defers them), and the other actions of an {!Lwt_timeout} due in the same
+    second. When that matters, start a task with {!spawn} inside the
     callback.
 
-    [await] needs an event loop running on the current domain, that is a
-    surrounding {!Lwt_main.run} or {!main}; otherwise it raises [Failure]. It
-    also raises [Failure] from a callback that the engine invokes from C (as
-    the libev engine does), because an effect cannot cross a C frame; the
-    callbacks of promises are never in that position, only a callback handed
-    directly to {!Lwt_engine} is. *)
+    Where suspension is refused, [await] on a pending promise raises
+    {!Suspension_forbidden} at the call: inside {!no_await}, inside a
+    propagation started by a setter of [Lwt_react], and inside the event
+    loop's own lap, that is the iteration hooks of {!Lwt_main} and the
+    callbacks the engine invokes directly (a callback handed to
+    {!Lwt_engine}, an [Lwt_unix.on_signal] handler, an
+    [Lwt_unix.make_notification] callback, the synchronous part of
+    [Lwt_preemptive.run_in_main], an [Lwt_gc.finalise] function), on every
+    engine alike. With no event loop running on the current domain (at top
+    level, or in a system thread such as the body of
+    [Lwt_preemptive.detach]), it raises [Failure] naming itself. A promise
+    already resolved or rejected returns its value, or raises, anywhere.
+
+    A task suspended on a promise that is never resolved keeps its stack for
+    the life of the program, some hundreds of bytes at least: the OCaml
+    runtime does not reclaim the stack of a dropped continuation. Cancelling
+    the promise releases it, since the task is then resumed with
+    {!Lwt.Canceled}. *)
 
 val main : (unit -> 'a) -> 'a
 (** [main f] runs the event loop until [f ()], started as a task with

@@ -95,6 +95,17 @@
     nothing; it used to re-queue the task at once, and a loop of yields kept
     I/O, timers and pauses from running for as long as it lasted.
 
+  * A task started by Lwt_direct.spawn runs at depth 1 of the resolution loop,
+    as a callback does: a Lwt.wakeup_later inside it never runs the awakened
+    continuation on the task's stack.
+
+  * Lwt.wakeup, inside a callback that the engine invokes directly (a
+    Lwt_unix.on_signal handler, a Lwt_unix.make_notification callback, the
+    synchronous part of Lwt_preemptive.run_in_main, a Lwt_gc.finalise
+    function, a callback handed to Lwt_engine), queues the callbacks instead
+    of running them on the engine's stack; they run as soon as the iteration
+    returns. Everywhere else its immediacy is unchanged.
+
   * Lwt_direct.main, the entry point of a program written in direct style
     (Lwt_main.run (spawn f)); and Lwt_direct.no_await, a region in which an
     await on a pending promise, or a yield, raises Suspension_forbidden at

@@ -676,11 +676,15 @@ let iter_s f h = Lwt_direct.spawn (fun () ->
   What the current task is decides what an [await] suspends: the callback
   itself, together with whatever called it synchronously and is still on the
   stack. The event loop runs the callbacks of each pause, I/O completion and
-  timer as a task of their own, so an awaiting callback never delays the
-  callbacks of other events. A callback run synchronously by [Lwt.wakeup]
-  shares its task with the code that resolved the promise: that code resumes
-  once the await is over. When that matters, start a task with [spawn] inside
-  the callback.
+  timer as a task of their own, and the other callbacks of the same promise
+  are not held back, so an awaiting callback delays nothing but the code that
+  ran it synchronously: the code that resolved the promise with [Lwt.wakeup]
+  resumes once the await is over ([Lwt.wakeup_later] defers the callbacks
+  instead). When that matters, start a task with [spawn] inside the callback.
+  Where the loop itself runs, in its iteration hooks and in the callbacks the
+  engine invokes directly, suspension is refused: [await] raises
+  [Lwt_direct.Suspension_forbidden], on every engine. [Lwt_direct.yield]
+  suspends the task until the next lap of the loop.
 
   The price of direct style is that the types no longer say whether a call
   may suspend. Code that must run without interleaving, such as a reactive
