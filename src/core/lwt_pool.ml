@@ -36,8 +36,10 @@ type 'a t = {
   (* Number of elements in the pool. *)
   list : 'a Queue.t;
   (* Available pool members. *)
-  waiters : 'a Lwt.u Lwt_sequence.t;
-  (* Promise resolvers waiting for a free member. *)
+  waiters : ('a Lwt.t * 'a Lwt.u) Lwt_sequence.t;
+  (* Promises waiting for a free member, with their resolvers. The promise is
+     kept so that a waiter cancelled after it was chosen (while its replacement
+     member was being created) is recognised, and the member kept. *)
   owner : Lwt_dls.token;
   (* The domain this pool lives on. *)
 }
@@ -68,36 +70,46 @@ let create_member p =
        Lwt.fail exn)
 
 (* Release a pool member. *)
-let release p c =
+let rec release p c =
   match Lwt_sequence.take_opt_l p.waiters with
-  | Some wakener ->
-    (* A promise resolver is waiting, give it the pool member. *)
-    Lwt.wakeup_later wakener c
+  | Some (waiter, wakener) ->
+    (* A promise resolver is waiting, give it the pool member; unless it was
+       cancelled meanwhile, in which case the next one. *)
+    if Lwt.is_sleeping waiter then Lwt.wakeup_later wakener c
+    else release p c
   | None ->
     (* No one is waiting, queue it. *)
     Queue.push c p.list
 
-(* Dispose of a pool member. *)
+(* Dispose of a pool member. The count goes down whether the disposal succeeds
+   or not: the member is gone either way, and a slot that stayed counted was
+   lost for good. *)
 let dispose p c =
-  p.dispose c >>= fun () ->
-  p.count <- p.count - 1;
-  Lwt.return_unit
+  Lwt.finalize
+    (fun () -> p.dispose c)
+    (fun () -> p.count <- p.count - 1; Lwt.return_unit)
 
-(* Create a new member when one is thrown away. *)
+(* Create a new member when one is thrown away. Through [create_member], so
+   that the replacement is counted: created directly, it was not, and the pool
+   then held more members than [max]. *)
 let replace_disposed p =
   match Lwt_sequence.take_opt_l p.waiters with
   | None ->
     (* No one is waiting, do not create a new member to avoid
        losing an error if creation fails. *)
     ()
-  | Some wakener ->
+  | Some (waiter, wakener) ->
     Lwt.on_any
-      (Lwt.apply p.create ())
+      (create_member p)
       (fun c ->
-         Lwt.wakeup_later wakener c)
+         (* The waiter may have been cancelled while the member was being
+            created; the member then goes to the pool rather than being
+            lost. *)
+         if Lwt.is_sleeping waiter then Lwt.wakeup_later wakener c
+         else release p c)
       (fun exn ->
          (* Creation failed, notify the waiter of the failure. *)
-         Lwt.wakeup_later_exn wakener exn)
+         if Lwt.is_sleeping waiter then Lwt.wakeup_later_exn wakener exn)
 
 (* Verify a member is still valid before using it. *)
 let validate_and_return p c =
@@ -127,7 +139,10 @@ let acquire p =
       create_member p
     else
       (* Limit reached: wait for a free one. *)
-      (Lwt.add_task_r [@ocaml.warning "-3"]) p.waiters >>= validate_and_return p
+      let waiter, wakener = Lwt.task () in
+      let node = Lwt_sequence.add_r (waiter, wakener) p.waiters in
+      Lwt.on_cancel waiter (fun () -> Lwt_sequence.remove node);
+      waiter >>= validate_and_return p
   else
     (* Take the first free member and validate it. *)
     let c = Queue.take p.list in
@@ -137,7 +152,12 @@ let acquire p =
    is still valid. *)
 let check_and_release p c cleared =
   let ok = ref false in
-  p.check c (fun result -> ok := result);
+  (* A check that raises is a member that failed the check: without this the
+     exception left the member neither released nor disposed, and its slot
+     was lost for good. *)
+  (match p.check c (fun result -> ok := result) with
+   | () -> ()
+   | exception exn when Lwt.Exception_filter.run exn -> ok := false);
   if cleared || not !ok then (
     (* Element is not ok or the pool was cleared - dispose of it *)
     dispose p c >>= fun () ->
@@ -165,8 +185,11 @@ let use p f =
   in
   promise >>= fun _ ->
   if !cleared then (
-    (* p was cleared while promise was resolving - dispose of this element *)
+    (* p was cleared while promise was resolving - dispose of this element,
+       and give a waiter its replacement, as the failure path does: a waiter
+       queued behind a member that was disposed after a clear starved. *)
     dispose p c >>= fun () ->
+    replace_disposed p;
     promise
   )
   else (
@@ -182,7 +205,10 @@ let clear p =
   let old_cleared = !(p.cleared) in
   old_cleared := true;
   p.cleared := ref false;
-  Lwt_list.iter_s (dispose p) elements
+  (* All of them, even if one disposal fails: they are out of the pool already,
+     and one that is skipped is never disposed and stays counted. The first
+     failure rejects the result once every disposal is done. *)
+  Lwt_list.iter_p (dispose p) elements
 
 (* A read, so unchecked. *)
 let wait_queue_length p = Lwt_sequence.length p.waiters
