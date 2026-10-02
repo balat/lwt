@@ -288,6 +288,72 @@ let test_connect () =
   check "connect routed through io_uring" (read = n && Bytes.equal got msg);
   Lwt_main.run (Lwt_unix.close lsock)
 
+(* The outcome of [p] after one more lap of the loop: [`Pending] if it is still
+   waiting. *)
+let settled p =
+  Lwt_main.run
+    (Lwt.pick
+       [ Lwt.catch
+           (fun () -> p >|= fun _ -> `Resolved)
+           (fun e -> Lwt.return (`Rejected e));
+         (Lwt_unix.sleep 0.2 >|= fun () -> `Pending) ])
+
+(* Closing or aborting a descriptor fails the read in flight on it, as the
+   default path fails its waiters, and the kernel lets go of the file, so the
+   peer sees end of file. *)
+let test_close_fails_io () =
+  let a, b = Unix.socketpair Unix.PF_UNIX Unix.SOCK_STREAM 0 in
+  let a = Lwt_unix.of_unix_file_descr a in
+  let read = Lwt_unix.read a (Bytes.create 1) 0 1 in
+  Lwt_main.run (Lwt.pause ());
+  Lwt.async (fun () -> Lwt_unix.close a);
+  let outcome = settled read in
+  let peer_at_eof =
+    match Unix.select [ b ] [] [] 0.2 with
+    | [], _, _ -> false
+    | _ -> Unix.read b (Bytes.create 1) 0 1 = 0
+  in
+  Unix.close b;
+  check "close fails the read in flight with EBADF"
+    (match outcome with
+     | `Rejected (Unix.Unix_error (Unix.EBADF, _, _)) -> true
+     | _ -> false);
+  check "after close, the peer sees end of file" peer_at_eof;
+  let c, d = Unix.socketpair Unix.PF_UNIX Unix.SOCK_STREAM 0 in
+  let c = Lwt_unix.of_unix_file_descr c in
+  let read = Lwt_unix.read c (Bytes.create 1) 0 1 in
+  Lwt_main.run (Lwt.pause ());
+  Lwt_unix.abort c Exit;
+  let outcome = settled read in
+  Lwt_main.run (Lwt_unix.close c);
+  Unix.close d;
+  check "abort fails the read in flight with its exception"
+    (match outcome with `Rejected Exit -> true | _ -> false)
+
+(* A write prepared just before [close] must not reach the next file to get the
+   same descriptor number: the kernel resolves the number when the operation is
+   submitted. *)
+let test_close_then_reuse () =
+  let a, b = Unix.socketpair Unix.PF_UNIX Unix.SOCK_STREAM 0 in
+  let a = Lwt_unix.of_unix_file_descr a in
+  let write =
+    Lwt.catch
+      (fun () -> Lwt_unix.write_string a "SECRET" 0 6 >|= ignore)
+      (fun _ -> Lwt.return_unit)
+  in
+  let close = Lwt_unix.close a in
+  (* Let the worker close the file, then take its number, before the loop runs
+     again. *)
+  Unix.sleepf 0.05;
+  let c, d = Unix.socketpair Unix.PF_UNIX Unix.SOCK_STREAM 0 in
+  Lwt_main.run (Lwt.join [ write; close ]);
+  let leaked =
+    match Unix.select [ d ] [] [] 0.1 with [], _, _ -> false | _ -> true
+  in
+  List.iter Unix.close [ b; c; d ];
+  check "a write prepared before close does not reach the next owner"
+    (not leaked)
+
 (* Replacing a uring engine that watches a descriptor and has a completion-based
    read in flight: the readiness wait moves to the new engine, and the read is
    cancelled, its promise rejected with [ECANCELED]. *)
@@ -415,6 +481,8 @@ let test_available () =
   test_io_bigarray ();
   test_connect ();
   test_dup2_kind ();
+  test_close_fails_io ();
+  test_close_then_reuse ();
   test_replace_busy_engine ();
   test_replace_from_callback ();
   test_fork ()

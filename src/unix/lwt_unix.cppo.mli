@@ -1511,6 +1511,8 @@ type completion_io = {
     (char, Bigarray.int8_unsigned_elt, Bigarray.c_layout) Bigarray.Array1.t ->
     int -> int -> int Lwt.t option;
   connect : file_descr -> Unix.sockaddr -> unit Lwt.t option;
+  on_close : Unix.file_descr -> unit;
+  on_abort : Unix.file_descr -> exn -> unit;
 }
 (** A completion-based I/O backend (e.g. io_uring), installed by a library such
     as [lwt_uring]. Each function may return [Some promise] to perform the
@@ -1521,7 +1523,15 @@ type completion_io = {
     [connect] resolves once the connection completes (or fails); it is only
     consulted for sockets. ([accept] is intentionally not part of this hook:
     routing single-shot [accept] through completion measured slower than the
-    readiness path, which already runs on the io_uring engine.) *)
+    readiness path, which already runs on the io_uring engine.)
+
+    [on_close] is called when {!close} closes a descriptor, or {!dup2}
+    replaces the file it names, before the file is closed. The backend fails
+    the operations it has in flight on the descriptor, as the default path
+    fails its waiters, and submits what it has prepared: once the file is
+    closed, the number may name another one. [on_abort] is called when
+    {!abort} aborts a descriptor; the backend fails the operations it has in
+    flight on it with the exception. *)
 
 val fd_kind : file_descr -> Unix.file_kind
 (** [fd_kind fd] is the [Unix.fstat] kind of [fd] (whether it is a socket, a

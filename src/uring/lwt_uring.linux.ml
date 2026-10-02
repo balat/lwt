@@ -52,49 +52,52 @@ and timer_req = {
 }
 
 and io_req = {
+  ops : io_req list ref;
+      (* The operations in flight on the same descriptor, this one included
+         (see [state]). *)
   complete : int -> unit;
       (* Resolves the operation's promise from the syscall result (negative for
          an errno). *)
   mutable io_job : req U.job option;
       (* As [job] above, for cancellation. *)
-  mutable slot : int;
-      (* The operation's index in its engine's [in_flight] table. *)
-  mutable abandoned : bool;
-      (* Set when the engine cancels the operation because it is destroyed: a
-         failure then rejects the promise with [Lwt.Canceled]. *)
+  mutable stopped : exn option;
+      (* Set when the operation is cancelled because its engine is destroyed,
+         or its descriptor closed or aborted: unless the operation completed
+         first, its promise is then rejected with this exception. *)
 }
 
-(* An engine's ring, with the completion-based operations in flight on it. Polls
-   and timers are [Lwt_engine] events, which [Lwt_engine] stops, and so cancels,
-   when it destroys the engine; completion-based operations are not, so the
-   engine keeps them here to cancel them itself (see [cleanup]). An operation
-   knows its slot, and removal moves the last entry into the freed one, so both
-   tracking and untracking are O(1). *)
+(* An engine's ring, with the completion-based operations in flight on it, by
+   descriptor. Polls and timers are [Lwt_engine] events, which [Lwt_engine]
+   stops, and so cancels, when it destroys the engine or when [Lwt_unix] closes
+   their descriptor; completion-based operations are not, so the engine keeps
+   them here to cancel them itself (see [cleanup] and [stop_descriptor]). A
+   descriptor has one or two operations in flight, a read and a write, so the
+   lists are short. An entry is emptied rather than removed, which saves
+   reallocating it for the next operation; the table holds at most one entry per
+   descriptor number. *)
 type state = {
   ring : req U.t;
-  mutable in_flight : io_req array;
-  mutable count : int;
+  in_flight : (Unix.file_descr, io_req list ref) Hashtbl.t;
 }
 
-let no_io = { complete = ignore; io_job = None; slot = -1; abandoned = false }
+(* One lookup per operation, which allocates nothing: the cell of a descriptor
+   is created once and then updated in place. *)
+let cell st fd =
+  match Hashtbl.find st.in_flight fd with
+  | ops -> ops
+  | exception Not_found ->
+    let ops = ref [] in
+    Hashtbl.add st.in_flight fd ops;
+    ops
 
-let track st r =
-  if st.count = Array.length st.in_flight then begin
-    let bigger = Array.make (max 16 (2 * st.count)) no_io in
-    Array.blit st.in_flight 0 bigger 0 st.count;
-    st.in_flight <- bigger
-  end;
-  r.slot <- st.count;
-  st.in_flight.(st.count) <- r;
-  st.count <- st.count + 1
-
-let untrack st r =
-  let last = st.count - 1 in
-  let moved = st.in_flight.(last) in
-  st.in_flight.(r.slot) <- moved;
-  moved.slot <- r.slot;
-  st.in_flight.(last) <- no_io;
-  st.count <- last
+(* Physical equality: after a close, the number may already carry the
+   operations of a new descriptor, and [r] is no longer among them. *)
+let untrack (r : io_req) =
+  let ops = r.ops in
+  match !ops with
+  | [ o ] when o == r -> ops := []
+  | o :: rest when o == r -> ops := rest
+  | l -> ops := List.filter (fun o -> o != r) l
 
 type Lwt_engine.engine_id += Engine_id__uring
 
@@ -136,7 +139,7 @@ let dispatch st result data =
   | Cancel -> ()
   | Io r ->
     r.io_job <- None;
-    untrack st r;
+    untrack r;
     r.complete result
   | Poll pr ->
     pr.job <- None;
@@ -171,7 +174,7 @@ let create_ring ~queue_depth =
 class uring ?(queue_depth = 256) () = object
   inherit Lwt_engine.abstract
 
-  val st = { ring = create_ring ~queue_depth; in_flight = [||]; count = 0 }
+  val st = { ring = create_ring ~queue_depth; in_flight = Hashtbl.create 64 }
 
   (* [false] in the child of a [Lwt_unix.fork]: the ring then belongs to the
      parent (see [fork]) and nothing here may touch it any more, neither to
@@ -201,17 +204,20 @@ class uring ?(queue_depth = 256) () = object
   method private cleanup =
     (match !installed with Some s when s == st -> installed := None | _ -> ());
     if live then begin
-      for i = 0 to st.count - 1 do
-        let r = st.in_flight.(i) in
-        r.abandoned <- true;
-        match r.io_job with Some job -> cancel st.ring job | None -> ()
-      done;
+      Hashtbl.iter
+        (fun _ ops ->
+          List.iter
+            (fun r ->
+              r.stopped <- Some Lwt.Canceled;
+              match r.io_job with Some job -> cancel st.ring job | None -> ())
+            !ops)
+        st.in_flight;
       while U.active_ops st.ring > 0 do
         match U.wait st.ring with
         | U.Some { result; data = Io r } ->
           let result = (result :> int) in
           r.io_job <- None;
-          untrack st r;
+          untrack r;
           Lwt.on_success (Lwt.pause ()) (fun () -> r.complete result)
         | U.Some { data = Poll _ | Timer _ | Cancel; _ } | U.None -> ()
       done;
@@ -311,23 +317,49 @@ let current_offset = Optint.Int63.minus_one
    the bounce-buffer blit of the bytes read path) so no extra promise is
    allocated on the per-operation hot path. Cancelling the promise cancels the
    in-flight submission. *)
-let submit_io st op_name post make =
+let submit_io st fd op_name post make =
   let waiter, wakener = Lwt.task () in
+  let ops = cell st fd in
   let rec r =
-    { complete =
+    { ops;
+      complete =
         (fun result ->
            if result >= 0 then Lwt.wakeup wakener (post result)
-           else if r.abandoned then Lwt.wakeup_exn wakener Lwt.Canceled
            else
-             Lwt.wakeup_exn wakener
-               (Unix.Unix_error (U.error_of_errno result, op_name, "")));
-      io_job = None; slot = -1; abandoned = false }
+             match r.stopped with
+             | Some e -> Lwt.wakeup_exn wakener e
+             | None ->
+               Lwt.wakeup_exn wakener
+                 (Unix.Unix_error (U.error_of_errno result, op_name, "")));
+      io_job = None; stopped = None }
   in
   r.io_job <- Some (submit st.ring (Io r) make);
-  track st r;
+  ops := r :: !ops;
   Lwt.on_cancel waiter (fun () ->
     match r.io_job with Some job -> cancel st.ring job | None -> ());
   waiter
+
+(* Fail the operations in flight on [fd] with [exn], unless they complete
+   first, and submit everything prepared so far. [Lwt_unix] calls this before
+   close(2), and the kernel resolves a descriptor number when an operation is
+   submitted: once the file is closed, the number may name another one, and a
+   write prepared for this file would reach it. *)
+let stop_descriptor fd exn =
+  match !installed with
+  | None -> ()
+  | Some st ->
+    let ops = cell st fd in
+    let stopped = !ops in
+    ops := [];
+    List.iter
+      (fun r ->
+        r.stopped <- Some exn;
+        match r.io_job with Some job -> cancel st.ring job | None -> ())
+      stopped;
+    ignore (U.submit st.ring)
+
+(* What the default path raises for an operation on a closed descriptor. *)
+let closed = Unix.Unix_error (Unix.EBADF, "check_descriptor", "")
 
 (* Result adapters for [submit_io]'s [post], defined once so that the common
    cases allocate no per-operation closure. *)
@@ -372,7 +404,7 @@ module Io = struct
   let read fd buf pos len =
     check "read" (Bytes.length buf) pos len;
     let cs = Cstruct.create_unsafe len in
-    submit_io (get_state ()) "read"
+    submit_io (get_state ()) fd "read"
       (fun n -> Cstruct.blit_to_bytes cs 0 buf pos n; n)
       (fun ring data -> U.read ring ~file_offset:current_offset fd cs data)
 
@@ -380,19 +412,19 @@ module Io = struct
     check "write" (Bytes.length buf) pos len;
     let cs = Cstruct.create_unsafe len in
     Cstruct.blit_from_bytes buf pos cs 0 len;
-    submit_io (get_state ()) "write" int_result (fun ring data ->
+    submit_io (get_state ()) fd "write" int_result (fun ring data ->
       U.write ring ~file_offset:current_offset fd cs data)
 
   let read_bigarray fd buf pos len =
     check "read_bigarray" (Bigarray.Array1.dim buf) pos len;
     let cs = Cstruct.of_bigarray ~off:pos ~len buf in
-    submit_io (get_state ()) "read" int_result (fun ring data ->
+    submit_io (get_state ()) fd "read" int_result (fun ring data ->
       U.read ring ~file_offset:current_offset fd cs data)
 
   let write_bigarray fd buf pos len =
     check "write_bigarray" (Bigarray.Array1.dim buf) pos len;
     let cs = Cstruct.of_bigarray ~off:pos ~len buf in
-    submit_io (get_state ()) "write" int_result (fun ring data ->
+    submit_io (get_state ()) fd "write" int_result (fun ring data ->
       U.write ring ~file_offset:current_offset fd cs data)
 end
 
@@ -421,7 +453,7 @@ let completion_backend : Lwt_unix.completion_io =
       let fd = Lwt_unix.unix_file_descr ch and kind = Lwt_unix.fd_kind ch in
       let cs = Cstruct.create_unsafe len in
       Some
-        (submit_io st "read"
+        (submit_io st fd "read"
            (fun n -> Cstruct.blit_to_bytes cs 0 buf pos n; n)
            (read_op kind fd cs))
   in
@@ -432,7 +464,7 @@ let completion_backend : Lwt_unix.completion_io =
       let fd = Lwt_unix.unix_file_descr ch and kind = Lwt_unix.fd_kind ch in
       let cs = Cstruct.create_unsafe len in
       Cstruct.blit_from_bytes buf pos cs 0 len;
-      Some (submit_io st "write" int_result (write_op kind fd cs))
+      Some (submit_io st fd "write" int_result (write_op kind fd cs))
   in
   let read_bigarray ch buf pos len =
     match !installed with
@@ -440,7 +472,7 @@ let completion_backend : Lwt_unix.completion_io =
     | Some st ->
       let fd = Lwt_unix.unix_file_descr ch and kind = Lwt_unix.fd_kind ch in
       let cs = Cstruct.of_bigarray ~off:pos ~len buf in
-      Some (submit_io st "read" int_result (read_op kind fd cs))
+      Some (submit_io st fd "read" int_result (read_op kind fd cs))
   in
   let write_bigarray ch buf pos len =
     match !installed with
@@ -448,7 +480,7 @@ let completion_backend : Lwt_unix.completion_io =
     | Some st ->
       let fd = Lwt_unix.unix_file_descr ch and kind = Lwt_unix.fd_kind ch in
       let cs = Cstruct.of_bigarray ~off:pos ~len buf in
-      Some (submit_io st "write" int_result (write_op kind fd cs))
+      Some (submit_io st fd "write" int_result (write_op kind fd cs))
   in
   (* Completion-based [connect]: submit IORING_OP_CONNECT and resolve when the
      connection completes (result 0) or fails (negative errno, mapped by
@@ -460,7 +492,7 @@ let completion_backend : Lwt_unix.completion_io =
     | Some st ->
       let fd = Lwt_unix.unix_file_descr ch in
       Some
-        (submit_io st "connect" unit_result (fun ring data ->
+        (submit_io st fd "connect" unit_result (fun ring data ->
            U.connect ring fd addr data))
   in
   (* [accept] is deliberately left on Lwt's default path: under the io_uring
@@ -469,7 +501,10 @@ let completion_backend : Lwt_unix.completion_io =
      compensating fcntl, and sequential accepts do not batch).
      Possible improvement: a multishot accept (IORING_OP_ACCEPT_MULTI, not in the
      [uring] API surface used here) would batch and might flip that verdict. *)
-  { Lwt_unix.read; write; read_bigarray; write_bigarray; connect }
+  let on_close fd = stop_descriptor fd closed in
+  let on_abort fd e = stop_descriptor fd e in
+  { Lwt_unix.read; write; read_bigarray; write_bigarray; connect; on_close;
+    on_abort }
 
 let () = Lwt_unix.set_completion_io (Some completion_backend)
 

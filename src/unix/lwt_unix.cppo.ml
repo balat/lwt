@@ -417,10 +417,45 @@ let clear_events ch =
       ()
   end
 
+type bigarray =
+  (char, Bigarray.int8_unsigned_elt, Bigarray.c_layout) Bigarray.Array1.t
+
+(* +-----------------------------------------------------------------+
+   | Completion-based I/O backend (e.g. io_uring)                    |
+   +-----------------------------------------------------------------+ *)
+
+(* An optional completion-based I/O backend, installed by a library such as
+   [lwt_uring]. When present, the basic read/write operations (including the
+   bigarray ones used by [Lwt_io]) consult it before falling back to the default
+   readiness/job path. Each function returns [Some promise] to take over the
+   operation, or [None] to decline (e.g. when its engine is not currently
+   installed), in which case the default path runs. This lets completion-based
+   engines transparently speed up existing code. *)
+type completion_io = {
+  read : file_descr -> bytes -> int -> int -> int Lwt.t option;
+  write : file_descr -> bytes -> int -> int -> int Lwt.t option;
+  read_bigarray : file_descr -> bigarray -> int -> int -> int Lwt.t option;
+  write_bigarray : file_descr -> bigarray -> int -> int -> int Lwt.t option;
+  connect : file_descr -> Unix.sockaddr -> unit Lwt.t option;
+  on_close : Unix.file_descr -> unit;
+  (* Called when a descriptor is closed, or replaced by [dup2], BEFORE
+     close(2): the backend fails the operations it has in flight on it, as
+     the readiness path fails its waiters, and submits what it has prepared,
+     while the number still names the file. *)
+  on_abort : Unix.file_descr -> exn -> unit;
+  (* Called when a descriptor is aborted: the backend fails the operations it
+     has in flight on it with the exception. *)
+}
+
+let completion_io : completion_io option ref = ref None
+
+let set_completion_io backend = completion_io := backend
+
 let abort ch e =
   if ch.state <> Closed then begin
     set_state ch (Aborted e);
-    clear_events ch
+    clear_events ch;
+    match !completion_io with Some io -> io.on_abort ch.fd e | None -> ()
   end
 
 let unix_file_descr ch = ch.fd
@@ -607,36 +642,12 @@ let close ch =
   if ch.state = Closed then check_descriptor ch;
   set_state ch Closed;
   clear_events ch;
+  (match !completion_io with Some io -> io.on_close ch.fd | None -> ());
   if Sys.win32 then
     Lwt.return (Unix.close ch.fd)
   else
     run_job (close_job ch.fd)
 
-type bigarray =
-  (char, Bigarray.int8_unsigned_elt, Bigarray.c_layout) Bigarray.Array1.t
-
-(* +-----------------------------------------------------------------+
-   | Completion-based I/O backend (e.g. io_uring)                    |
-   +-----------------------------------------------------------------+ *)
-
-(* An optional completion-based I/O backend, installed by a library such as
-   [lwt_uring]. When present, the basic read/write operations (including the
-   bigarray ones used by [Lwt_io]) consult it before falling back to the default
-   readiness/job path. Each function returns [Some promise] to take over the
-   operation, or [None] to decline (e.g. when its engine is not currently
-   installed), in which case the default path runs. This lets completion-based
-   engines transparently speed up existing code. *)
-type completion_io = {
-  read : file_descr -> bytes -> int -> int -> int Lwt.t option;
-  write : file_descr -> bytes -> int -> int -> int Lwt.t option;
-  read_bigarray : file_descr -> bigarray -> int -> int -> int Lwt.t option;
-  write_bigarray : file_descr -> bigarray -> int -> int -> int Lwt.t option;
-  connect : file_descr -> Unix.sockaddr -> unit Lwt.t option;
-}
-
-let completion_io : completion_io option ref = ref None
-
-let set_completion_io backend = completion_io := backend
 
 let wait_read ch =
   Lwt.catch
@@ -1292,6 +1303,8 @@ let dup ?cloexec ch =
 
 let dup2 ?cloexec ch1 ch2 =
   check_descriptor ch1;
+  (* dup2(2) closes the file [ch2] named. *)
+  (match !completion_io with Some io -> io.on_close ch2.fd | None -> ());
   Unix.dup2 ?cloexec ch1.fd ch2.fd;
   (* [ch2] now names the file of [ch1]: its cached kind is stale. *)
   ch2.io_kind <- None;
