@@ -274,6 +274,8 @@ and sched = {
    the run queue ([suspend]), instead of freezing them in the continuation. *)
 and cascade =
   | Cascade : ('a, exn) result * 'a waiter ref -> cascade
+  | Cancels of (unit -> unit) list ref
+    (* The [on_cancel] callbacks still to run, for a cancellation. *)
 
 (* A ready unit of work in the run queue. A [Thunk] carries the storage to
    restore before it runs. [Paused] and [Fill] are the loop's own events served
@@ -641,31 +643,66 @@ let new_pending (sched : sched) : 'a t =
    being linked, and a removable waiter firing from here finds the promise
    resolved and leaves its node alone (see [add_removable_waiter_to_each_of]).
    That is also what lets a cursor into it be followed later. *)
+(* [with_cascades sched outer f]: run [f ()] with the cascade entries it
+   registered on top of [outer], and put [outer] back whether [f] returned or
+   raised: a waiter that raises escapes the loop, as in Lwt, and must not
+   leave a stale entry that a later suspension would detach, resurrecting
+   callbacks the exception had dropped. *)
+let with_cascades (sched : sched) (outer : cascade list) (f : unit -> unit) :
+    unit =
+  match f () with
+  | () -> sched.cascades <- outer
+  | exception e ->
+    let bt = Printexc.get_raw_backtrace () in
+    sched.cascades <- outer;
+    Printexc.raise_with_backtrace e bt
+
+let rec run_waiters cursor r =
+  match !cursor with
+  | No_waiter -> ()
+  | Waiter w ->
+    cursor := w.older;
+    w.run r;
+    run_waiters cursor r
+
+let rec run_cancels (cursor : (unit -> unit) list ref) : unit =
+  match !cursor with
+  | [] -> ()
+  | f :: rest ->
+    cursor := rest;
+    f ();
+    run_cancels cursor
+
 let run_resolution_callbacks (type a) (sched : sched) (pe : a pending)
     (r : (a, exn) result) : unit =
-  (match r with
-  | Error Canceled -> List.iter (fun f -> f ()) pe.cancel_waiters
-  | Ok _ | Error _ -> ());
-  match pe.newest with
-  | No_waiter -> ()
-  | Waiter { older = No_waiter; run; _ } -> run r
-  | Waiter _ as first ->
-    (* Several waiters: go through a cursor the scheduler knows about, so that
-       a suspension inside one of them can detach the others ([suspend]). The
-       single-waiter case above, which is every pending [bind], pays nothing. *)
-    let cursor = ref first in
+  match (r, pe.cancel_waiters) with
+  | Error Canceled, (_ :: _ as cancels) ->
+    (* A cancellation with [on_cancel] callbacks: they run first, then the
+       waiters, and both go through cursors the scheduler knows about, the
+       waiters' registered first, so that a suspension inside an [on_cancel]
+       callback detaches the cancel callbacks still to run and then every
+       waiter, in that order ([suspend]). *)
     let outer = sched.cascades in
-    sched.cascades <- Cascade (r, cursor) :: outer;
-    let rec go () =
-      match !cursor with
-      | No_waiter -> ()
-      | Waiter w ->
-        cursor := w.older;
-        w.run r;
-        go ()
-    in
-    go ();
-    sched.cascades <- outer
+    let waiters = ref pe.newest in
+    let cancels = ref cancels in
+    sched.cascades <- Cancels cancels :: Cascade (r, waiters) :: outer;
+    with_cascades sched outer (fun () ->
+      run_cancels cancels;
+      sched.cascades <- Cascade (r, waiters) :: outer;
+      run_waiters waiters r)
+  | _ -> (
+    match pe.newest with
+    | No_waiter -> ()
+    | Waiter { older = No_waiter; run; _ } -> run r
+    | Waiter _ as first ->
+      (* Several waiters: go through a cursor the scheduler knows about, so
+         that a suspension inside one of them can detach the others
+         ([suspend]). The single-waiter case above, which is every pending
+         [bind], pays nothing. *)
+      let cursor = ref first in
+      let outer = sched.cascades in
+      sched.cascades <- Cascade (r, cursor) :: outer;
+      with_cascades sched outer (fun () -> run_waiters cursor r))
 
 let fill_general (type a) (sched : sched) ~allow_deferring
     ~maximum_callback_nesting_depth (p : a t) (r : (a, exn) result) : unit =
@@ -1140,45 +1177,80 @@ type resolution_state = {
   r_nesting : int;
   r_storage : storage;
   r_cascades : cascade list;
+  r_defer_fills : bool;
+    (* A fiber suspended inside the engine iteration (which [Lwt_main] runs
+       under [defer_fills]) must not leave [defer_fills] set for the pass that
+       goes on without it: [Lwt.wakeup] would stop running its callbacks for
+       everyone. Kept here so that it is restored with the fiber. *)
 }
 
 let capture (sched : sched) : resolution_state =
-  { r_nesting = sched.nesting; r_storage = sched.storage; r_cascades = sched.cascades }
+  {
+    r_nesting = sched.nesting;
+    r_storage = sched.storage;
+    r_cascades = sched.cascades;
+    r_defer_fills = sched.defer_fills;
+  }
 
 let install (sched : sched) (st : resolution_state) : unit =
   sched.nesting <- st.r_nesting;
   sched.storage <- st.r_storage;
-  sched.cascades <- st.r_cascades
+  sched.cascades <- st.r_cascades;
+  sched.defer_fills <- st.r_defer_fills
+
+(* The state at the start of a pass; one value, not one allocation per
+   suspension. *)
+let pass_start : resolution_state =
+  { r_nesting = 0; r_storage = empty_storage; r_cascades = []; r_defer_fills = false }
 
 let suspend (sched : sched) : resolution_state =
   let st = capture sched in
   List.iter
-    (fun (Cascade (r, cursor)) ->
-      let rec detach = function
-        | No_waiter -> ()
-        | Waiter w ->
-          Run_queue.push sched.queue (Detached (r, w.run));
-          detach w.older
-      in
-      detach !cursor;
-      cursor := No_waiter)
+    (function
+      | Cascade (r, cursor) ->
+        let rec detach = function
+          | No_waiter -> ()
+          | Waiter w ->
+            Run_queue.push sched.queue (Detached (r, w.run));
+            detach w.older
+        in
+        detach !cursor;
+        cursor := No_waiter
+      | Cancels cursor ->
+        List.iter
+          (fun f ->
+            Run_queue.push sched.queue
+              (Thunk (st.r_storage, fun () -> run_in_resolution_loop sched f)))
+          !cursor;
+        cursor := [])
     st.r_cascades;
   while not (Queue.is_empty sched.deferred) do
     let f = Queue.pop sched.deferred in
     Run_queue.push sched.queue
       (Thunk (st.r_storage, fun () -> run_in_resolution_loop sched f))
   done;
-  install sched { r_nesting = 0; r_storage = empty_storage; r_cascades = [] };
+  install sched pass_start;
   st
 
 let resume (sched : sched) (st : resolution_state) (f : unit -> unit) : unit =
-  let saved = capture sched in
+  (* The resumer's state in locals rather than a record: nothing allocated
+     per resumption. *)
+  let nesting = sched.nesting
+  and storage = sched.storage
+  and cascades = sched.cascades
+  and defer_fills = sched.defer_fills in
+  let restore () =
+    sched.nesting <- nesting;
+    sched.storage <- storage;
+    sched.cascades <- cascades;
+    sched.defer_fills <- defer_fills
+  in
   install sched st;
   match f () with
-  | () -> install sched saved
+  | () -> restore ()
   | exception e ->
     let bt = Printexc.get_raw_backtrace () in
-    install sched saved;
+    restore ();
     Printexc.raise_with_backtrace e bt
 
 (* A region in which suspending the current task is an error. The core only
