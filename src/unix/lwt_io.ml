@@ -1918,8 +1918,14 @@ let establish_server_deprecated ?fd ?buffer_size ?backlog sockaddr f =
   Lwt.ignore_result server_started;
   server
 
+(* A channel whose domain has gone: its finalisers are adopted by another
+   domain, where closing would raise from inside the finaliser, at whatever
+   allocation that domain was doing. Nothing is done with it then: its loop is
+   gone, and with it any way to flush or to run its close hook. *)
+let owned ch = ch.channel.owner = Lwt_dls.self_token ()
+
 let ignore_close ch =
-  ignore (close ch)
+  if owned ch then ignore (close ch)
 
 let make_stream f lazy_ic =
   let lazy_ic =

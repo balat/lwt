@@ -55,5 +55,26 @@ let () =
   check "a finaliser of a departed domain is dropped rather than misrouted"
     (not (Atomic.get ran_after_death));
 
+  (* A channel whose domain has gone. Its finaliser is adopted by another
+     domain and runs there, at some allocation of that domain; closing from
+     there would raise the ownership error out of the finaliser. The channel
+     is left alone instead. *)
+  let path = Filename.temp_file "lwt-orphan" ".txt" in
+  let oc = open_out path in
+  output_string oc "one\ntwo\n";
+  close_out oc;
+  Domain.join
+    (Domain.spawn (fun () ->
+       Lwt_main.run
+         (Lwt.map (fun _ -> ()) (Lwt_stream.get (Lwt_io.lines_of_file path)))));
+  let adopted_finaliser_raised =
+    match Gc.full_major (); Gc.full_major () with
+    | () -> false
+    | exception Invalid_argument _ -> true
+  in
+  (try Sys.remove path with Sys_error _ -> ());
+  check "a departed domain's channel finaliser does not raise here"
+    (not adopted_finaliser_raised);
+
   if !failures > 0 then exit 1;
   print_endline "Lwt_gc follows the domain that registered: ok"
