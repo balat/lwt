@@ -95,6 +95,9 @@ module Signal_map = Map.Make(struct type t = int let compare a b = a - b end)
 type signal_handler = {
   sh_num : int;
   sh_node : (signal_handler_id -> int -> unit) Lwt_sequence.node;
+  (* The loop that registered it: the node above is in that loop's list of
+     handlers, which only that loop may touch. *)
+  sh_owner : Lwt_dls.token;
 }
 
 and signal_handler_id = signal_handler option ref
@@ -2649,7 +2652,7 @@ let on_signal_full signum handler =
       (notification, actions)
   in
   let node = Lwt_sequence.add_r handler actions in
-  id := Some { sh_num = signum; sh_node = node };
+  id := Some { sh_num = signum; sh_node = node; sh_owner = Lwt_dls.self_token () };
   id
 
 let on_signal signum f = on_signal_full signum (fun _notification num -> f num)
@@ -2659,13 +2662,17 @@ let disable_signal_handler id =
   | None ->
     ()
   | Some sh ->
+    (* From its own loop only: the handler list it is in belongs to that loop,
+       and so does the subscription it may end. From another domain this used
+       to mutate that list unsynchronised, and leave the loop subscribed with
+       no handler left, so the signal was swallowed. *)
+    Lwt_dls.check_owner "Lwt_unix.disable_signal_handler" sh.sh_owner;
     let notif = self_notif () in
     id := None;
     Lwt_sequence.remove sh.sh_node;
     match Signal_map.find_opt sh.sh_num notif.signals with
     | None ->
-      (* Registered on another loop: its handler list is not ours to unsubscribe
-         from, and the node above was all we could remove. *)
+      (* The loop was retired meanwhile and its subscriptions went with it. *)
       ()
     | Some (notification, actions) ->
       if Lwt_sequence.is_empty actions then begin

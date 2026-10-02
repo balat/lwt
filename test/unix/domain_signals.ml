@@ -158,5 +158,21 @@ let () =
      | Unix.WSIGNALED n -> n = Sys.sigusr1
      | Unix.WEXITED _ | Unix.WSTOPPED _ -> false);
 
+  (* A handler belongs to the loop that registered it: disabling it from
+     another domain is refused rather than done half-way (the node pulled out
+     of a list that is not ours, the subscription left in place with no handler,
+     and the signal swallowed from then on). *)
+  let foreign =
+    Domain.join
+      (Domain.spawn (fun () ->
+         let id = Lwt_unix.on_signal Sys.sigurg (fun _ -> ()) in
+         Lwt_main.run (Lwt_unix.sleep 0.01);
+         id))
+  in
+  check "disabling another loop's handler is refused"
+    (match Lwt_unix.disable_signal_handler foreign with
+     | () -> false
+     | exception Invalid_argument _ -> true);
+
   if !failures > 0 then exit 1;
   print_endline "signals reach every subscribed loop: ok"
