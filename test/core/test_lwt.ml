@@ -4559,3 +4559,37 @@ let callback_exception_tests = suite "callback exceptions" [
   end;
 ]
 let suites = suites @ [callback_exception_tests]
+
+
+
+(* choose and pick select AT RANDOM among the promises already resolved: from
+   a generator of the core's own, as in Lwt, not the program's. *)
+let choice_tests = suite "choice among resolved promises" [
+  test "choose: the program's Random is left alone" begin fun () ->
+    Random.init 42;
+    let expected = Random.bits () in
+    Random.init 42;
+    for _ = 1 to 10 do
+      ignore (Lwt.choose [ Lwt.return 1; Lwt.return 2; Lwt.return 3 ])
+    done;
+    Lwt.return (Random.bits () = expected)
+  end;
+
+  (* A rejected promise wins over a fulfilled one, and among several rejected
+     any may be chosen, as among several fulfilled: the first in the list was
+     always chosen. *)
+  test "choose: any of several rejected promises may be chosen" begin fun () ->
+    let seen_a = ref false and seen_b = ref false in
+    for _ = 1 to 200 do
+      match
+        Lwt.state
+          (Lwt.choose [ Lwt.return 0; Lwt.fail Exit; Lwt.fail Not_found ])
+      with
+      | Lwt.Fail Exit -> seen_a := true
+      | Lwt.Fail Not_found -> seen_b := true
+      | _ -> ()
+    done;
+    Lwt.return (!seen_a && !seen_b)
+  end;
+]
+let suites = suites @ [choice_tests]

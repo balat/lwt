@@ -228,6 +228,12 @@ and sched = {
     (* Depth of the resolution loop: Lwt's tail-call protection, and what
        [wakeup_later] tests to decide whether to defer. *)
   deferred : (unit -> unit) Queue.t;
+  prng : Random.State.t Lazy.t;
+    (* What [choose] and [pick] draw from, among promises already resolved. The
+       scheduler's own, as in Lwt: drawing from the global [Random] consumed the
+       program's numbers and made a program's seed change which promise was
+       chosen. Per scheduler, hence per domain, since a [Random.State.t] is not
+       safe to share. Seeded with a constant, as Lwt's was. *)
     (* Callbacks deferred past the nesting cap; drained when the outermost loop
        exits. *)
   queue : task Run_queue.t;
@@ -408,6 +414,7 @@ let new_sched () : sched =
     storage = empty_storage;
     nesting = 0;
     deferred = Queue.create ();
+    prng = lazy (Random.State.make [||]);
     queue = Run_queue.create (Thunk (empty_storage, ignore));
     paused = [];
     yielded = [];
@@ -1059,26 +1066,30 @@ let add_removable_waiter_to_each_of (sched : sched) (ps : 'a t list)
    with several fulfilled and none rejected, one is chosen at random (fairness,
    as Lwt). The [Invalid_argument] messages use Lwt's wording: this core is meant
    to BE the Lwt core (B2b), where these are the right names. *)
-let select_resolved (ps : 'a t list) : 'a t option =
+(* A rejected promise wins over a fulfilled one; among several of the winning
+   kind, one at random, from the scheduler's generator, as in Lwt. *)
+let select_resolved (sched : sched) (ps : 'a t list) : 'a t option =
+  let pick_one = function
+    | [] -> None
+    | [ p ] -> Some p
+    | l ->
+      Some (List.nth l (Random.State.int (Lazy.force sched.prng) (List.length l)))
+  in
   match
     List.filter (fun p -> match (prj p).st with Rejected _ -> true | _ -> false) ps
   with
-  | p :: _ -> Some p
-  | [] -> (
-    match
-      List.filter
-        (fun p -> match (prj p).st with Fulfilled _ -> true | _ -> false)
-        ps
-    with
-    | [] -> None
-    | [ p ] -> Some p
-    | l -> Some (List.nth l (Random.int (List.length l))))
+  | _ :: _ as rejected -> pick_one rejected
+  | [] ->
+    pick_one
+      (List.filter
+         (fun p -> match (prj p).st with Fulfilled _ -> true | _ -> false)
+         ps)
 
 let choose (ps : 'a t list) : 'a t =
   let sched = self_sched () in
   if ps = [] then
     invalid_arg "Lwt.choose [] would return a promise that is pending forever";
-  match select_resolved ps with
+  match select_resolved sched ps with
   | Some p -> p
   | None ->
     let result = new_pending sched in
@@ -1095,7 +1106,7 @@ let pick (ps : 'a t list) : 'a t =
   let sched = self_sched () in
   if ps = [] then
     invalid_arg "Lwt.pick [] would return a promise that is pending forever";
-  match select_resolved ps with
+  match select_resolved sched ps with
   | Some p ->
     List.iter (fun q -> if q != p then cancel q) ps;
     p
