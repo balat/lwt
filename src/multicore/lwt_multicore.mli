@@ -92,7 +92,13 @@ exception Loop_terminated
 val run_on : loop -> (unit -> unit) -> unit
 (** [run_on loop f] posts [f] to [loop] and wakes it. [f] runs ON THAT LOOP's
     domain, on its next lap, with nothing held: it may do anything an ordinary
-    Lwt callback may do, including resolving that loop's promises.
+    Lwt callback may do, including resolving that loop's promises. An exception
+    out of [f] goes to {!Lwt.async_exception_hook}, as from any callback, and
+    the work posted after it still runs.
+
+    [f] runs inside the loop's notification handler, that is during the
+    engine's own lap, where a direct-style [Lwt_direct.await] is refused: an
+    [f] that must await should start a promise and return.
 
     Callable from any domain and from any thread, including a thread that is not
     running Lwt at all.
