@@ -16,6 +16,8 @@ depends: [
   "base-unix"
   "lwt" {>= "6"}
   "uring" {>= "2.7"}
+  "cstruct"
+  "optint"
   "odoc" {with-doc}
 ]
 build: [

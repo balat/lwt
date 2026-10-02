@@ -16,6 +16,7 @@ depends: [
   "base-unix"
   "lwt" {>= "6"}
   "saturn" {>= "1.0"}
+  "qcheck-stm" {with-test & >= "0.3"}
   "odoc" {with-doc}
 ]
 build: [
