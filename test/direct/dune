@@ -21,3 +21,11 @@
  (build_if
   (>= %{ocaml_version} "5.3"))
  (libraries lwt_direct lwt.unix))
+
+(test
+ (name test_stream_source)
+ (modules test_stream_source)
+ (package lwt_direct)
+ (build_if
+  (>= %{ocaml_version} "5.3"))
+ (libraries lwt_direct lwt.unix))

@@ -27,6 +27,15 @@ let new_node () =
 type 'a from = {
   from_create : unit -> 'a option Lwt.t;
   (* Function used to create new elements. *)
+  mutable from_busy : bool;
+  (* Whether [from_create] has been called and has not returned yet. A source
+     written in direct style may suspend inside the call, before its promise
+     exists; a second reader arriving then must wait rather than call the
+     source again, or the elements come out in the order of completion and
+     the end of the stream is signalled twice. *)
+  mutable from_waiters : unit Lwt.u list;
+  (* The readers that arrived while [from_busy]; woken once the element is in
+     the queue. *)
   mutable from_thread : unit Lwt.t;
   (* Thread which:
 
@@ -35,6 +44,14 @@ type 'a from = {
 
      If it is a sleeping thread, then it must be used instead of creating a
      new one with [from_create]. *)
+}
+
+(* A direct source, with the same guard against a second reader arriving while
+   the source is suspended inside its call. *)
+type 'a from_direct = {
+  fd_create : unit -> 'a option;
+  mutable fd_busy : bool;
+  mutable fd_waiters : unit Lwt.u list;
 }
 
 (* Type of a stream source for push streams. *)
@@ -73,7 +90,7 @@ type 'a push_bounded = {
 (* Source of a stream. *)
 type 'a source =
   | From of 'a from
-  | From_direct of (unit -> 'a option)
+  | From_direct of 'a from_direct
   | Push of push
   | Push_bounded of 'a push_bounded
 
@@ -141,10 +158,12 @@ let from_source source =
     owner = Lwt_dls.self_token () }
 
 let from f =
-  from_source (From { from_create = f; from_thread = Lwt.return_unit })
+  from_source
+    (From { from_create = f; from_busy = false; from_waiters = [];
+            from_thread = Lwt.return_unit })
 
 let from_direct f =
-  from_source (From_direct f)
+  from_source (From_direct { fd_create = f; fd_busy = false; fd_waiters = [] })
 
 let closed s = s.closed
 
@@ -387,6 +406,11 @@ let create_bounded size =
 
 (* Wait for a new element to be added to the queue of pending element
    of the stream. *)
+(* The end of the stream, signalled once: the source may be called again after
+   it returned [None], and must not raise then. *)
+let signal_end s =
+  if Lwt.is_sleeping s.closed then Lwt.wakeup s.close ()
+
 let feed s =
   Lwt_dls.check_owner "Lwt_stream (reading)" s.owner;
   match s.source with
@@ -395,32 +419,73 @@ let feed s =
        wait for this one to terminate. *)
     if Lwt.is_sleeping from.from_thread then
       Lwt.protected from.from_thread
+    else if from.from_busy then begin
+      let waiter, wakener = Lwt.task () in
+      from.from_waiters <- wakener :: from.from_waiters;
+      waiter
+    end
     else begin
       (* Otherwise request a new element. *)
-      let thread =
+      from.from_busy <- true;
+      let take_waiters () =
+        let late = from.from_waiters in
+        from.from_waiters <- [];
+        from.from_busy <- false;
+        late
+      in
+      let wake late = List.iter (fun wakener -> Lwt.wakeup_later wakener ()) late in
+      match
         (* The function [from_create] can raise an exception (with
            [raise], rather than returning a failed promise with
-           [Lwt.fail]). In this case, we have to catch the exception
-           and turn it into a safe failed promise. *)
+           [Lwt.fail]), and then the exception leaves [feed] as it is,
+           which callers such as [wrap_exn] rely on. *)
         Lwt.catch
           (fun () ->
             from.from_create () >>= fun x ->
             (* Push the element to the end of the queue. *)
             enqueue x s;
-            if x = None then Lwt.wakeup s.close ();
+            if x = None then signal_end s;
             Lwt.return_unit)
           Lwt.reraise
-      in
-      (* Allow other threads to access this thread. *)
-      from.from_thread <- thread;
-      Lwt.protected thread
+      with
+      | exception exn ->
+        (* The readers that arrived meanwhile try again themselves. *)
+        wake (take_waiters ());
+        raise exn
+      | thread ->
+        let late = take_waiters () in
+        (* Allow other threads to access this thread. *)
+        from.from_thread <- thread;
+        if late <> [] then Lwt.on_termination thread (fun () -> wake late);
+        Lwt.protected thread
     end
-  | From_direct f ->
-    let x = f () in
-    (* Push the element to the end of the queue. *)
-    enqueue x s;
-    if x = None then Lwt.wakeup s.close ();
-    Lwt.return_unit
+  | From_direct fd ->
+    if fd.fd_busy then begin
+      let waiter, wakener = Lwt.task () in
+      fd.fd_waiters <- wakener :: fd.fd_waiters;
+      waiter
+    end
+    else begin
+      fd.fd_busy <- true;
+      let take_waiters () =
+        let late = fd.fd_waiters in
+        fd.fd_waiters <- [];
+        fd.fd_busy <- false;
+        late
+      in
+      let wake late = List.iter (fun wakener -> Lwt.wakeup_later wakener ()) late in
+      match fd.fd_create () with
+      | exception exn ->
+        wake (take_waiters ());
+        raise exn
+      | x ->
+        let late = take_waiters () in
+        (* Push the element to the end of the queue. *)
+        enqueue x s;
+        if x = None then signal_end s;
+        wake late;
+        Lwt.return_unit
+    end
   | Push push ->
     push.push_waiting <- true;
     Lwt.protected push.push_signal
