@@ -309,4 +309,101 @@ let state_suite = suite "resolution state across suspensions" [
   end;
 ]
 
-let suites = [anywhere_suite; no_await_suite; state_suite]
+[@@@alert "-trespassing"]
+
+(* Regression tests for the findings of the review of the branch. *)
+let review_suite = suite "review findings" [
+  test "an await in an on_cancel callback detaches the rest of the cascade" begin fun () ->
+    (* The cleanup the on_cancel callback awaits is done by an on_failure
+       callback of the SAME promise, which runs after the cancel callbacks: it
+       must be detached and run while the callback is suspended. *)
+    let cleanup_done, cleanup_u = Lwt.wait () in
+    let p, _ = Lwt.task () in
+    Lwt.on_failure p (fun _ -> Lwt.wakeup cleanup_u ());
+    Lwt.on_cancel p (fun () -> await cleanup_done);
+    let run =
+      Lwt.pause () >>= fun () ->
+      Lwt.cancel p;
+      cleanup_done >|= fun () -> true
+    in
+    Lwt.pick [run; (Lwt_unix.sleep 1.0 >|= fun () -> false)]
+  end;
+
+  test "an exception out of a waiter leaves no stale cascade behind" begin fun () ->
+    let ran = ref false in
+    let p, r = Lwt.wait () in
+    Lwt.on_success p (fun () -> ran := true);
+    Lwt.on_success p (fun () -> raise Stack_overflow);
+    Lwt.pause () >>= fun () ->
+    (match Lwt.wakeup r () with () -> () | exception Stack_overflow -> ());
+    let before = !ran in
+    (* A suspension used to detach the stale cascade and resurrect the
+       abandoned waiter. *)
+    await (Lwt_unix.sleep 1e-3);
+    Lwt.return (not before && not !ran)
+  end;
+
+  test "an await in an iteration hook raises Suspension_forbidden" begin fun () ->
+    let seen = ref false in
+    let hook =
+      Lwt_main.Enter_iter_hooks.add_first (fun () ->
+        match await (Lwt_unix.sleep 1e-3) with
+        | () -> ()
+        | exception Lwt_direct.Suspension_forbidden -> seen := true)
+    in
+    Lwt_unix.sleep 2e-3 >|= fun () ->
+    Lwt_main.Enter_iter_hooks.remove hook;
+    !seen
+  end;
+
+  test "an await in an engine callback raises Suspension_forbidden, on every engine" begin fun () ->
+    let seen = ref false in
+    let fired, fired_u = Lwt.wait () in
+    let _ = Lwt_engine.on_timer 1e-3 false (fun ev ->
+      Lwt_engine.stop_event ev;
+      (match await (Lwt_unix.sleep 1e-3) with
+       | () -> ()
+       | exception Lwt_direct.Suspension_forbidden -> seen := true);
+      Lwt.wakeup fired_u ())
+    in
+    fired >|= fun () -> !seen
+  end;
+
+  test "leave hooks run after the callbacks of their lap" begin fun () ->
+    (* A leave hook that flushes what a timer callback asked for: it must see
+       the request in the same lap, not at the next event. *)
+    let pending = ref false in
+    let flushed, flushed_u = Lwt.wait () in
+    let hook =
+      Lwt_main.Leave_iter_hooks.add_first (fun () ->
+        if !pending then begin pending := false; Lwt.wakeup flushed_u () end)
+    in
+    let t0 = Unix.gettimeofday () in
+    Lwt.async (fun () -> Lwt_unix.sleep 1e-3 >|= fun () -> pending := true);
+    Lwt.pick [flushed; Lwt_unix.sleep 0.5] >|= fun () ->
+    Lwt_main.Leave_iter_hooks.remove hook;
+    Unix.gettimeofday () -. t0 < 0.1
+  end;
+
+  test "await on a pending promise of another domain raises Foreign_promise at the call" begin fun () ->
+    let p, _ = Lwt.wait () in
+    let d =
+      Domain.spawn (fun () ->
+        Lwt_main.run
+          (Lwt.pause () >|= fun () ->
+           match await p with
+           | () -> false
+           | exception Lwt.Foreign_promise -> true))
+    in
+    Lwt.return (Domain.join d)
+  end;
+
+  test "abandon_paused also drops the pauses already queued as tasks" begin fun () ->
+    let pz = Lwt.pause () in
+    Lwt.Private.scheduler_serve_paused ();
+    Lwt.abandon_paused ();
+    Lwt_unix.sleep 1e-3 >|= fun () -> Lwt.state pz = Lwt.Sleep
+  end;
+]
+
+let suites = [anywhere_suite; no_await_suite; state_suite; review_suite]
