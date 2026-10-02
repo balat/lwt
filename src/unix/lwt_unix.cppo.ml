@@ -125,12 +125,19 @@ type notif = {
      * int)
     Lwt_sequence.t;
   mutable sigchld_installed : bool;
+  (* What to run when this loop is retired, after its exit hooks have been
+     drained and before its channel is closed: a layer above (lwt_multicore)
+     closes its inbox there, so that nothing posted to the loop is lost while
+     the hooks can still use it. Last registered, first run. Never run on the
+     main domain, whose loop lives as long as the process. *)
+  at_retirement : (unit -> unit) list ref;
 }
 
 let notif_slot : notif Lwt_dls.t =
   Lwt_dls.new_key (fun () ->
     let fd, chan = new_notification_channel () in
     let event = Lwt_engine.on_readable fd (fun _ -> !drain_notifications chan) in
+    let at_retirement = ref [] in
     (* Retire the channel with the domain, but NOT on the main one, and that
        exception is the whole subtlety.
 
@@ -165,6 +172,7 @@ let notif_slot : notif Lwt_dls.t =
            longer exists, and the signal keeps being swallowed: a program whose
            last subscriber died would stop dying on SIGTERM. *)
         !drop_signal_subscriptions ();
+        List.iter (fun f -> f ()) !at_retirement;
         Lwt_engine.stop_event event;
         free_notification_channel chan;
         (* And forget every notification this loop made, LAST: a sender that
@@ -180,7 +188,8 @@ let notif_slot : notif Lwt_dls.t =
       job_count = 0;
       signals = Signal_map.empty;
       wait_children = Lwt_sequence.create ();
-      sigchld_installed = false })
+      sigchld_installed = false;
+      at_retirement })
 
 let[@inline] self_notif () = Lwt_dls.get notif_slot
 let[@inline] self_channel () = (Lwt_dls.get notif_slot).chan
@@ -189,6 +198,10 @@ let[@inline] self_channel () = (Lwt_dls.get notif_slot).chan
    registers its exit drain, so that the drain runs while the channel lives; see
    the ORDER note above. *)
 let ensure_channel () = ignore (Lwt_dls.get notif_slot)
+
+let at_loop_exit f =
+  let notif = self_notif () in
+  notif.at_retirement := f :: !(notif.at_retirement)
 
 (* Which domain initialised this module. Only [fork] still cares, and not for any
    reason to do with notifications: the runtime does not support forking while

@@ -68,3 +68,13 @@
  (build_if
   (>= %{ocaml_version} "5.0"))
  (libraries lwt.unix lwt_multicore qcheck-stm.sequential))
+
+; An exit hook that waits for another domain: the process must exit.
+
+(test
+ (name exit_hooks)
+ (package lwt_multicore)
+ (modules exit_hooks)
+ (build_if
+  (>= %{ocaml_version} "5.0"))
+ (libraries lwt.unix lwt_multicore))
