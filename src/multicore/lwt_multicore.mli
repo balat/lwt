@@ -352,7 +352,12 @@ module Service : sig
   val shutdown : ('req, 'res) t -> unit Lwt.t
   (** Closes the request channel, waits for the service to finish what it has, and
       reaps its domain. Calls already in flight are answered; calls made
-      afterwards are rejected with {!Stream.Closed}. *)
+      afterwards are rejected with {!Stream.Closed}.
+
+      A service whose handler let through an exception the loop does not catch
+      (a runtime exception such as [Stack_overflow], which the default
+      {!Lwt.Exception_filter} leaves alone) is dead: its queued calls are
+      rejected with that exception, and so is this promise. *)
 end
 
 module Pool : sig

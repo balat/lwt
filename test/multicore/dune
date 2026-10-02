@@ -89,3 +89,13 @@
  (build_if
   (>= %{ocaml_version} "5.0"))
  (libraries lwt.unix lwt_multicore))
+
+; A service killed by a runtime exception, and run_on work that raises.
+
+(test
+ (name service_fatal)
+ (package lwt_multicore)
+ (modules service_fatal)
+ (build_if
+  (>= %{ocaml_version} "5.0"))
+ (libraries lwt.unix lwt_multicore))
