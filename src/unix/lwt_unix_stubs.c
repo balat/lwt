@@ -637,11 +637,27 @@ CAMLprim value lwt_unix_init_notifications(value unit) {
    the interrupted thread may hold is exactly what must be avoided. A slot's
    pointer is written once, before any id can name it, and cleared only after the
    loop that owned it is gone. */
+/* The slot pointer, [in_use] and [generation] are read here without the mutex,
+   by another thread or a signal handler, while the loop that owns the channel
+   writes them: so they are published with RELEASE stores and read with ACQUIRE
+   loads. Plain accesses were enough on x86, whose ordering hides the problem,
+   and not on ARM or POWER, where a reader could see the slot before the channel
+   it names was initialised; ThreadSanitizer reported it, as it should. */
+#if defined(__GNUC__) || defined(__clang__)
+#define LWT_LOAD_ACQUIRE(p) __atomic_load_n((p), __ATOMIC_ACQUIRE)
+#define LWT_STORE_RELEASE(p, v) __atomic_store_n((p), (v), __ATOMIC_RELEASE)
+#else
+/* Other compilers (MSVC): plain accesses, which x86 and x64, the targets of
+   such a port, order as acquire and release. */
+#define LWT_LOAD_ACQUIRE(p) (*(p))
+#define LWT_STORE_RELEASE(p, v) (*(p) = (v))
+#endif
+
 static struct notification_channel *channel_of_id(intnat id) {
   int i = LWT_NOTIFICATION_INDEX(id);
-  struct notification_channel *chan = notification_channels[i];
-  if (chan == NULL || chan->in_use == 0) return NULL;
-  if (chan->generation != LWT_NOTIFICATION_GEN(id)) return NULL;
+  struct notification_channel *chan = LWT_LOAD_ACQUIRE(&notification_channels[i]);
+  if (chan == NULL || LWT_LOAD_ACQUIRE(&chan->in_use) == 0) return NULL;
+  if (LWT_LOAD_ACQUIRE(&chan->generation) != LWT_NOTIFICATION_GEN(id)) return NULL;
   return chan;
 }
 
@@ -685,7 +701,8 @@ void lwt_unix_send_notification(intnat id) {
      a sender racing with a loop's exit wrote to a closed descriptor (EBADF
      out of send_notification, from a thread with no runtime if it was a job
      worker) or, worse, to whatever file had reused the number. */
-  if (chan->in_use == 0 || chan->generation != LWT_NOTIFICATION_GEN(id)) {
+  if (LWT_LOAD_ACQUIRE(&chan->in_use) == 0 ||
+      LWT_LOAD_ACQUIRE(&chan->generation) != LWT_NOTIFICATION_GEN(id)) {
     lwt_unix_mutex_unlock(&chan->mutex);
 #if !defined(LWT_ON_WINDOWS)
     pthread_sigmask(SIG_SETMASK, &old_mask, NULL);
@@ -985,19 +1002,35 @@ CAMLprim value lwt_unix_new_notification_channel(value unit) {
     chan->notifications =
         (intnat *)lwt_unix_malloc(chan->count * sizeof(intnat));
     chan->generation = 0;
+    chan->index = 0;
+    channel_adopt_transport(chan, &transport);
+    /* Published last, and in_use last of all: [channel_of_id] reads this slot
+       without the mutex, so nothing may name the channel before it is
+       complete. */
+    LWT_STORE_RELEASE(&chan->in_use, 1);
+    LWT_STORE_RELEASE(&notification_channels[found], chan);
   } else {
     /* A slot coming back from the free list: a new generation, so that ids
-       handed out by its previous owner stop naming it. */
-    chan->generation =
-        (chan->generation + 1) & (unsigned)LWT_NOTIFICATION_GEN_MASK;
+       handed out by its previous owner stop naming it. Under the channel's
+       own mutex, with signals masked as every taker of it: a late sender of
+       the previous owner may be about to check the slot under that mutex,
+       and must see the old state or the new one, never a mix. */
+#if !defined(LWT_ON_WINDOWS)
+    sigset_t new_mask, old_mask;
+    sigfillset(&new_mask);
+    pthread_sigmask(SIG_SETMASK, &new_mask, &old_mask);
+#endif
+    lwt_unix_mutex_lock(&chan->mutex);
+    LWT_STORE_RELEASE(&chan->generation,
+        (chan->generation + 1) & (unsigned)LWT_NOTIFICATION_GEN_MASK);
+    chan->index = 0;
+    channel_adopt_transport(chan, &transport);
+    LWT_STORE_RELEASE(&chan->in_use, 1);
+    lwt_unix_mutex_unlock(&chan->mutex);
+#if !defined(LWT_ON_WINDOWS)
+    pthread_sigmask(SIG_SETMASK, &old_mask, NULL);
+#endif
   }
-  chan->index = 0;
-  channel_adopt_transport(chan, &transport);
-
-  /* Published last, and in_use last of all: [channel_of_id] reads this slot
-     without the mutex, so nothing may name the channel before it is complete. */
-  chan->in_use = 1;
-  notification_channels[found] = chan;
   lwt_unix_mutex_unlock(&notification_channels_mutex);
 
   result = caml_alloc_tuple(2);
@@ -1028,7 +1061,7 @@ CAMLprim value lwt_unix_free_notification_channel(value val_index) {
     pthread_sigmask(SIG_SETMASK, &new_mask, &old_mask);
 #endif
     lwt_unix_mutex_lock(&chan->mutex);
-    chan->in_use = 0;
+    LWT_STORE_RELEASE(&chan->in_use, 0);
     chan->index = 0;
     channel_close_transport(chan);
     lwt_unix_mutex_unlock(&chan->mutex);
