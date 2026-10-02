@@ -235,6 +235,43 @@ let test_many_ready_polls () =
     pairs;
   check "more ready descriptors than the queue holds: all woken" woken
 
+(* Tearing a uring engine down with operations in flight that produce no
+   completion of their own: a recv on an idle socket, an armed multishot
+   accept. The teardown waited for them without cancelling them, for ever: an
+   engine replaced, or a domain whose loop ended with a connection open, never
+   came back. Both must return, and the read's promise is rejected. *)
+let test_teardown_in_flight () =
+  let a, _b = Lwt_unix.socketpair Unix.PF_UNIX Unix.SOCK_STREAM 0 in
+  let pending_read = Lwt_unix.read a (Bytes.create 8) 0 8 in
+  let listener = Lwt_unix.socket Unix.PF_INET Unix.SOCK_STREAM 0 in
+  Lwt_main.run
+    (Lwt_unix.bind listener (Unix.ADDR_INET (Unix.inet_addr_loopback, 0))
+     >>= fun () ->
+     Lwt_unix.listen listener 8;
+     let (_ : (Lwt_unix.file_descr * Unix.sockaddr) Lwt.t) =
+       Lwt_unix.accept listener
+     in
+     Lwt_unix.sleep 0.02);
+  Lwt_engine.set (new Lwt_engine.select);
+  check "replacing the engine with a read and an accept in flight returns" true;
+  check "and the read in flight is rejected"
+    (match Lwt.state pending_read with Lwt.Fail _ -> true | _ -> false);
+  Lwt_uring.set ()
+
+(* The same through the exit of a domain. Last of the tests: the runtime
+   refuses Unix.fork once a domain has been spawned. *)
+let test_domain_exit_in_flight () =
+  let exited =
+    Domain.join
+      (Domain.spawn (fun () ->
+         Lwt_uring.set ();
+         let c, _d = Lwt_unix.socketpair Unix.PF_UNIX Unix.SOCK_STREAM 0 in
+         ignore (Lwt_unix.read c (Bytes.create 8) 0 8);
+         Lwt_main.run (Lwt_unix.sleep 0.02);
+         true))
+  in
+  check "a domain on uring exits with a read still in flight" exited
+
 let () =
   (* A test that hangs the loop must fail rather than wait for ever. *)
   Sys.set_signal Sys.sigalrm
@@ -257,7 +294,9 @@ let () =
   test_io_bigarray ();
   test_connect ();
   test_many_ready_polls ();
+  test_teardown_in_flight ();
   test_fork ();
+  test_domain_exit_in_flight ();
   if !failures = 0 then Printf.printf "\nAll tests passed.\n%!"
   else begin
     Printf.printf "\n%d test(s) failed.\n%!" !failures;

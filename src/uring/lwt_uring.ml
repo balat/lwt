@@ -93,15 +93,6 @@ let submit_timer ring tr =
   tr.t_job <- Some (submit ring (Timer tr)
                       (fun ring data -> U.timeout ring U.Boottime tr.ns data))
 
-(* Cancel an in-flight submission. The original operation still produces a
-   completion (with [ECANCELED]), which is dropped because its event is no
-   longer active; the cancel submission itself produces a [Cancel] completion,
-   which is ignored. *)
-let cancel ring job =
-  try ignore (U.cancel ring job Cancel)
-  with Invalid_argument _ -> ()
-  (* The job was already collected — nothing to cancel. *)
-
 (* ---- multishot accept ---- *)
 
 (* Set to [false] when the kernel rejects a multishot accept (EINVAL: Linux
@@ -132,15 +123,99 @@ let multishot_supported = Atomic.make true
    the pointer on the live ring. *)
 [@@@alert "-lwt_internal"]
 
+(* A routed operation in flight: its ring and its submission, to cancel it,
+   and how to fail its promise from outside, when its descriptor is closed or
+   aborted, or its engine torn down. *)
+type inflight = {
+  op_ring : req U.t;
+  mutable op_job : req U.job option;
+  op_fail : exn -> unit;
+}
+
 type uring_state = {
   mutable ring : req U.t option;
   accept_streams : (Unix.file_descr, accept_stream) Hashtbl.t;
+  inflight : (Unix.file_descr, inflight list) Hashtbl.t;
+    (* The routed operations in flight, by descriptor. Keyed by the NUMBER,
+       which is sound because an entry is dropped when its descriptor is
+       closed, before close(2) lets the number be reused. *)
+  mutable deferred_cancels : (req U.t * req U.job) list;
+    (* Cancellations that found the submission queue full even after a
+       flush; submitted at the next iteration rather than dropped. *)
 }
 
 let state_slot : uring_state Lwt_dls.t =
-  Lwt_dls.new_key (fun () -> { ring = None; accept_streams = Hashtbl.create 8 })
+  Lwt_dls.new_key (fun () ->
+    { ring = None;
+      accept_streams = Hashtbl.create 8;
+      inflight = Hashtbl.create 64;
+      deferred_cancels = [] })
 
 let[@inline] self_state () = Lwt_dls.get state_slot
+
+(* Cancel an in-flight submission. The original operation still produces a
+   completion (with [ECANCELED]), which is dropped because its event is no
+   longer active; the cancel submission itself produces a [Cancel] completion,
+   which is ignored. A full submission queue is flushed and the cancel tried
+   again; still full, it is kept for the next iteration. A cancel that was
+   dropped instead left the operation running in the kernel, holding its file:
+   a closed socket stayed open there. *)
+let cancel ring job =
+  match U.cancel ring job Cancel with
+  | Some _ -> ()
+  | None -> (
+    ignore (U.submit ring);
+    match U.cancel ring job Cancel with
+    | Some _ -> ()
+    | None ->
+      let st = self_state () in
+      st.deferred_cancels <- (ring, job) :: st.deferred_cancels)
+  | exception Invalid_argument _ -> ()
+  (* The job was already collected: nothing to cancel. *)
+
+let retry_deferred_cancels ring =
+  let st = self_state () in
+  match st.deferred_cancels with
+  | [] -> ()
+  | pending ->
+    st.deferred_cancels <- [];
+    List.iter
+      (fun ((r, job) as c) ->
+         if r == ring then cancel ring job
+         else st.deferred_cancels <- c :: st.deferred_cancels)
+      pending
+
+let remember st fd op =
+  let ops = match Hashtbl.find_opt st.inflight fd with Some l -> l | None -> [] in
+  Hashtbl.replace st.inflight fd (op :: ops)
+
+let forget st fd op =
+  match Hashtbl.find_opt st.inflight fd with
+  | None -> ()
+  | Some ops -> (
+    match List.filter (fun o -> o != op) ops with
+    | [] -> Hashtbl.remove st.inflight fd
+    | ops -> Hashtbl.replace st.inflight fd ops)
+
+(* The routed operations of [ring], failed with [exn] and, unless the ring is
+   not ours to touch any more ([~cancel_them:false], the child of a fork), cancelled
+   in the kernel. *)
+let fail_inflight ?(cancel_them = true) st ring exn =
+  let mine = ref [] in
+  Hashtbl.filter_map_inplace
+    (fun _ ops ->
+       let theirs, ours = List.partition (fun op -> op.op_ring != ring) ops in
+       mine := ours @ !mine;
+       match theirs with [] -> None | l -> Some l)
+    st.inflight;
+  List.iter
+    (fun op ->
+       (match op.op_job with
+        | Some j when cancel_them -> cancel ring j
+        | _ -> ());
+       op.op_job <- None;
+       op.op_fail exn)
+    !mine
 
 let arm_accept ring str =
   str.armed <-
@@ -173,9 +248,16 @@ let reject_acceptors str exn =
     str.acceptors;
   Queue.clear str.acceptors
 
-let teardown_accept_streams st =
+(* Every accept stream goes. Their armed multishots are cancelled on [ring]
+   when it is given: left armed, they kept the listening sockets referenced in
+   the kernel and a teardown waited for them for ever. Not given for the child
+   of a fork, whose ring is the parent's. *)
+let teardown_accept_streams ?ring st =
   Hashtbl.iter
     (fun _ str ->
+      (match ring, str.armed with
+       | Some ring, Some job -> cancel ring job
+       | _ -> ());
       Queue.iter (fun fd -> try Unix.close fd with _ -> ()) str.accepted;
       Queue.clear str.accepted;
       reject_acceptors str Lwt.Canceled;
@@ -290,6 +372,7 @@ class uring ?(queue_depth = 256) ?(deferred = false) () = object
     abandoned <- true;
     let st = self_state () in
     teardown_accept_streams st;
+    fail_inflight ~cancel_them:false st ring Lwt.Canceled;
     st.ring <- None;
     Lwt_engine.set ~destroy:false (new uring ~queue_depth ~deferred ())
 
@@ -297,26 +380,35 @@ class uring ?(queue_depth = 256) ?(deferred = false) () = object
     if not abandoned then begin
     let st = self_state () in
     (match st.ring with Some r when r == ring -> st.ring <- None | _ -> ());
-    teardown_accept_streams st;
+    (* Everything still in flight on this ring is cancelled first: the armed
+       multishot accepts, and the routed operations, whose promises are
+       rejected with [Canceled]. A recv on an idle socket or an armed accept
+       produce no completion of their own, so waiting for them without
+       cancelling them waited for ever, and a domain whose loop ended with a
+       connection open could not exit. *)
+    teardown_accept_streams ~ring st;
+    fail_inflight st ring Lwt.Canceled;
+    retry_deferred_cancels ring;
     (* Reap what is still in flight before exiting. Cancelling in io_uring is
        itself an operation: [Lwt_engine.abstract]'s [destroy] and [transfer] stop
        every event, each stop SUBMITS a cancel, and both the cancel and the
        request it cancels stay in flight until they are reaped. [U.exit] refuses a
-       ring with requests still active, so without this a uring engine could not
-       be destroyed once it had ever watched a descriptor. Nothing re-arms here:
-       the events are already stopped and the accept streams disarmed. Bounded, so
-       that a request that never completes cannot hang the teardown. *)
-    let rec drain n =
-      if n > 0 && U.active_ops ring > 0 then begin
-        ignore (U.submit ring);
-        (match U.wait ring with
+       ring with requests still active. Nothing re-arms here: the events are
+       stopped and the accept streams disarmed. Bounded in TIME, so that a
+       request that never completes cannot hang the teardown; then the ring is
+       left as it is rather than exited, since the kernel may still write into
+       buffers it holds. *)
+    let deadline = Unix.gettimeofday () +. 1. in
+    let rec drain () =
+      if U.active_ops ring > 0 && Unix.gettimeofday () < deadline then begin
+        (match U.wait ~timeout:0.05 ring with
          | U.Some { result; data; more } -> dispatch ring result more data
          | U.None -> ());
-        drain (n - 1)
+        drain ()
       end
     in
-    drain 4096;
-    U.exit ring
+    drain ();
+    if U.active_ops ring = 0 then U.exit ring
     end
 
   method private register_readable fd f =
@@ -349,6 +441,7 @@ class uring ?(queue_depth = 256) ?(deferred = false) () = object
         match tr.t_job with Some job -> cancel ring job | None -> ())
 
   method iter block =
+    retry_deferred_cancels ring;
     ignore (U.submit ring);
     (* When [block] is requested and the ring has outstanding operations, wait
        for at least one completion; otherwise just harvest what is ready. With
@@ -378,8 +471,9 @@ class uring ?(queue_depth = 256) ?(deferred = false) () = object
 end
 
 let get_ring () =
-  match (self_state ()).ring with
-  | Some r -> r
+  let st = self_state () in
+  match st.ring with
+  | Some r -> (st, r)
   | None ->
     failwith
       "Lwt_uring.Io: no io_uring engine installed on this domain (use \
@@ -395,27 +489,30 @@ let current_offset = Optint.Int63.minus_one
    bounce-buffer blit of the bytes read path) so no extra promise is allocated
    on the per-operation hot path. Cancelling the promise cancels the in-flight
    submission. *)
-let submit_io ring op_name post make =
+let submit_io st ring fd op_name post make =
   let waiter, wakener = Lwt.task () in
-  let job = ref None in
-  let handler result =
-    job := None;
-    if result < 0 then
-      Lwt.wakeup_exn wakener
-        (Unix.Unix_error (U.error_of_errno result, op_name, ""))
-    else Lwt.wakeup wakener (post result)
+  let op =
+    { op_ring = ring;
+      op_job = None;
+      op_fail = (fun exn -> if Lwt.is_sleeping waiter then Lwt.wakeup_exn wakener exn) }
   in
-  (match make ring (Io handler) with
-   | Some j -> job := Some j
-   | None ->
-     ignore (U.submit ring);
-     (match make ring (Io handler) with
-      | Some j -> job := Some j
-      | None -> failwith "Lwt_uring.Io: submission queue full"));
+  let handler result =
+    op.op_job <- None;
+    forget st fd op;
+    (* The promise may have been settled meanwhile, by a cancel or by a close
+       of its descriptor; then [post], which writes into the caller's buffer,
+       does not run either. *)
+    if Lwt.is_sleeping waiter then
+      if result < 0 then
+        Lwt.wakeup_exn wakener
+          (Unix.Unix_error (U.error_of_errno result, op_name, ""))
+      else Lwt.wakeup wakener (post result)
+  in
+  op.op_job <- Some (submit ring (Io handler) make);
+  remember st fd op;
   Lwt.on_cancel waiter (fun () ->
-    match !job with
-    | Some j -> (try ignore (U.cancel ring j Cancel) with Invalid_argument _ -> ())
-    | None -> ());
+    forget st fd op;
+    match op.op_job with Some j -> cancel ring j | None -> ());
   waiter
 
 (* Result adapters for [submit_io]'s [post] (defined once: the common cases
@@ -453,24 +550,28 @@ module Io = struct
      (which uses [recv]/[send]). *)
   let read fd buf pos len =
     let cs = Cstruct.create_unsafe len in
-    submit_io (get_ring ()) "read"
+    let st, ring = get_ring () in
+    submit_io st ring fd "read"
       (fun n -> Cstruct.blit_to_bytes cs 0 buf pos n; n)
       (fun ring data -> U.read ring ~file_offset:current_offset fd cs data)
 
   let write fd buf pos len =
     let cs = Cstruct.create_unsafe len in
     Cstruct.blit_from_bytes buf pos cs 0 len;
-    submit_io (get_ring ()) "write" int_result (fun ring data ->
+    let st, ring = get_ring () in
+    submit_io st ring fd "write" int_result (fun ring data ->
       U.write ring ~file_offset:current_offset fd cs data)
 
   let read_bigarray fd buf pos len =
     let cs = Cstruct.of_bigarray ~off:pos ~len buf in
-    submit_io (get_ring ()) "read" int_result (fun ring data ->
+    let st, ring = get_ring () in
+    submit_io st ring fd "read" int_result (fun ring data ->
       U.read ring ~file_offset:current_offset fd cs data)
 
   let write_bigarray fd buf pos len =
     let cs = Cstruct.of_bigarray ~off:pos ~len buf in
-    submit_io (get_ring ()) "write" int_result (fun ring data ->
+    let st, ring = get_ring () in
+    submit_io st ring fd "write" int_result (fun ring data ->
       U.write ring ~file_offset:current_offset fd cs data)
 end
 
@@ -502,10 +603,11 @@ let completion_backend : Lwt_unix.completion_io =
     match (self_state ()).ring with
     | None -> None
     | Some ring ->
+      let st = self_state () in
       let fd = Lwt_unix.unix_file_descr ch and kind = Lwt_unix.fd_kind ch in
       let cs = Cstruct.create_unsafe len in
       Some
-        (submit_io ring "read"
+        (submit_io st ring fd "read"
            (fun n -> Cstruct.blit_to_bytes cs 0 buf pos n; n)
            (read_op kind fd cs))
   in
@@ -513,26 +615,29 @@ let completion_backend : Lwt_unix.completion_io =
     match (self_state ()).ring with
     | None -> None
     | Some ring ->
+      let st = self_state () in
       let fd = Lwt_unix.unix_file_descr ch and kind = Lwt_unix.fd_kind ch in
       let cs = Cstruct.create_unsafe len in
       Cstruct.blit_from_bytes buf pos cs 0 len;
-      Some (submit_io ring "write" int_result (write_op kind fd cs))
+      Some (submit_io st ring fd "write" int_result (write_op kind fd cs))
   in
   let read_bigarray ch buf pos len =
     match (self_state ()).ring with
     | None -> None
     | Some ring ->
+      let st = self_state () in
       let fd = Lwt_unix.unix_file_descr ch and kind = Lwt_unix.fd_kind ch in
       let cs = Cstruct.of_bigarray ~off:pos ~len buf in
-      Some (submit_io ring "read" int_result (read_op kind fd cs))
+      Some (submit_io st ring fd "read" int_result (read_op kind fd cs))
   in
   let write_bigarray ch buf pos len =
     match (self_state ()).ring with
     | None -> None
     | Some ring ->
+      let st = self_state () in
       let fd = Lwt_unix.unix_file_descr ch and kind = Lwt_unix.fd_kind ch in
       let cs = Cstruct.of_bigarray ~off:pos ~len buf in
-      Some (submit_io ring "write" int_result (write_op kind fd cs))
+      Some (submit_io st ring fd "write" int_result (write_op kind fd cs))
   in
   (* Completion-based [connect]: submit IORING_OP_CONNECT and resolve when the
      connection completes (result 0) or fails (negative errno, mapped by
@@ -542,9 +647,10 @@ let completion_backend : Lwt_unix.completion_io =
     match (self_state ()).ring with
     | None -> None
     | Some ring ->
+      let st = self_state () in
       let fd = Lwt_unix.unix_file_descr ch in
       Some
-        (submit_io ring "connect" unit_result (fun ring data ->
+        (submit_io st ring fd "connect" unit_result (fun ring data ->
            U.connect ring fd addr data))
   in
   (* [accept] uses a MULTISHOT accept (IORING_OP_ACCEPT +
