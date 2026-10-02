@@ -864,7 +864,11 @@ module Pool = struct
 
   let detach t f x =
     let result = new_shared () in
-    let i = Atomic.fetch_and_add t.next 1 mod Array.length t.workers in
+    (* [land max_int]: the counter wraps negative after max_int calls, and a
+       negative index is out of bounds. *)
+    let i =
+      Atomic.fetch_and_add t.next 1 land max_int mod Array.length t.workers
+    in
     let thunk () =
       (* Runs on the worker's domain. The result travels as data; [resolve] is
          callable from anywhere. *)
