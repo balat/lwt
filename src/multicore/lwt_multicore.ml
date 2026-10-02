@@ -705,26 +705,47 @@ module Service = struct
     let stopped = new_shared () in
     let domain =
       Domain.spawn (fun () ->
-        Lwt_main.run
-          (let rec serve () =
-             Lwt.bind (Stream.take requests) (function
-               | None -> Lwt.return_unit
-               | Some (req, reply) ->
-                 (* Each request is served to completion before the next is
-                    taken: a service is one loop, and concurrency between
-                    requests is the caller's business, obtained by having several
-                    services or by the handler returning early. *)
-                 Lwt.bind
-                   (Lwt.catch
-                      (fun () -> Lwt.bind (handler req) (fun res ->
-                         resolve reply res; Lwt.return_unit))
-                      (fun exn -> reject reply exn; Lwt.return_unit))
-                   serve)
-           in
-           serve ());
-        (* Announced before this domain exits, so that [shutdown] can wait for the
-           work to be finished rather than for the domain to be reaped. *)
-        resolve stopped ())
+        (* The reply of the request being served, so that a death of the
+           service can reject it: it is no longer in the queue. *)
+        let in_flight = ref None in
+        let rec serve () =
+          Lwt.bind (Stream.take requests) (function
+            | None -> Lwt.return_unit
+            | Some (req, reply) ->
+              in_flight := Some reply;
+              (* Each request is served to completion before the next is
+                 taken: a service is one loop, and concurrency between
+                 requests is the caller's business, obtained by having several
+                 services or by the handler returning early. *)
+              Lwt.bind
+                (Lwt.catch
+                   (fun () -> Lwt.bind (handler req) (fun res ->
+                      resolve reply res; Lwt.return_unit))
+                   (fun exn -> reject reply exn; Lwt.return_unit))
+                (fun () -> in_flight := None; serve ()))
+        in
+        match Lwt_main.run (serve ()) with
+        | () ->
+          (* Announced before this domain exits, so that [shutdown] can wait for
+             the work to be finished rather than for the domain to be reaped. *)
+          resolve stopped ()
+        | exception exn ->
+          (* The handler let through an exception the loop does not catch (a
+             runtime exception, since Lwt 6), or the loop itself failed: the
+             service is dead, and everyone must hear it rather than wait for
+             ever. The calls still queued are rejected, later ones are refused
+             by the closed stream, and [shutdown] raises. *)
+          Stream.close requests;
+          (match !in_flight with
+           | Some reply when is_pending reply -> reject reply exn
+           | Some _ | None -> ());
+          let rec reject_queued () =
+            Lwt.bind (Stream.take requests) (function
+              | None -> Lwt.return_unit
+              | Some (_, reply) -> reject reply exn; reject_queued ())
+          in
+          Lwt_main.run (reject_queued ());
+          reject stopped exn)
     in
     { requests; stopped; domain }
 
@@ -734,11 +755,14 @@ module Service = struct
 
   let shutdown t =
     Stream.close t.requests;
-    Lwt.bind (await t.stopped) (fun () ->
-      (* The service has finished its work by now, so this is short. It is done
-         at all so that no domain is left unreaped. *)
-      Domain.join t.domain;
-      Lwt.return_unit)
+    Lwt.try_bind
+      (fun () -> await t.stopped)
+      (fun () ->
+         (* The service has finished its work by now, so this is short. It is
+            done at all so that no domain is left unreaped. *)
+         Domain.join t.domain;
+         Lwt.return_unit)
+      (fun exn -> Domain.join t.domain; Lwt.fail exn)
 end
 
 (* +-----------------------------------------------------------------+
