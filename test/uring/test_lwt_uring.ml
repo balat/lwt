@@ -173,6 +173,40 @@ let test_connect () =
   check "connect routed through io_uring" (read = n && Bytes.equal got msg);
   Lwt_main.run (Lwt_unix.close lsock)
 
+(* The child of a fork must not share the parent's ring: the submission and
+   completion queues are the same shared memory in both processes. The child
+   gets a fresh ring and runs a loop of its own; the parent's loop keeps
+   working afterwards, waitpid included, which goes through its ring. *)
+let test_fork () =
+  let child_loop () =
+    let a, b = Unix.socketpair Unix.PF_UNIX Unix.SOCK_STREAM 0 in
+    let la = Lwt_unix.of_unix_file_descr a
+    and lb = Lwt_unix.of_unix_file_descr b in
+    Lwt_main.run
+      (Lwt_unix.sleep 0.01 >>= fun () ->
+       Lwt_unix.write_string la "ping" 0 4 >>= fun _ ->
+       let buf = Bytes.create 4 in
+       Lwt_unix.read lb buf 0 4 >>= fun n ->
+       Lwt_unix.close la >>= fun () ->
+       Lwt_unix.close lb >|= fun () ->
+       n = 4 && Bytes.to_string buf = "ping")
+  in
+  match Lwt_unix.fork () with
+  | 0 ->
+    let ok = try child_loop () with _ -> false in
+    Unix._exit (if ok then 0 else 1)
+  | pid ->
+    let status =
+      Lwt_main.run
+        (Lwt.pick
+           [ (Lwt_unix.waitpid [] pid >|= fun (_, status) -> Some status);
+             (Lwt_unix.sleep 5. >|= fun () -> None) ])
+    in
+    check "the child of a fork gets its own ring and runs its loop"
+      (status = Some (Unix.WEXITED 0));
+    check "and the parent's loop still works after the fork"
+      (Lwt_main.run (Lwt_unix.sleep 0.01 >|= fun () -> true))
+
 let () =
   check "io_uring is available" (Lwt_uring.available ());
   Lwt_uring.set ();
@@ -188,6 +222,7 @@ let () =
   test_io_regular_file ();
   test_io_bigarray ();
   test_connect ();
+  test_fork ();
   if !failures = 0 then Printf.printf "\nAll tests passed.\n%!"
   else begin
     Printf.printf "\n%d test(s) failed.\n%!" !failures;

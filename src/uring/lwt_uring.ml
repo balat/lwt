@@ -270,11 +270,31 @@ class uring ?(queue_depth = 256) ?(deferred = false) () = object
 
   val ring : req U.t = create_ring ~queue_depth ~deferred
 
+  (* Set in the child of a fork. The ring is the parent's from then on: its
+     queues are shared memory between the two processes, so the child must
+     never touch it again, not even to cancel a request. *)
+  val mutable abandoned = false
+
   initializer (self_state ()).ring <- Some ring
 
   method id = Engine_id__uring
 
+  (* The child of a fork gets a fresh engine of the same kind, and what was
+     registered with this one is carried over to it by [Lwt_engine.set]. The
+     inherited ring is left exactly as it is: exiting it would wait for the
+     parent's requests, and cancelling anything would write into the parent's
+     submission queue. Its memory is kept in the child, once. The accept
+     streams are the parent's too: their queued connections are closed here
+     (the parent serves them) and their waiters are told. *)
+  method! fork =
+    abandoned <- true;
+    let st = self_state () in
+    teardown_accept_streams st;
+    st.ring <- None;
+    Lwt_engine.set ~destroy:false (new uring ~queue_depth ~deferred ())
+
   method private cleanup =
+    if not abandoned then begin
     let st = self_state () in
     (match st.ring with Some r when r == ring -> st.ring <- None | _ -> ());
     teardown_accept_streams st;
@@ -297,6 +317,7 @@ class uring ?(queue_depth = 256) ?(deferred = false) () = object
     in
     drain 4096;
     U.exit ring
+    end
 
   method private register_readable fd f =
     let pr =
@@ -305,7 +326,8 @@ class uring ?(queue_depth = 256) ?(deferred = false) () = object
     submit_poll ring pr;
     lazy (
       pr.active <- false;
-      match pr.job with Some job -> cancel ring job | None -> ())
+      if not abandoned then
+        match pr.job with Some job -> cancel ring job | None -> ())
 
   method private register_writable fd f =
     let pr =
@@ -314,7 +336,8 @@ class uring ?(queue_depth = 256) ?(deferred = false) () = object
     submit_poll ring pr;
     lazy (
       pr.active <- false;
-      match pr.job with Some job -> cancel ring job | None -> ())
+      if not abandoned then
+        match pr.job with Some job -> cancel ring job | None -> ())
 
   method private register_timer delay repeat f =
     let ns = Int64.of_float (delay *. 1e9) in
@@ -322,7 +345,8 @@ class uring ?(queue_depth = 256) ?(deferred = false) () = object
     submit_timer ring tr;
     lazy (
       tr.t_active <- false;
-      match tr.t_job with Some job -> cancel ring job | None -> ())
+      if not abandoned then
+        match tr.t_job with Some job -> cancel ring job | None -> ())
 
   method iter block =
     ignore (U.submit ring);
