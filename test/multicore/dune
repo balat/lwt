@@ -109,3 +109,13 @@
  (build_if
   (>= %{ocaml_version} "5.0"))
  (libraries lwt.unix lwt_multicore))
+
+; The shared value is linearisable across real domains, checked by qcheck-lin.
+
+(test
+ (name lin_shared_value)
+ (package lwt_multicore)
+ (modules lin_shared_value)
+ (build_if
+  (>= %{ocaml_version} "5.0"))
+ (libraries lwt_multicore qcheck-lin.domain))

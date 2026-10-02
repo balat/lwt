@@ -18,6 +18,7 @@ depends: [
   "saturn" {>= "1.0"}
   "qcheck-core" {with-test & >= "0.90"}
   "qcheck-stm" {with-test & >= "0.3"}
+  "qcheck-lin" {with-test & >= "0.3"}
   "odoc" {with-doc}
 ]
 build: [

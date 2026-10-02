@@ -20,8 +20,8 @@ build=${LWT_TSAN_BUILD_DIR:-_build-tsan}
 here=$(cd "$(dirname "$0")" && pwd)
 
 # One line per test: the dune target. Anything that spawns a domain belongs here,
-# except the benchmark that needs an external load. The uring and direct tests
-# need uring and react in the TSan switch; see README.md.
+# except the benchmark that needs an external load. The uring, direct and qcheck
+# tests need uring, react and qcheck-lin in the TSan switch; see README.md.
 tests="
 test/core/test_ownership.exe
 test/core/test_sched_domains.exe
@@ -55,6 +55,7 @@ test/multicore/exit_hooks.exe
 test/multicore/departed_loop.exe
 test/multicore/service_fatal.exe
 test/multicore/cancel_storm.exe
+test/multicore/lin_shared_value.exe
 test/direct/main.exe
 test/uring/domain_rings.exe
 test/uring/test_lwt_uring.exe

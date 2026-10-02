@@ -98,7 +98,7 @@ From the root of the tree, in that switch:
 
 ```
 opam install ./lwt.opam ./lwt_multicore.opam --deps-only
-opam install react uring    # for the direct and uring tests
+opam install react uring qcheck-lin    # for the direct, uring and qcheck tests
 sh test/tsan/run.sh              # every test that spawns a domain
 sh test/tsan/run.sh domain_soak  # one of them
 ```
