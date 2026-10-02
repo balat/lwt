@@ -89,6 +89,21 @@ let () =
     must_not_raise "Lwt.state on a foreign pending promise" (fun () ->
       Lwt.state still_pending));
 
+  (* Cancelling a foreign [protected] mirror must be refused BEFORE anything is
+     touched: its hook unlinks the mirror's waiter from the source, and done
+     from here that unlinked it from the owner's list, so the mirror never
+     resolved once the source did. *)
+  let source, resolve_source = Lwt.wait () in
+  let mirror = Lwt.protected source in
+  on_another_domain (fun () ->
+    must_raise "cancel of a foreign protected mirror" (fun () ->
+      Lwt.cancel mirror));
+  Lwt.wakeup resolve_source 42;
+  if Lwt.state mirror <> Lwt.Return 42 then begin
+    Printf.eprintf "FAILED: a refused foreign cancel still detached the mirror\n";
+    incr failures
+  end;
+
   if !failures > 0 then begin
     Printf.eprintf "%d ownership checks behaved wrongly\n" !failures;
     exit 1
