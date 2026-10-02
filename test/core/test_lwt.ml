@@ -4593,3 +4593,30 @@ let choice_tests = suite "choice among resolved promises" [
   end;
 ]
 let suites = suites @ [choice_tests]
+
+
+
+(* wrap1 to wrap7 go through the exception filter, like wrap: the default
+   filter leaves the runtime's exceptions alone. *)
+let wrap_filter_tests = suite "wrap and the exception filter" [
+  test "wrap1 to wrap7 let a runtime exception through" begin fun () ->
+    let escapes f = match f () with _ -> false | exception Stack_overflow -> true in
+    let so _ = raise Stack_overflow in
+    Lwt.return
+      (escapes (fun () -> Lwt.wrap1 so ())
+       && escapes (fun () -> Lwt.wrap2 (fun _ -> so) () ())
+       && escapes (fun () -> Lwt.wrap3 (fun _ _ -> so) () () ())
+       && escapes (fun () -> Lwt.wrap4 (fun _ _ _ -> so) () () () ())
+       && escapes (fun () -> Lwt.wrap5 (fun _ _ _ _ -> so) () () () () ())
+       && escapes (fun () -> Lwt.wrap6 (fun _ _ _ _ _ -> so) () () () () () ())
+       && escapes (fun () ->
+              Lwt.wrap7 (fun _ _ _ _ _ _ -> so) () () () () () () ()))
+  end;
+
+  test "wrap1 still turns an ordinary exception into a rejection"
+      begin fun () ->
+    Lwt.return
+      (Lwt.state (Lwt.wrap1 (fun () -> raise Exit) ()) = Lwt.Fail Exit)
+  end;
+]
+let suites = suites @ [wrap_filter_tests]

@@ -1871,15 +1871,24 @@ let ( <&> ) a b = join [ a; b ]
 let ( =<< ) f p = bind p f
 let ( =|< ) f p = map f p
 
-let wrap1 f = fun x -> (try return (f x) with e -> fail e)
-let wrap2 f = fun x y -> (try return (f x y) with e -> fail e)
-let wrap3 f = fun x y z -> (try return (f x y z) with e -> fail e)
-let wrap4 f = fun a b c d -> (try return (f a b c d) with e -> fail e)
-let wrap5 f = fun a b c d e -> (try return (f a b c d e) with ex -> fail ex)
-let wrap6 f = fun a b c d e g -> (try return (f a b c d e g) with ex -> fail ex)
+(* Through the exception filter, like [wrap]: a runtime exception (a stack
+   overflow, out of memory) is not turned into a rejection unless the program
+   asked for it. They caught everything. *)
+let wrap1 f = fun x ->
+  (try return (f x) with e when Exception_filter.run e -> fail e)
+let wrap2 f = fun x y ->
+  (try return (f x y) with e when Exception_filter.run e -> fail e)
+let wrap3 f = fun x y z ->
+  (try return (f x y z) with e when Exception_filter.run e -> fail e)
+let wrap4 f = fun a b c d ->
+  (try return (f a b c d) with e when Exception_filter.run e -> fail e)
+let wrap5 f = fun a b c d e ->
+  (try return (f a b c d e) with ex when Exception_filter.run ex -> fail ex)
+let wrap6 f = fun a b c d e g ->
+  (try return (f a b c d e g) with ex when Exception_filter.run ex -> fail ex)
 
-let wrap7 f =
- fun a b c d e g h -> (try return (f a b c d e g h) with ex -> fail ex)
+let wrap7 f = fun a b c d e g h ->
+  (try return (f a b c d e g h) with ex when Exception_filter.run ex -> fail ex)
 
 external reraise : exn -> 'a = "%reraise"
 
