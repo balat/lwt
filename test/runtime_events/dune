@@ -1,0 +1,9 @@
+; The spans a ppx bind emits through lwt_runtime_events, read back from the
+; runtime's own event ring. Runtime events exist from OCaml 5.1.
+
+(test
+ (name test_trace)
+ (package lwt_runtime_events)
+ (build_if
+  (>= %{ocaml_version} "5.1"))
+ (libraries lwt lwt_runtime_events runtime_events))

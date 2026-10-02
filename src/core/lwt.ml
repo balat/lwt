@@ -1908,14 +1908,25 @@ external reraise : exn -> 'a = "%reraise"
    plain fast path of [bind], so the cost of this on a program that is not raising
    is nil.
 
-   [_name] and [_line] are the runtime-events metadata, which this core does not
-   emit; that is a separate gap, recorded as such. *)
+   [name] and [line] locate the [let%lwt] for runtime events, as in Lwt: a ppx
+   bind that has to wait, because its promise is pending, emits a [Begin] span
+   when it is set up and the matching [End] when its callback starts, both
+   carrying the tracing context of [with_tracing_context] in effect at the
+   bind. A bind on a resolved promise emits nothing. Without the
+   [lwt_runtime_events] library, [Lwt_rte] makes both no-ops. *)
+
+(* The context the spans carry. ONE key, also exported as
+   [Private.tracing_context]: the ppx reads it for the spans of the loops it
+   expands, so a second key would leave those spans without their context. *)
+let tracing_context : string key = new_key ()
+
+let with_tracing_context name f = with_value tracing_context (Some name) f
 
 (* [apply], with the location function applied to a synchronous exception. *)
 let apply_loc add_loc (f : 'a -> 'b t) (v : 'a) : 'b t =
   try f v with e when Exception_filter.run e -> inj { st = Rejected (add_loc e) }
 
-let backtrace_bind (type a b) _name _line add_loc (p : a t) (f : a -> b t) : b t =
+let backtrace_bind (type a b) name line add_loc (p : a t) (f : a -> b t) : b t =
   match (prj p).st with
   | Fulfilled v -> f v
   | Rejected e -> inj { st = Rejected (add_loc e) }
@@ -1924,7 +1935,10 @@ let backtrace_bind (type a b) _name _line add_loc (p : a t) (f : a -> b t) : b t
     let result = new_pending sched in
     set_cancel_forward sched result p;
     let saved = sched.storage in
+    let context = get_from_storage tracing_context saved in
+    Lwt_rte.emit_trace Begin context name line;
     add_waiter sched p (fun r ->
+      Lwt_rte.emit_trace End context name line;
       let outer = sched.storage in
       sched.storage <- saved;
       (match r with
@@ -1933,7 +1947,7 @@ let backtrace_bind (type a b) _name _line add_loc (p : a t) (f : a -> b t) : b t
       sched.storage <- outer);
     result
 
-let backtrace_try_bind _name _line add_loc (f : unit -> 'a t) (g : 'a -> 'b t)
+let backtrace_try_bind name line add_loc (f : unit -> 'a t) (g : 'a -> 'b t)
     (h : exn -> 'b t) : 'b t =
   let p = try f () with e when Exception_filter.run e -> inj { st = Rejected e } in
   match (prj p).st with
@@ -1944,7 +1958,10 @@ let backtrace_try_bind _name _line add_loc (f : unit -> 'a t) (g : 'a -> 'b t)
     let result = new_pending sched in
     set_cancel_forward sched result p;
     let saved = sched.storage in
+    let context = get_from_storage tracing_context saved in
+    Lwt_rte.emit_trace Begin context name line;
     add_waiter sched p (fun r ->
+      Lwt_rte.emit_trace End context name line;
       let outer = sched.storage in
       sched.storage <- saved;
       forward sched result
@@ -1998,9 +2015,6 @@ let add_task_l seq =
   on_cancel p (fun () -> Lwt_sequence.remove node);
   p
 
-(* Tracing is a no-op here (this core does not emit Lwt's span events). *)
-let with_tracing_context _name f = f ()
-
 (* Compares the {e constructor} of the expected state with the promise's. *)
 let debug_state_is expected p =
   return
@@ -2027,7 +2041,7 @@ module Private = struct
     let set_current_storage s = (self_sched ()).storage <- s
   end
 
-  let tracing_context : string key = new_key ()
+  let tracing_context = tracing_context
 
   (* Effect-scheduler hooks (this core is engine-free): [Lwt_main.run] drives
      the run queue and installs the engine-blocking idle hook through these. *)
