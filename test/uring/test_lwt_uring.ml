@@ -268,9 +268,20 @@ let test_unavailable () =
     (match Lwt_uring.set () with
      | () -> false
      | exception Lwt_sys.Not_available _ -> true);
-  check "the engine is left alone" (Lwt_engine.id () = before)
+  check "the engine is left alone" (Lwt_engine.id () = before);
+  check "set_if_available declines" (not (Lwt_uring.set_if_available ()));
+  check "the engine is still left alone" (Lwt_engine.id () = before)
+
+let is_uring () =
+  match Lwt_engine.id () with Lwt_uring.Engine_id__uring -> true | _ -> false
 
 let test_available () =
+  Unix.putenv "LWT_URING" "0";
+  check "LWT_URING=0 makes set_if_available decline"
+    (not (Lwt_uring.set_if_available ()) && not (is_uring ()));
+  Unix.putenv "LWT_URING" "1";
+  check "set_if_available installs the engine"
+    (Lwt_uring.set_if_available () && is_uring ());
   Lwt_uring.set ();
   (match Lwt_engine.id () with
    | Lwt_uring.Engine_id__uring -> check "uring engine installed" true

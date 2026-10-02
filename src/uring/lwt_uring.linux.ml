@@ -453,3 +453,16 @@ let available () =
 
 let set ?queue_depth () =
   Lwt_engine.set (new uring ?queue_depth ())
+
+(* [LWT_URING=0] turns io_uring off without recompiling, for instance to
+   compare engines or to work around a kernel problem in production. *)
+let disabled_by_environment () =
+  match Sys.getenv_opt "LWT_URING" with
+  | Some "0" -> true
+  | Some _ | None -> false
+
+let set_if_available ?queue_depth () =
+  (not (disabled_by_environment ()))
+  && (match set ?queue_depth () with
+      | () -> true
+      | exception Lwt_sys.Not_available _ -> false)

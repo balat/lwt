@@ -14,6 +14,8 @@ let available () = false
 
 let set ?queue_depth:_ () = not_available ()
 
+let set_if_available ?queue_depth:_ () = false
+
 type Lwt_engine.engine_id += Engine_id__uring
 
 (* The class exists so that the interface is the same as on Linux. Building an

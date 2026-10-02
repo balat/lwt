@@ -49,6 +49,22 @@ val set : ?queue_depth:int -> unit -> unit
       registrations per system call at the cost of more locked memory (very
       large values can fail with [ENOMEM]). Defaults to [256]. *)
 
+val set_if_available : ?queue_depth:int -> unit -> bool
+(** [set_if_available ?queue_depth ()] installs the io_uring engine as {!set}
+    does and returns [true], where io_uring is available. Otherwise it leaves
+    the current engine in place and returns [false]: on a system other than
+    Linux, where the kernel lacks or forbids io_uring, and when the environment
+    variable [LWT_URING] is set to [0], which turns io_uring off without
+    recompiling. Other failures to create the ring raise, as with {!set}.
+
+    This is the simplest way to use io_uring where it exists and the default
+    engine elsewhere: call it once, before {!Lwt_main.run}.
+    {[
+      let () =
+        ignore (Lwt_uring.set_if_available ());
+        Lwt_main.run (main ())
+    ]} *)
+
 (** {2 The engine class} *)
 
 type Lwt_engine.engine_id += Engine_id__uring
