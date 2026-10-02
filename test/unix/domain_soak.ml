@@ -73,9 +73,11 @@ let generation i =
        assert (n = i * 2)))
 
 let () =
-  (* One generation first, so that the baseline includes everything that is
-     allocated once per process rather than once per domain. *)
-  generation 1;
+  (* A few generations first, so that the baseline includes everything that is
+     allocated once per process rather than once per domain: the pool of job
+     threads in particular, which grows to the number of jobs in flight at once
+     and keeps its threads, so a single generation does not show its size. *)
+  for i = 1 to 3 do generation i done;
   Gc.full_major ();
   let fd0 = open_descriptors () and th0 = live_threads () in
   let t0 = Unix.gettimeofday () in
@@ -89,9 +91,11 @@ let () =
   Printf.printf "%d generations in %.1fs: descriptors %d -> %d, threads %d -> %d\n"
     !generations budget fd0 fd1 th0 th1;
   check "several generations ran" (!generations >= 3);
-  (* A slack of a couple, since the runtime may keep a thread or a pipe of its own
-     around; a leak PER DOMAIN would show as tens or hundreds. *)
+  (* Some slack, since the runtime may keep a thread or a pipe of its own
+     around, and the job pool may still gain a thread when two generations'
+     jobs overlap more than the warm-up's did; a leak PER DOMAIN would show as
+     tens or hundreds, one per generation. *)
   check "descriptors did not accumulate" (fd1 <= fd0 + 2);
-  check "threads did not accumulate" (th1 <= th0 + 2);
+  check "threads did not accumulate" (th1 <= th0 + 4);
   if !failures > 0 then exit 1;
   print_endline "soak, domains coming and going: ok"
