@@ -231,7 +231,9 @@ let drain () =
   if not (Lwt_sequence.is_empty (exit_hooks ())) then begin
     Lwt.abandon_wakeups ();
     finished ();
-    run (call_hooks ())
+    (* Through a pause, so that the first hook too runs as a task of the
+       loop, where it may await, instead of before the loop starts. *)
+    run (Lwt.pause () >>= call_hooks)
   end
 
 let () = drain_exit_hooks := drain
