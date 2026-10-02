@@ -64,4 +64,26 @@ let run_tests = [
 
 let tests = tests @ run_tests
 
+let transfer_tests = [
+  (* An event registered before two engine replacements can still be stopped
+     through the handle its registration returned. *)
+  test "Lwt_engine.set twice: the original handle still stops the event"
+      ~sequential:true begin fun () ->
+    let original = Lwt_engine.get () in
+    let r, w = Unix.pipe () in
+    let before = Lwt_engine.readable_count () in
+    let ev = Lwt_engine.on_readable r ignore in
+    Lwt_engine.set ~destroy:false (new Lwt_engine.select);
+    Lwt_engine.set (new Lwt_engine.select);
+    Lwt_engine.stop_event ev;
+    let after = Lwt_engine.readable_count () in
+    Lwt_engine.set original;
+    Unix.close r;
+    Unix.close w;
+    Lwt.return (after = before)
+  end;
+]
+
+let tests = tests @ transfer_tests
+
 let suite = suite "lwt_engine" tests
