@@ -928,8 +928,12 @@ let map (type a b) (f : a -> b) (p : a t) : b t =
       sched.storage <- saved;
       (match r with
       | Ok v -> (
-        try fill sched result (Ok (f v))
-        with e when Exception_filter.run e -> fill sched result (Error e))
+        (* Only [f] inside the handler, not the fill: the fill runs [result]'s
+           callbacks, and an exception escaping one of them was taken for an
+           exception of [f], then lost on a promise already resolved. *)
+        match f v with
+        | v' -> fill sched result (Ok v')
+        | exception e when Exception_filter.run e -> fill sched result (Error e))
       | Error e -> fill sched result (Error e));
       sched.storage <- outer);
     result
