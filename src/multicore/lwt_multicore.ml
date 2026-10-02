@@ -40,7 +40,15 @@ exception Loop_terminated
 let drain inbox =
   let rec go () =
     match Inbox.pop_opt inbox with
-    | Some job -> job.run (); go ()
+    | Some job ->
+      (* An exception out of the work goes where an exception out of an
+         ordinary Lwt callback goes, and the rest of the inbox is served. It
+         used to escape through the notification handler and out of the
+         target loop's Lwt_main.run, leaving the other posted work stuck. *)
+      (match job.run () with
+       | () -> ()
+       | exception exn -> !Lwt.async_exception_hook exn);
+      go ()
     | None -> ()
     | exception Inbox.Closed -> ()
   in
