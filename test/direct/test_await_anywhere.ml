@@ -398,6 +398,25 @@ let review_suite = suite "review findings" [
     Lwt.return (Domain.join d)
   end;
 
+  test "a loop of yields starves neither the engine nor the pauses" begin fun () ->
+    let timer = ref false and paused = ref false in
+    Lwt.async (fun () -> Lwt_unix.sleep 1e-3 >|= fun () -> timer := true);
+    Lwt.async (fun () -> Lwt.pause () >|= fun () -> paused := true);
+    Lwt_direct.spawn (fun () ->
+      let t0 = Unix.gettimeofday () in
+      while Unix.gettimeofday () -. t0 < 0.05 do Lwt_direct.yield () done;
+      !timer && !paused)
+  end;
+
+  test "the same, yielding from a callback" begin fun () ->
+    let timer = ref false in
+    Lwt.async (fun () -> Lwt_unix.sleep 1e-3 >|= fun () -> timer := true);
+    Lwt.pause () >|= fun () ->
+    let t0 = Unix.gettimeofday () in
+    while Unix.gettimeofday () -. t0 < 0.05 do Lwt_direct.yield () done;
+    !timer
+  end;
+
   test "abandon_paused also drops the pauses already queued as tasks" begin fun () ->
     let pz = Lwt.pause () in
     Lwt.Private.scheduler_serve_paused ();

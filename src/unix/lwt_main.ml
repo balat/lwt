@@ -117,7 +117,7 @@ let run (type a) (p : a Lwt.t) : a =
          must run that work now, not after an unbounded engine wait. *)
       let should_block_waiting_for_io =
         Lwt.is_sleeping p
-        && Lwt.paused_count () = 0
+        && not (Lwt.Private.scheduler_next_lap_pending ())
         && Lwt.Private.scheduler_queue_is_empty ()
       in
       Lwt.Private.scheduler_defer_fills Lwt_engine.iter should_block_waiting_for_io;
