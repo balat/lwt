@@ -368,23 +368,20 @@ let gen_outcome =
 let gen_index = Gen.int_bound 7
 let gen_indexes = Gen.list_size (Gen.int_range 1 3) gen_index
 
-(* The two observable differences between the cores that are known, and
-   pending a decision rather than a bug (see the module comment of
-   test/differential and the session that found them):
+(* The class of programs left out by default: merging. When a bind's callback
+   returns an existing pending promise, the waiters of that promise and of the
+   bind result end up in one list, and the cores were found to run them in
+   different orders.
 
-   - cancellation: the historical core marks every promise a cancel reaches
-     as cancelled first, then runs their callbacks in reverse order of
-     discovery; the current core cancels and runs each in list order, so a
-     callback can see a sibling still pending;
-   - merging: when a bind's callback returns a pending promise, the
-     historical core runs the bind result's callbacks before that promise's,
-     the current core after.
+   The default run leaves out what produces it (callbacks that return an
+   existing promise), so that it checks everything else and stays green.
+   DIFFERENTIAL_ALL=1 puts it back, to see the difference or to check a change
+   that aligns the cores. DIFFERENTIAL_COUNT sets the number of programs.
 
-   The default run leaves out what produces them (cancel, pick and npick,
-   which cancel their losers, and callbacks that return an existing promise),
-   so that it checks everything else and stays green. DIFFERENTIAL_ALL=1
-   puts them back, to see the differences or to check a change that aligns
-   the cores. DIFFERENTIAL_COUNT sets the number of programs. *)
+   Cancellation used to be the other known class: the historical core marks
+   every promise a cancel reaches as cancelled first, then runs their callbacks
+   in reverse order of discovery, and the current core now does the same, so
+   cancel, pick and npick are part of the default run. *)
 let all_classes = Sys.getenv_opt "DIFFERENTIAL_ALL" <> None
 let known w = if all_classes then w else 0
 
@@ -416,9 +413,9 @@ let rec gen_step depth =
            (Gen.pair gen_index callback) callback;
       2, with_cb (fun i cb -> Finalize (i, cb));
       1, Gen.map (fun is -> Choose is) gen_indexes;
-      known 2, Gen.map (fun is -> Pick is) gen_indexes;
+      2, Gen.map (fun is -> Pick is) gen_indexes;
       1, Gen.map (fun is -> Nchoose is) gen_indexes;
-      known 1, Gen.map (fun is -> Npick is) gen_indexes;
+      1, Gen.map (fun is -> Npick is) gen_indexes;
       2, Gen.map (fun is -> Join is) gen_indexes;
       1, Gen.map2 (fun i j -> Both (i, j)) gen_index gen_index;
       1, one (fun i -> Protected i);
@@ -431,7 +428,7 @@ let rec gen_step depth =
       2, with_cb (fun i cb -> On_cancel (i, cb));
       5, Gen.map2 (fun i o -> Wakeup (i, o)) gen_index gen_outcome;
       3, Gen.map2 (fun i o -> Wakeup_later (i, o)) gen_index gen_outcome;
-      known 3, one (fun i -> Cancel i);
+      3, one (fun i -> Cancel i);
       2, Gen.return Pause;
       2, Gen.return Wakeup_paused ]
 

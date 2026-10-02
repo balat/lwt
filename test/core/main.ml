@@ -18,4 +18,5 @@ Test.run "core"
     Test_lwt_seq.suite_base;
     Test_lwt_seq.suite_fuzzing;
     Test_lwt_waiters.suite;
+    Test_lwt_cancel_order.suite;
   ])

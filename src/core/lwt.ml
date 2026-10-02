@@ -187,16 +187,23 @@ and 'a waiter =
     }
 
 (* Lwt's cancellation model:
-   - [Cancel_self hook]: directly cancelable ([task], timers, I/O) — [cancel]
-     runs the hook (e.g. stopping an engine event) then rejects with [Canceled];
-   - [Cancel_forward fwd]: a derived promise (e.g. a [bind] result) — [cancel]
-     forwards to its current source; the rejection then flows back through the
-     ordinary waiter chain (the promise is not rejected directly);
+   - [Cancel_self hook]: directly cancelable ([task], and the mirrors of
+     [protected] and [wrap_in_cancelable]): [cancel] rejects it with [Canceled]
+     after running the hook;
+   - [Cancel_forward collect]: a derived promise (e.g. a [bind] result):
+     [cancel] goes on to its current sources, and the rejection then flows back
+     through the ordinary waiter chain (the promise is not rejected directly).
+     [collect] adds to the list it is given what its sources' cancellation
+     finds, see [collect_cancelable];
    - [Not_cancelable]: [wait]-created (and [no_cancel]) promises ignore [cancel]. *)
 and cancel_mode =
   | Cancel_self of (unit -> unit)
-  | Cancel_forward of (sched -> unit)
+  | Cancel_forward of (sched -> cancel_found list -> cancel_found list)
   | Not_cancelable
+
+(* A promise [cancel] found to cancel, already marked [Canceled], with the hook
+   to run and the waiters to deliver to once the search is over. *)
+and cancel_found = Found : 'a pending * (unit -> unit) -> cancel_found
 
 (* The scheduler: all of the core's per-scheduler state in ONE record, so that a
    hot path can obtain it once and then work on fields. Mutually recursive with
@@ -717,6 +724,21 @@ let run_resolution_callbacks (type a) (sched : sched) (pe : a pending)
       sched.cascades <- Cascade (r, cursor) :: outer;
       with_cascades sched outer (fun () -> run_waiters cursor r))
 
+(* Runs, defers or queues the callbacks of a promise whose state has just been
+   set to [r]: the second half of a resolution, shared by [fill_general] and by
+   [cancel_gen], which sets the states of all it cancels before delivering. *)
+let deliver (type a) (sched : sched) ~allow_deferring
+    ~maximum_callback_nesting_depth (pe : a pending) (r : (a, exn) result) :
+    unit =
+  if sched.defer_fills then
+    (* Inside the engine iteration: the callbacks become a task, see
+       [defer_fills]. *)
+    Run_queue.push sched.queue (Fill (pe, r))
+  else if allow_deferring && sched.nesting >= maximum_callback_nesting_depth then
+    Queue.push (fun () -> run_resolution_callbacks sched pe r) sched.deferred
+  else
+    run_in_resolution_loop sched (fun () -> run_resolution_callbacks sched pe r)
+
 let fill_general (type a) (sched : sched) ~allow_deferring
     ~maximum_callback_nesting_depth (p : a t) (r : (a, exn) result) : unit =
   let p = prj p in
@@ -724,15 +746,7 @@ let fill_general (type a) (sched : sched) ~allow_deferring
   | Pending pe ->
     check_owner sched pe;
     p.st <- (match r with Ok v -> Fulfilled v | Error e -> Rejected e);
-    if sched.defer_fills then
-      (* Inside the engine iteration: the callbacks become a task, see
-         [defer_fills]. *)
-      Run_queue.push sched.queue (Fill (pe, r))
-    else if allow_deferring && sched.nesting >= maximum_callback_nesting_depth then
-      Queue.push (fun () -> run_resolution_callbacks sched pe r) sched.deferred
-    else
-      run_in_resolution_loop sched (fun () ->
-        run_resolution_callbacks sched pe r)
+    deliver sched ~allow_deferring ~maximum_callback_nesting_depth pe r
   | Fulfilled _ | Rejected _ -> ()
 
 (* Internal resolution: immediate up to the default nesting depth. *)
@@ -757,23 +771,45 @@ let set_on_cancel (type a) (sched : sched) (p : a t) (f : unit -> unit) : unit =
     pe.cancel <- Cancel_self f
   | Fulfilled _ | Rejected _ -> ()
 
-let cancel_gen (type a) (sched : sched) (p : a t) : unit =
-  match (prj p).st with
+(* Cancellation runs in two phases, as in Lwt. The first, this function, walks
+   back from the promise being cancelled through the sources of derived
+   promises, and every directly cancelable promise it reaches is marked
+   [Canceled] on the spot, so that one reached twice (a diamond) is cancelled
+   once, but nothing runs yet. The second, in [cancel_gen], runs what the first
+   found, last found first. So when [cancel (join [a; b])] cancels both [a] and
+   [b], a callback of either already sees the other [Canceled], as in Lwt, rather
+   than the state of a cancellation still under way.
+
+   The owner is checked at every hop, before any hook runs: the hook of
+   [protected] (or of [wrap_in_cancelable]) unlinks a waiter from ANOTHER
+   pending promise, with the scheduler that promise captured, so without this
+   check it would pass its own and mutate the owner's list from a foreign
+   domain, and the mirror would never resolve. *)
+let collect_cancelable (type a) (sched : sched) (found : cancel_found list)
+    (p : a t) : cancel_found list =
+  let c = prj p in
+  match c.st with
   | Pending pe -> (
-    (* Before the hook, not in [fill] after it: the hook of [protected] (or of
-       [wrap_in_cancelable]) unlinks a waiter from ANOTHER pending promise,
-       with the scheduler that promise captured, so it passed its own check
-       and mutated the owner's list from the foreign domain; the mirror then
-       never resolved. [sched] here is the caller's, and every forward hop
-       checks again. *)
     check_owner sched pe;
     match pe.cancel with
-    | Not_cancelable -> ()
+    | Not_cancelable -> found
     | Cancel_self hook ->
+      c.st <- Rejected Canceled;
+      Found (pe, hook) :: found
+    | Cancel_forward collect -> collect sched found)
+  | Fulfilled _ | Rejected _ -> found
+
+(* The second phase delivers without deferring, as Lwt's [cancel] does: the
+   cancellation of a promise is visible to the caller of [cancel] when it
+   returns. *)
+let cancel_gen (type a) (sched : sched) (p : a t) : unit =
+  List.iter
+    (fun (Found (pe, hook)) ->
       hook ();
-      fill sched p (Error Canceled)
-    | Cancel_forward fwd -> fwd sched)
-  | Fulfilled _ | Rejected _ -> ()
+      deliver sched ~allow_deferring:false
+        ~maximum_callback_nesting_depth:default_maximum_callback_nesting_depth
+        pe (Error Canceled))
+    (collect_cancelable sched [] p)
 
 (* [Lwt.cancel] is public and takes only the promise. *)
 let cancel (type a) (p : a t) : unit = cancel_gen (self_sched ()) p
@@ -785,17 +821,21 @@ let set_cancel_forward (type a b) (sched : sched) (result : a t) (src : b t) :
   match (prj result).st with
   | Pending pe ->
     check_owner sched pe;
-    pe.cancel <- Cancel_forward (fun sched -> cancel_gen sched src)
+    pe.cancel <-
+      Cancel_forward (fun sched found -> collect_cancelable sched found src)
   | Fulfilled _ | Rejected _ -> ()
 
 (* Forward cancellation to a whole list of sources (Lwt's
-   [propagate_cancel_to_several], used by choose/pick/join/all/both/nchoose). *)
+   [propagate_cancel_to_several], used by choose/pick/join/all/both/nchoose),
+   searched in list order. *)
 let set_cancel_forward_list (type a b) (sched : sched) (result : a t)
     (ps : b t list) : unit =
   match (prj result).st with
   | Pending pe ->
     check_owner sched pe;
-    pe.cancel <- Cancel_forward (fun sched -> List.iter (cancel_gen sched) ps)
+    pe.cancel <-
+      Cancel_forward
+        (fun sched found -> List.fold_left (collect_cancelable sched) found ps)
   | Fulfilled _ | Rejected _ -> ()
 
 (* ------------------------------------------------------------------ *)
@@ -983,9 +1023,8 @@ let both (a : 'a t) (b : 'b t) : ('a * 'b) t =
     check_owner sched pe;
     pe.cancel <-
       Cancel_forward
-        (fun sched ->
-          cancel_gen sched a;
-          cancel_gen sched b)
+        (fun sched found ->
+          collect_cancelable sched (collect_cancelable sched found a) b)
   | Fulfilled _ | Rejected _ -> ());
   let va = ref None
   and vb = ref None
