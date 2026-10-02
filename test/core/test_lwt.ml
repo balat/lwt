@@ -4488,3 +4488,36 @@ let tailrec_tests = suite "tailrec" [
   end;
 ]
 let suites = suites @ [tailrec_tests]
+
+
+
+(* What the callbacks of the core do with an exception, where the rewritten
+   core once differed from Lwt. *)
+
+(* An async_exception_hook that raises: the way to see a callback's exception
+   come out of the resolver, as tests and some programs use it. *)
+let with_raising_hook f =
+  let saved = !Lwt.async_exception_hook in
+  Lwt.async_exception_hook := (fun e -> raise e);
+  Fun.protect ~finally:(fun () -> Lwt.async_exception_hook := saved) f
+
+let callback_exception_tests = suite "callback exceptions" [
+  (* map's handler covered the fill of its result, so an exception escaping
+     a callback downstream was taken for an exception of the function, and
+     lost on a promise already resolved. *)
+  test "map: an exception out of a later callback is not swallowed"
+      begin fun () ->
+    let p, u = Lwt.wait () in
+    let q = Lwt.map succ p in
+    Lwt.on_success q (fun _ -> raise Exit);
+    let escaped =
+      with_raising_hook (fun () ->
+        match Lwt.wakeup u 1 with () -> false | exception Exit -> true)
+    in
+    (* The resolution loop is left mid-way by the exception, as in Lwt. *)
+    Lwt.abandon_wakeups ();
+    Lwt.return (escaped && Lwt.state q = Lwt.Return 2)
+  end;
+
+]
+let suites = suites @ [callback_exception_tests]
