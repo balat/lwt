@@ -229,6 +229,34 @@ let test_io_bigarray () =
   Unix.close a;
   Unix.close b
 
+(* After [Lwt_unix.dup2] puts a regular file under a descriptor that held a
+   socket, a routed write uses the operation for files, not the cached one for
+   sockets. *)
+let test_dup2_kind () =
+  let a, b = Unix.socketpair Unix.PF_UNIX Unix.SOCK_STREAM 0 in
+  let sock = Lwt_unix.of_unix_file_descr a in
+  ignore (Lwt_main.run (Lwt_unix.write_string sock "x" 0 1));
+  let path = Filename.temp_file "lwt_uring_test" ".dat" in
+  let file =
+    Lwt_unix.of_unix_file_descr
+      (Unix.openfile path [ Unix.O_WRONLY; Unix.O_TRUNC ] 0o600)
+  in
+  Lwt_unix.dup2 file sock;
+  let written =
+    Lwt_main.run
+      (Lwt.catch
+         (fun () -> Lwt_unix.write_string sock "file" 0 4)
+         (fun _ -> Lwt.return (-1)))
+  in
+  Lwt_main.run (Lwt_unix.close sock >>= fun () -> Lwt_unix.close file);
+  Unix.close b;
+  let ic = open_in_bin path in
+  let contents = really_input_string ic (in_channel_length ic) in
+  close_in ic;
+  Sys.remove path;
+  check "dup2 forgets the cached kind of the replaced file"
+    (written = 4 && contents = "file")
+
 (* Lwt_unix.connect routed through io_uring (IORING_OP_CONNECT): a loopback TCP
    connection is established through the ring (the accept side uses the default
    path, whose readiness already runs on the engine), then exchanges data. *)
@@ -386,6 +414,7 @@ let test_available () =
   test_io_regular_file ();
   test_io_bigarray ();
   test_connect ();
+  test_dup2_kind ();
   test_replace_busy_engine ();
   test_replace_from_callback ();
   test_fork ()

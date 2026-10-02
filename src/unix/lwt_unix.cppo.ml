@@ -1293,6 +1293,8 @@ let dup ?cloexec ch =
 let dup2 ?cloexec ch1 ch2 =
   check_descriptor ch1;
   Unix.dup2 ?cloexec ch1.fd ch2.fd;
+  (* [ch2] now names the file of [ch1]: its cached kind is stale. *)
+  ch2.io_kind <- None;
   ch2.set_flags <- ch1.set_flags;
   ch2.blocking <- (
     if ch2.set_flags then
