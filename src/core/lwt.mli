@@ -1790,6 +1790,14 @@ val wakeup : 'a u -> 'a -> unit
     that callbacks associated with [r] will be called immediately, deeper on the
     current stack.
 
+    One exception: inside a callback that the event loop's engine invokes
+    directly (an [Lwt_unix.on_signal] handler, an [Lwt_unix.make_notification]
+    callback, the synchronous part of the function given to
+    [Lwt_preemptive.run_in_main], an [Lwt_gc.finalise] function, a callback
+    handed to [Lwt_engine]), the callbacks are queued and run as soon as the
+    engine iteration returns, still before the next time Lwt blocks on I/O:
+    there they must not run on the engine's stack, which may be a C frame.
+
     In contrast, {!Lwt.wakeup_later} {e may} call callbacks immediately, or may
     queue them for execution on a shallower stack – though still before the next
     time Lwt blocks the process on I/O.

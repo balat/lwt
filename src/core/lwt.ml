@@ -1156,8 +1156,9 @@ let serve_paused_sched (sched : sched) =
    performed across a C call), and the callbacks of one event must not freeze
    the dispatch of the others when one of them awaits. The state of a promise is
    still set at once; only its callbacks move to the queue, in FIFO order, which
-   is within what [wakeup_later] promises and invisible to [wakeup]'s callers
-   inside the engine. *)
+   is within what [wakeup_later] promises. For [wakeup] it is the one documented
+   exception to its immediacy: inside the engine iteration its callbacks are
+   queued as well, since they must not run on the engine's stack. *)
 let defer_fills (sched : sched) (f : 'a -> unit) (x : 'a) : unit =
   let saved = sched.defer_fills in
   sched.defer_fills <- true;
