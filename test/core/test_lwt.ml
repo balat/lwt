@@ -4519,5 +4519,43 @@ let callback_exception_tests = suite "callback exceptions" [
     Lwt.return (escaped && Lwt.state q = Lwt.Return 2)
   end;
 
+  (* async called the hook through a callback wrapper that catches into the
+     hook: a hook that raised was called a second time, with its own
+     exception. Lwt calls it once, and its exception propagates. *)
+  test "async: a raising hook is called once" begin fun () ->
+    let calls = ref 0 in
+    let saved = !Lwt.async_exception_hook in
+    Lwt.async_exception_hook := (fun e -> incr calls; raise e);
+    let p, u = Lwt.wait () in
+    Lwt.async (fun () -> p);
+    let escaped =
+      match Lwt.wakeup_exn u Exit with () -> false | exception Exit -> true
+    in
+    Lwt.async_exception_hook := saved;
+    Lwt.abandon_wakeups ();
+    Lwt.return (escaped && !calls = 1)
+  end;
+
+  (* dont_wait's handler is the caller's: its exception goes to the caller
+     when the promise is already rejected, to the resolver otherwise, not to
+     the async hook. *)
+  test "dont_wait: the handler's exception propagates" begin fun () ->
+    let hook_calls = ref 0 in
+    let saved = !Lwt.async_exception_hook in
+    Lwt.async_exception_hook := (fun _ -> incr hook_calls);
+    let to_caller =
+      match Lwt.dont_wait (fun () -> Lwt.fail Not_found) (fun _ -> raise Exit) with
+      | () -> false
+      | exception Exit -> true
+    in
+    let p, u = Lwt.wait () in
+    Lwt.dont_wait (fun () -> p) (fun _ -> raise Exit);
+    let to_resolver =
+      match Lwt.wakeup_exn u Not_found with () -> false | exception Exit -> true
+    in
+    Lwt.async_exception_hook := saved;
+    Lwt.abandon_wakeups ();
+    Lwt.return (to_caller && to_resolver && !hook_calls = 0)
+  end;
 ]
 let suites = suites @ [callback_exception_tests]

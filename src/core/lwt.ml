@@ -1769,18 +1769,28 @@ let on_cancel (type a) (p : a t) (f : unit -> unit) : unit =
   | Rejected Canceled -> f ()
   | Fulfilled _ | Rejected _ -> ()
 
+(* The handler of [async], [dont_wait] and [ignore_result] is called DIRECTLY,
+   as Lwt always has: no registration storage, and no [hooked] around it, so an
+   exception it raises propagates, to the caller when the promise is already
+   rejected, to the resolver otherwise. Through [on_failure], the hook that
+   [async] calls was itself wrapped in a call to the hook, and a hook that
+   raised was called a second time with its own exception; and the handler of
+   [dont_wait], which is the caller's, sent its exception to the hook. *)
+let on_failure_direct (type a) (p : a t) (handler : exn -> unit) : unit =
+  add_waiter (self_sched ()) p (function Ok _ -> () | Error e -> handler e)
+
 (* Lwt's [async] is fire-and-forget and runs [f ()] {e immediately} on the
    caller's stack (its callbacks register before the caller's next action —
    tests rely on this); a synchronous raise or a rejection goes to
    [async_exception_hook]. *)
 let async (f : unit -> unit t) : unit =
   let p = try f () with e when Exception_filter.run e -> fail e in
-  on_failure p (fun e -> !async_exception_hook e)
+  on_failure_direct p (fun e -> !async_exception_hook e)
 
 (* Same immediate-run semantics for [dont_wait], with a user handler. *)
 let dont_wait (f : unit -> unit t) (handler : exn -> unit) : unit =
   let p = try f () with e when Exception_filter.run e -> fail e in
-  on_failure p handler
+  on_failure_direct p handler
 
 (* Lwt's [ignore_result]: an already-rejected promise raises synchronously; a
    later rejection goes to [async_exception_hook]. *)
@@ -1788,7 +1798,7 @@ let ignore_result p =
   match (prj p).st with
   | Fulfilled _ -> ()
   | Rejected e -> raise e
-  | Pending _ -> on_failure p (fun e -> !async_exception_hook e)
+  | Pending _ -> on_failure_direct p (fun e -> !async_exception_hook e)
 
 (* [no_cancel p] mirrors [p] but ignores [cancel]; [protected p] mirrors [p]
    and is cancelable without affecting [p] (cancelling rejects the mirror only). *)
