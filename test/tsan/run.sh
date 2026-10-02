@@ -20,8 +20,8 @@ build=${LWT_TSAN_BUILD_DIR:-_build-tsan}
 here=$(cd "$(dirname "$0")" && pwd)
 
 # One line per test: the dune target. Anything that spawns a domain belongs here,
-# except what needs a library the TSan switch may lack (lwt_uring: io_uring;
-# lwt_direct's suite: react) and the benchmark that needs an external load.
+# except the benchmark that needs an external load. The uring and direct tests
+# need uring and react in the TSan switch; see README.md.
 tests="
 test/core/test_ownership.exe
 test/core/test_sched_domains.exe
@@ -55,6 +55,9 @@ test/multicore/exit_hooks.exe
 test/multicore/departed_loop.exe
 test/multicore/service_fatal.exe
 test/multicore/cancel_storm.exe
+test/direct/main.exe
+test/uring/domain_rings.exe
+test/uring/test_lwt_uring.exe
 "
 
 if [ $# -gt 0 ]; then
@@ -68,7 +71,10 @@ fi
 LWT_SOAK_SECONDS=${LWT_SOAK_SECONDS:-3}
 export LWT_SOAK_SECONDS
 
-base_opts="suppressions=$here/suppressions.txt halt_on_error=0 history_size=4"
+# die_after_fork=0: the uring suite forks a process that has threads, which TSan
+# does not support in the child, and by default it kills the child. Letting it run
+# keeps the test's own assertions; a report from the child would be suspect.
+base_opts="suppressions=$here/suppressions.txt halt_on_error=0 history_size=4 die_after_fork=0"
 
 # A recent kernel's ASLR entropy makes libtsan abort at startup ("unexpected memory
 # mapping"). setarch -R turns randomisation off for the process and its children,
