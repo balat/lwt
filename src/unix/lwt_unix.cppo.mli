@@ -864,7 +864,10 @@ val on_signal_full : int -> (signal_handler_id -> int -> unit) -> signal_handler
       disable it. *)
 
 val disable_signal_handler : signal_handler_id -> unit
-  (** Stops receiving this signal *)
+  (** Stops receiving this signal. From the loop that registered the handler:
+      the handler list is that loop's, and so is the subscription it may end.
+
+      @raise Invalid_argument from another domain. *)
 
 val signal_count : unit -> int
   (** Returns the number of registered signal handler. *)
