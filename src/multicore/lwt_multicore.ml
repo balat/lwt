@@ -72,8 +72,17 @@ let self_slot : loop Lwt_dls.t =
     register l;
     (* Closing the inbox is what makes a later [run_on] fail instead of dropping
        work silently. The notification goes too, so the id stops naming a live
-       handler, and the registry entry with it. *)
-    Lwt_dls.at_domain_exit (fun () ->
+       handler, and the registry entry with it.
+
+       When the LOOP is retired, not when the domain exits: that is after the
+       loop's exit hooks have run, and a hook may well wait for another domain
+       (shutting a service down is the natural thing to do in one), which needs
+       this inbox open. A plain domain-exit callback ran before the drain of the
+       hooks, on the main domain always and on a spawned one whenever the handle
+       was first taken inside the loop, and the process hung at exit. On the
+       main domain the loop is never retired, and nothing needs to be: the
+       process is ending. *)
+    Lwt_unix.at_loop_exit (fun () ->
       Inbox.close inbox;
       Lwt_unix.stop_notification notification;
       deregister dom);

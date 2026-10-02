@@ -1684,3 +1684,12 @@ val ensure_channel : unit -> unit
     and may need a job, happens while the channel still lives: domain exit
     callbacks run last-registered-first. *)
 
+val at_loop_exit : (unit -> unit) -> unit
+  [@@alert lwt_internal "Internal to the Lwt packages, keep away."]
+(** [at_loop_exit f] runs [f] when the calling domain's loop is retired: after
+    the loop's exit hooks have been drained and before its notification channel
+    is closed, so that [f] is the last thing to use the loop. Registered last,
+    run first. Never run on the main domain, whose loop lives as long as the
+    process. [Lwt_multicore] closes a loop's inbox there, which the ordering of
+    plain domain-exit callbacks could not guarantee. *)
+
