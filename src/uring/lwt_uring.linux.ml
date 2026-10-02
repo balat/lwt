@@ -204,12 +204,28 @@ type unread = { mutable bytes : string; mutable off : int }
 
 let unread : (Unix.file_descr, unread) Hashtbl.t = Hashtbl.create 8
 
+(* Several loops, each on a domain of its own, may share the table, so a mutex
+   guards it. Its length is read without the mutex, which is enough to skip the
+   table when it is empty: the bytes kept for a descriptor were kept by the loop
+   that owns the descriptor, which is the one that reads them. *)
+let unread_mutex = Mutex.create ()
+
+let locked f =
+  Mutex.lock unread_mutex;
+  match f () with
+  | v -> Mutex.unlock unread_mutex; v
+  | exception e -> Mutex.unlock unread_mutex; raise e
+
 let keep_unread fd s =
-  match Hashtbl.find unread fd with
-  | u ->
-    u.bytes <- String.sub u.bytes u.off (String.length u.bytes - u.off) ^ s;
-    u.off <- 0
-  | exception Not_found -> Hashtbl.add unread fd { bytes = s; off = 0 }
+  locked (fun () ->
+    match Hashtbl.find unread fd with
+    | u ->
+      u.bytes <- String.sub u.bytes u.off (String.length u.bytes - u.off) ^ s;
+      u.off <- 0
+    | exception Not_found -> Hashtbl.add unread fd { bytes = s; off = 0 })
+
+let drop_unread fd =
+  if Hashtbl.length unread > 0 then locked (fun () -> Hashtbl.remove unread fd)
 
 (* Hand at most [len] of the bytes kept for [fd] to [blit src src_off n], and
    return [n], which is 0 if nothing is kept. Cheap when nothing is kept for any
@@ -217,14 +233,15 @@ let keep_unread fd s =
 let take_unread fd len blit =
   if Hashtbl.length unread = 0 then 0
   else
-    match Hashtbl.find unread fd with
-    | exception Not_found -> 0
-    | u ->
-      let n = min len (String.length u.bytes - u.off) in
-      blit u.bytes u.off n;
-      u.off <- u.off + n;
-      if u.off = String.length u.bytes then Hashtbl.remove unread fd;
-      n
+    locked (fun () ->
+      match Hashtbl.find unread fd with
+      | exception Not_found -> 0
+      | u ->
+        let n = min len (String.length u.bytes - u.off) in
+        blit u.bytes u.off n;
+        u.off <- u.off + n;
+        if u.off = String.length u.bytes then Hashtbl.remove unread fd;
+        n)
 
 (* Start [r]: serve it from the bytes kept for its descriptor, or hold it while
    a cancelled read is still in the kernel, or queue it for submission. *)
@@ -559,7 +576,7 @@ let submit_io st fd ~recovered op_name post make =
    may name another one, and the cancels go to the kernel at once, so that it
    lets go of the file. *)
 let stop_descriptor fd exn =
-  Hashtbl.remove unread fd;
+  drop_unread fd;
   match installed () with
   | None -> ()
   | Some st ->

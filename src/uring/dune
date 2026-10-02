@@ -13,6 +13,7 @@
  (libraries
   lwt.unix
   unix
+  threads
   (select
    lwt_uring.ml
    from
