@@ -207,7 +207,41 @@ let test_fork () =
     check "and the parent's loop still works after the fork"
       (Lwt_main.run (Lwt_unix.sleep 0.01 >|= fun () -> true))
 
+(* More descriptors ready at once than the submission queue holds: each poll
+   that fires is re-armed while its event is still active, and with the queue
+   full the re-arming flushed it, the polls completed at once, and iter never
+   came back. Every waiter must be woken, and the loop must go on. *)
+let test_many_ready_polls () =
+  let n = 300 in
+  let pairs =
+    List.init n (fun _ -> Lwt_unix.socketpair Unix.PF_UNIX Unix.SOCK_STREAM 0)
+  in
+  let woken =
+    Lwt_main.run
+      (Lwt.pick
+         [ (let waits = List.map (fun (a, _) -> Lwt_unix.wait_read a) pairs in
+            Lwt_unix.sleep 0.02 >>= fun () ->
+            List.iter
+              (fun (_, b) ->
+                 ignore
+                   (Unix.write_substring (Lwt_unix.unix_file_descr b) "x" 0 1))
+              pairs;
+            Lwt.join waits >|= fun () -> true);
+           (Lwt_unix.sleep 5. >|= fun () -> false) ])
+  in
+  List.iter
+    (fun (a, b) ->
+       Lwt_main.run (Lwt_unix.close a >>= fun () -> Lwt_unix.close b))
+    pairs;
+  check "more ready descriptors than the queue holds: all woken" woken
+
 let () =
+  (* A test that hangs the loop must fail rather than wait for ever. *)
+  Sys.set_signal Sys.sigalrm
+    (Sys.Signal_handle (fun _ ->
+       print_endline "FAIL - the loop hung (alarm)";
+       exit 1));
+  ignore (Unix.alarm 120);
   check "io_uring is available" (Lwt_uring.available ());
   Lwt_uring.set ();
   (match Lwt_engine.id () with
@@ -222,6 +256,7 @@ let () =
   test_io_regular_file ();
   test_io_bigarray ();
   test_connect ();
+  test_many_ready_polls ();
   test_fork ();
   if !failures = 0 then Printf.printf "\nAll tests passed.\n%!"
   else begin
