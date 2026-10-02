@@ -22,10 +22,17 @@
  (locks /tcp-port/lwt-unix-suites)
  (libraries lwttester tester lwt_uring))
 
+; The benchmarks below are self-contained: each measures the default engine
+; and then io_uring in one process. They are declared as tests of the package
+; so that a build restricted to other packages (the CI, a switch without
+; uring) leaves them alone, and so that [dune runtest] exercises each
+; io_uring path once, at a cost of a few seconds.
+
 ; Micro-benchmark: socketpair ping-pong under the default vs io_uring engine.
 
-(executable
+(test
  (name bench_pingpong)
+ (package lwt_uring)
  (modules bench_pingpong)
  (enabled_if
   (= %{system} linux))
@@ -33,8 +40,9 @@
 
 ; Request/response server benchmark over Lwt_io (the cohttp I/O path).
 
-(executable
+(test
  (name bench_server)
+ (package lwt_uring)
  (modules bench_server)
  (enabled_if
   (= %{system} linux))
@@ -42,8 +50,9 @@
 
 ; New-connection benchmark: isolates routing accept/connect through io_uring.
 
-(executable
+(test
  (name bench_connect)
+ (package lwt_uring)
  (modules bench_connect)
  (enabled_if
   (= %{system} linux))
