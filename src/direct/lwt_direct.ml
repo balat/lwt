@@ -37,6 +37,11 @@ let resume = Lwt.Private.scheduler_resume
    its own, in its wrapper, before it can get here. *)
 let push_resume f : unit = Lwt.Private.scheduler_enqueue f
 
+(* A yield parks its resumption for the next lap of the loop, after one engine
+   iteration, instead of re-queuing it at once: a task yielding in a loop must
+   not keep the engine, the timers and the pauses from running. *)
+let push_next_lap f : unit = Lwt.Private.scheduler_enqueue_next_lap f
+
 [@@@alert "+trespassing"]
 
 (* part 2: effects, performing them *)
@@ -129,7 +134,7 @@ let with_effect_handler (f : unit -> unit) : unit =
   | () -> ()
   | effect Yield, k ->
     let st = suspend () in
-    push_resume (fun () -> resume st (fun () -> Effect.Deep.continue k ()))
+    push_next_lap (fun () -> resume st (fun () -> Effect.Deep.continue k ()))
   | effect Await fut, k ->
     let st = suspend () in
     Lwt.on_any fut
@@ -205,7 +210,7 @@ let rec drive (loop : unit -> unit) : unit =
     | effect Yield, k ->
       retire_if_drainer ();
       let st = suspend () in
-      push_resume (fun () ->
+      push_next_lap (fun () ->
         resume st (fun () -> ignore (Effect.Deep.continue k ())));
       `Suspended
     | effect Await fut, k ->

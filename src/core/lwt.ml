@@ -235,6 +235,10 @@ and sched = {
        resolutions performed during an engine iteration. *)
   mutable paused : unit promise list;
   mutable paused_n : int;
+  mutable yielded : task list;
+    (* Resumptions that asked for the next lap, [Lwt_direct.yield]'s: served
+       with the paused batch, after one engine iteration, so that a task
+       yielding in a loop starves nothing. Most recent first, like [paused]. *)
   mutable pause_notifier : (int -> unit) option;
   on_reset : unit -> unit;
     (* Back-end state to clear at the start of [run], e.g. an I/O readiness
@@ -406,6 +410,7 @@ let new_sched () : sched =
     deferred = Queue.create ();
     queue = Run_queue.create (Thunk (empty_storage, ignore));
     paused = [];
+    yielded = [];
     paused_n = 0;
     pause_notifier = None;
     on_reset = ignore;
@@ -1128,8 +1133,8 @@ let wakeup_paused_sched (sched : sched) =
 (* [Lwt.wakeup_paused] is public and takes no argument. *)
 let wakeup_paused () = wakeup_paused_sched (self_sched ())
 
-(* Serve the paused batch as one task per promise, instead of resolving the
-   whole batch on the idle hook's stack. Each pause's callbacks then run from
+(* Serve the paused batch as one task per promise, and the yielded tasks after
+   them, instead of resolving the whole batch on the idle hook's stack. Each pause's callbacks then run from
    the loop as their own task, so an [await] in one of them (see [runner])
    suspends that task alone; resolving them in one [List.iter] would freeze the
    rest of the batch in the continuation. Same order as [wakeup_paused_sched]
@@ -1139,7 +1144,10 @@ let serve_paused_sched (sched : sched) =
   let ps = List.rev sched.paused in
   sched.paused <- [];
   sched.paused_n <- 0;
-  List.iter (fun p -> Run_queue.push sched.queue (Paused p)) ps
+  List.iter (fun p -> Run_queue.push sched.queue (Paused p)) ps;
+  let ys = List.rev sched.yielded in
+  sched.yielded <- [];
+  List.iter (Run_queue.push sched.queue) ys
 
 (* Run [f] with every resolution it triggers turned into a task of the run
    queue (see [fill_general]) rather than run on the spot. [Lwt_main] wraps the
@@ -1277,6 +1285,7 @@ let abandon_paused () =
   let sched = self_sched () in
   sched.paused <- [];
   sched.paused_n <- 0;
+  sched.yielded <- [];
   (* The pauses the idle lap already turned into tasks are abandoned too (the
      child of a fork must not run the parent's); one pass over the queue,
      which happens once per fork. *)
@@ -1320,7 +1329,7 @@ let retire_drainer (sched : sched) : unit =
    every pause generation between laps) is what keeps a backend's engine
    iterations from starving under a sustained stream of pauses. *)
 let core_idle (sched : sched) : bool =
-  if sched.paused_n > 0 then begin
+  if sched.paused_n > 0 || sched.yielded <> [] then begin
     serve_paused_sched sched;
     true
   end
@@ -1995,6 +2004,16 @@ module Private = struct
      await without freezing its neighbours or sitting on a C frame; see
      [serve_paused_sched] and [defer_fills]. *)
   let scheduler_serve_paused () = serve_paused_sched (self_sched ())
+
+  (* The next-lap list, for [Lwt_direct.yield]: a resumption parked here runs
+     after the next idle lap, with the paused batch. *)
+  let scheduler_enqueue_next_lap (f : unit -> unit) : unit =
+    let sched = self_sched () in
+    sched.yielded <- Thunk (sched.storage, f) :: sched.yielded
+
+  let scheduler_next_lap_pending () =
+    let sched = self_sched () in
+    sched.paused_n > 0 || sched.yielded <> []
   let scheduler_defer_fills f x = defer_fills (self_sched ()) f x
 
   (* The resolution state a suspended fiber takes with it; see [suspend]. *)

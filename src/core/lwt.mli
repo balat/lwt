@@ -2161,6 +2161,17 @@ module Private : sig
       that task alone. For the idle hook of a backend; {!wakeup_paused} keeps
       resolving the batch synchronously. *)
 
+  val scheduler_enqueue_next_lap : (unit -> unit) -> unit
+  (** Parks a thunk for the next lap: it runs after the next idle lap, with
+      the paused batch, under the storage current at the call. For a
+      direct-style layer's [yield]: unlike {!scheduler_enqueue}, which
+      re-queues at once and would let a task that yields in a loop keep the
+      idle lap, hence the engine, from ever running. *)
+
+  val scheduler_next_lap_pending : unit -> bool
+  (** Whether a pause or a next-lap thunk is waiting for the next idle lap. A
+      backend's idle hook must then not block on its engine. *)
+
   val scheduler_defer_fills : ('a -> unit) -> 'a -> unit
   (** [scheduler_defer_fills f x] runs [f x] with every promise resolution it
       performs queuing its callbacks as a task of the run queue, FIFO, instead

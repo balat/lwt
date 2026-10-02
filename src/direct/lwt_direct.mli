@@ -64,13 +64,16 @@ val spawn_in_the_background :
     If [f()] raises an exception, {!Lwt.async_exception_hook} is called. *)
 
 val yield : unit -> unit
-(** Yield to the event loop.
+(** Yield to the event loop: suspends the current task until the next lap of
+    the loop, after the engine has run once, so that I/O, timers, pauses and
+    the other tasks get their turn. It is {!await}[ (Lwt.pause ())] with less
+    machinery and fewer characters.
 
-    This is similar to [await (Lwt.pause ())], using less indirection internally
-    and fewer characters to write.
-
-    Outside of {!spawn} and {!spawn_in_the_background}, [yield] suspends the
-    current task, as {!await} does; see there for what the current task is. *)
+    A task that yields in a loop therefore costs one engine iteration per
+    yield when it is alone, as a loop of [Lwt.pause] does; that is the point:
+    nothing it shares the loop with is starved. Outside of {!spawn} and
+    {!spawn_in_the_background}, [yield] suspends the current task, as
+    {!await} does; see there for what the current task is. *)
 
 val await : 'a Lwt.t -> 'a
 (** [await p] returns the result of [p] (or raises the exception with which [p]

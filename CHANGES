@@ -82,6 +82,11 @@
     a callback invoked from C (the libev engine does so for callbacks handed
     directly to Lwt_engine), await and yield raise Failure.
 
+  * Lwt_direct.yield suspends the task until the next lap of the event loop,
+    after one engine iteration, so a task that yields in a loop starves
+    nothing; it used to re-queue the task at once, and a loop of yields kept
+    I/O, timers and pauses from running for as long as it lasted.
+
   * Lwt_direct.main, the entry point of a program written in direct style
     (Lwt_main.run (spawn f)); and Lwt_direct.no_await, a region in which an
     await on a pending promise, or a yield, raises Suspension_forbidden at
