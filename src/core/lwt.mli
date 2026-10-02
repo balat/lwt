@@ -2188,6 +2188,12 @@ module Private : sig
       the suspended fiber), then puts the resumer's own state back, whether
       [f] returned or raised. *)
 
+  val check_owner : 'a t -> unit
+  (** Raises {!Foreign_promise} if the promise is pending and belongs to
+      another domain, as attaching a callback to it would. For a layer about
+      to suspend on it: made before the continuation is captured, the error
+      is raised at the call site. *)
+
   val no_suspend : (unit -> 'a) -> 'a
   (** [no_suspend f] runs [f ()] in a region where suspending the current
       task is an error: a direct-style layer that would suspend raises instead

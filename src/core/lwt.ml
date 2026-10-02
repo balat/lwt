@@ -2003,6 +2003,14 @@ module Private = struct
   let scheduler_suspend () = suspend (self_sched ())
   let scheduler_resume st f = resume (self_sched ()) st f
 
+  (* For a layer about to suspend on [p]: the check [add_waiter] would make,
+     made before the continuation is captured, so that [Foreign_promise] is
+     raised at the call site and not out of the handler. *)
+  let check_owner (type a) (p : a t) : unit =
+    match (prj p).st with
+    | Pending pe -> check_owner (self_sched ()) pe
+    | Fulfilled _ | Rejected _ -> ()
+
   (* Regions where suspension is an error; see [no_suspend]. *)
   let no_suspend f = no_suspend (self_sched ()) f
   let suspension_forbidden () = (self_sched ()).suspension_forbidden > 0
