@@ -620,11 +620,14 @@ static lwt_unix_mutex signal_table_mutex = PTHREAD_MUTEX_INITIALIZER;
 static lwt_unix_mutex signal_table_mutex;
 #endif
 
+void initialize_threading(void);
+
 CAMLprim value lwt_unix_init_notifications(value unit) {
 #if !defined(LWT_NOTIFICATION_MUTEX_IS_STATIC)
   lwt_unix_mutex_init(&notification_channels_mutex);
   lwt_unix_mutex_init(&signal_table_mutex);
 #endif
+  initialize_threading();
   return Val_unit;
 }
 
@@ -1330,31 +1333,51 @@ static int thread_count = 0;
 /* Maximum number of system threads that can be started. */
 static int pool_size = 1000;
 
-/* Condition on which pool threads are waiting. */
+/* Condition on which pool threads are waiting. Built statically where the
+   platform allows, with the mutex below: a lazy initialisation behind a plain
+   flag was a race once two loops could submit their first job at the same
+   time, the same race ThreadSanitizer found on the channel table. Windows has
+   no static initialiser, so there both are built by [initialize_threading],
+   called once from [Lwt_unix]'s module initialisation. */
+#if defined(HAVE_PTHREAD)
+#define LWT_POOL_SYNC_IS_STATIC 1
+static lwt_unix_condition pool_condition = PTHREAD_COND_INITIALIZER;
+#else
 static lwt_unix_condition pool_condition;
+#endif
 
 /* Queue of pending jobs. It points to the last enqueued job.  */
 static lwt_unix_job pool_queue = NULL;
 
 /* The mutex which protect access to [pool_queue], [pool_condition]
    and [thread_waiting_count]. */
+#if defined(HAVE_PTHREAD)
+static lwt_unix_mutex pool_mutex = PTHREAD_MUTEX_INITIALIZER;
+#else
 static lwt_unix_mutex pool_mutex;
+#endif
 
 /* +-----------------------------------------------------------------+
    | Threading stuff initialization                                  |
    +-----------------------------------------------------------------+ */
 
-/* Whether threading has been initialized. */
+#if !defined(LWT_POOL_SYNC_IS_STATIC)
+/* Whether threading has been initialized, where the synchronisation is not
+   static. */
 static int threading_initialized = 0;
+#endif
 
-/* Initialize the pool of thread. */
+/* Initialize the pool of thread. A no-op where the mutex and the condition
+   are static. */
 void initialize_threading(void) {
+#if !defined(LWT_POOL_SYNC_IS_STATIC)
   if (threading_initialized == 0) {
     lwt_unix_mutex_init(&pool_mutex);
     lwt_unix_condition_init(&pool_condition);
 
     threading_initialized = 1;
   }
+#endif
 }
 
 /* +-----------------------------------------------------------------+
@@ -1564,18 +1587,23 @@ CAMLprim value lwt_unix_run_job_sync(value val_job) {
 }
 
 CAMLprim value lwt_unix_reset_after_fork(value Unit) {
-  if (threading_initialized) {
-    /* There is no more waiting threads. */
-    thread_waiting_count = 0;
+  /* There is no more waiting threads. */
+  thread_waiting_count = 0;
 
-    /* There is no more threads. */
-    thread_count = 0;
+  /* There is no more threads. */
+  thread_count = 0;
 
-    /* Empty the queue. */
-    pool_queue = NULL;
+  /* Empty the queue. */
+  pool_queue = NULL;
 
-    threading_initialized = 0;
-  }
+  /* The child has a single thread, and the mutex may have been held by a
+     worker of the parent at the moment of the fork: build both again. */
+#if defined(LWT_POOL_SYNC_IS_STATIC)
+  lwt_unix_mutex_init(&pool_mutex);
+  lwt_unix_condition_init(&pool_condition);
+#else
+  threading_initialized = 0;
+#endif
 
   return Val_unit;
 }
