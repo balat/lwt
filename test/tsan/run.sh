@@ -19,19 +19,42 @@ set -eu
 build=${LWT_TSAN_BUILD_DIR:-_build-tsan}
 here=$(cd "$(dirname "$0")" && pwd)
 
-# One line per test: the dune target. Anything that spawns a domain belongs here.
+# One line per test: the dune target. Anything that spawns a domain belongs here,
+# except what needs a library the TSan switch may lack (lwt_uring: io_uring;
+# lwt_direct's suite: react) and the benchmark that needs an external load.
 tests="
 test/core/test_ownership.exe
 test/core/test_sched_domains.exe
+test/core/test_containers_domains.exe
+test/core/test_lwt_dls_domains.exe
+test/core/test_storage_domains.exe
 test/unix/domain_wakeup_stress.exe
 test/unix/domain_shared_resolved.exe
 test/unix/domain_soak.exe
+test/unix/domain_channels.exe
+test/unix/domain_emfile.exe
+test/unix/domain_engines.exe
+test/unix/domain_exit_hooks.exe
+test/unix/domain_gc.exe
+test/unix/domain_io_affinity.exe
+test/unix/domain_notifications.exe
+test/unix/domain_reuseport.exe
+test/unix/domain_signals.exe
+test/unix/domain_timeouts.exe
+test/unix/domain_two_loops.exe
+test/unix/domain_unix_policy.exe
+test/unix/domain_upstream_scenarios.exe
 test/multicore/run_on.exe
 test/multicore/shared_value.exe
 test/multicore/adopt.exe
 test/multicore/sync.exe
 test/multicore/stream.exe
 test/multicore/service.exe
+test/multicore/example.exe
+test/multicore/exit_hooks.exe
+test/multicore/departed_loop.exe
+test/multicore/service_fatal.exe
+test/multicore/cancel_storm.exe
 "
 
 if [ $# -gt 0 ]; then
