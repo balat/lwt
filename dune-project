@@ -105,7 +105,8 @@
   ; public interface of Lwt_unix and Lwt_engine. To settle at release time, with
   ; the versions.
   (lwt (>= 6))
-  (saturn (>= 1.0))))
+  (saturn (>= 1.0))
+  (qcheck-stm (and :with-test (>= 0.3)))))
 
 (package
  (name lwt_runtime_events)
