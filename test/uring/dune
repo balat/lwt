@@ -2,7 +2,7 @@
  (name test_lwt_uring)
  (package lwt_uring)
  (modules test_lwt_uring)
- (libraries lwt.unix lwt_uring unix))
+ (libraries lwt.unix lwt_uring unix threads))
 
 ; Run Lwt's existing test/unix suites with the io_uring engine installed.
 

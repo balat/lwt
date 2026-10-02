@@ -12,16 +12,16 @@ let not_available () = raise (Lwt_sys.Not_available "io_uring")
 
 let available () = false
 
-let set ?queue_depth:_ () = not_available ()
+let set ?queue_depth:_ ?deferred:_ () = not_available ()
 
-let set_if_available ?queue_depth:_ () = false
+let set_if_available ?queue_depth:_ ?deferred:_ () = false
 
 type Lwt_engine.engine_id += Engine_id__uring
 
 (* The class exists so that the interface is the same as on Linux. Building an
    instance raises before the object exists; it inherits from [Lwt_engine.select]
    only because a class needs an implementation. *)
-class uring ?queue_depth:_ () =
+class uring ?queue_depth:_ ?deferred:_ () =
   let () = not_available () in
   object
     inherit Lwt_engine.select

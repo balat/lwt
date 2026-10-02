@@ -442,6 +442,36 @@ let test_cancel_in_flight () =
      | `Rejected (Unix.Unix_error (Unix.EBADF, _, _)) -> true
      | _ -> false)
 
+(* With [~deferred], the kernel posts completions only when the ring is entered
+   asking for events: a loop that never goes idle must still get its I/O. A
+   system thread writes 0.1 s after the read is submitted, while the loop keeps
+   pausing. *)
+let test_deferred () =
+  Lwt_uring.set ~deferred:true ();
+  let a, b = Unix.socketpair Unix.PF_UNIX Unix.SOCK_STREAM 0 in
+  let a = Lwt_unix.of_unix_file_descr a in
+  let read = Lwt_unix.read a (Bytes.create 4) 0 4 in
+  let writer =
+    Thread.create
+      (fun () ->
+        Thread.delay 0.1;
+        ignore (Unix.write_substring b "ping" 0 4))
+      ()
+  in
+  let t0 = Unix.gettimeofday () in
+  let rec spin () =
+    if Lwt.is_sleeping read && Unix.gettimeofday () -. t0 < 2. then
+      Lwt.pause () >>= spin
+    else Lwt.return_unit
+  in
+  Lwt_main.run (spin ());
+  Thread.join writer;
+  let got = Lwt.state read = Lwt.Return 4 in
+  Lwt_main.run (Lwt_unix.close a);
+  Unix.close b;
+  Lwt_uring.set ();
+  check "with ~deferred, a loop that never idles still gets its I/O" got
+
 (* Replacing a uring engine that watches a descriptor and has a completion-based
    read in flight: the readiness wait moves to the new engine, and the read is
    cancelled, its promise rejected with [ECANCELED]. *)
@@ -593,6 +623,7 @@ let test_available () =
   test_close_then_reuse ();
   test_cancel_before_submission ();
   test_cancel_in_flight ();
+  test_deferred ();
   test_replace_busy_engine ();
   test_replace_from_callback ();
   test_fork ()

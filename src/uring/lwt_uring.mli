@@ -72,7 +72,7 @@ val available : unit -> bool
     (a recent enough Linux kernel, which does not forbid io_uring). It never
     raises. *)
 
-val set : ?queue_depth:int -> unit -> unit
+val set : ?queue_depth:int -> ?deferred:bool -> unit -> unit
 (** [set ?queue_depth ()] installs a fresh io_uring engine as the current Lwt
     engine, transferring the events registered on the previous engine (see
     {!Lwt_engine.set}).
@@ -87,10 +87,16 @@ val set : ?queue_depth:int -> unit -> unit
       flushed and the submission retried, and an iteration of the loop handles
       at most that many completions, leaving the others to the next one. A
       larger value costs locked memory, and a very large one can fail with
-      [ENOMEM]. Defaults to [256]. *)
+      [ENOMEM]. Defaults to [256].
+    @param deferred
+      whether to ask the kernel for [SINGLE_ISSUER] and [DEFER_TASKRUN]. They
+      assume that one loop, on one system thread, owns the ring, and make the
+      engine enter the ring asking for events on every iteration of the loop.
+      Defaults to [false]: measured, they brought no gain. On a kernel older
+      than 6.0, which refuses them, the engine uses a plain ring. *)
 
-val set_if_available : ?queue_depth:int -> unit -> bool
-(** [set_if_available ?queue_depth ()] installs the io_uring engine as {!set}
+val set_if_available : ?queue_depth:int -> ?deferred:bool -> unit -> bool
+(** [set_if_available ?queue_depth ?deferred ()] installs the io_uring engine as {!set}
     does and returns [true], where io_uring is available. Otherwise it leaves
     the current engine in place and returns [false]: on a system other than
     Linux, where the kernel lacks or forbids io_uring, and when the environment
@@ -114,7 +120,7 @@ type Lwt_engine.engine_id += Engine_id__uring
     [Lwt_sys.Not_available "io_uring"] if the system has no io_uring
     ([ENOSYS]) or forbids it ([EPERM]); other failures, such as [ENOMEM] for a
     queue too deep for the locked-memory limit, raise [Unix.Unix_error]. *)
-class uring : ?queue_depth:int -> unit -> object
+class uring : ?queue_depth:int -> ?deferred:bool -> unit -> object
   inherit Lwt_engine.t
 end
 

@@ -366,17 +366,38 @@ let installed () =
 (* [io_uring_setup] fails with ENOSYS where the kernel has no io_uring, and with
    EPERM where it is forbidden: by the [kernel.io_uring_disabled] sysctl, or by
    a seccomp filter such as the default profile of Docker and containerd. *)
-let create_ring ~queue_depth =
-  match U.create ~queue_depth () with
+let create_ring ?(flags = U.Setup_flags.empty) ~queue_depth () =
+  match U.create ~flags ~queue_depth () with
   | ring -> ring
   | exception Unix.Unix_error ((Unix.ENOSYS | Unix.EPERM), _, _) ->
     raise (Lwt_sys.Not_available "io_uring")
 
-class uring ?(queue_depth = 256) () = object (self)
+(* SINGLE_ISSUER and DEFER_TASKRUN, offered by [~deferred] and off by default.
+   The first tells the kernel that one task submits, which holds as long as one
+   loop, on one system thread, owns the ring. The second makes the kernel run
+   completion work only when the ring is entered asking for events, so [iter]
+   then does so on every lap, not only when it blocks: otherwise a loop that
+   never goes idle would starve its own I/O. Measured, they bought nothing here:
+   -1.7% on a sequential ping-pong, +3.6% on 50 keep-alive connections over
+   Lwt_io, both inside the noise. On a kernel older than 6.0, which refuses
+   them, the ring is a plain one. *)
+let deferred_flags = U.Setup_flags.(single_issuer + defer_taskrun)
+
+let create_deferred_ring ~queue_depth =
+  match create_ring ~flags:deferred_flags ~queue_depth () with
+  | ring -> (ring, true)
+  | exception Unix.Unix_error _ -> (create_ring ~queue_depth (), false)
+
+class uring ?(queue_depth = 256) ?(deferred = false) () =
+  let ring, deferred =
+    if deferred then create_deferred_ring ~queue_depth
+    else (create_ring ~queue_depth (), false)
+  in
+  object (self)
   inherit Lwt_engine.abstract
 
   val st =
-    { ring = create_ring ~queue_depth;
+    { ring;
       descs = Hashtbl.create 64;
       pending = [||];
       n_pending = 0 }
@@ -472,7 +493,14 @@ class uring ?(queue_depth = 256) () = object (self)
 
   method iter block =
     submit_pending st;
-    ignore (U.submit st.ring);
+    (* With DEFER_TASKRUN, only an entry that asks for events gets the kernel
+       to post completions: when not blocking, enter with a zero timeout. *)
+    if deferred && not block then begin
+      match U.wait ~timeout:0. st.ring with
+      | U.Some { result; data } -> dispatch st (result :> int) data
+      | U.None -> ()
+    end
+    else ignore (U.submit st.ring);
     (* When [block] is requested and the ring has outstanding operations, wait
        for at least one completion; otherwise just harvest what is ready. With
        nothing outstanding there is nothing to wait for, so we never block. *)
@@ -512,7 +540,7 @@ class uring ?(queue_depth = 256) () = object (self)
   method! fork =
     live <- false;
     unregister (self :> Lwt_engine.t);
-    Lwt_engine.set ~destroy:false (new uring ~queue_depth ())
+    Lwt_engine.set ~destroy:false (new uring ~queue_depth ~deferred ())
 end
 
 let get_state () =
@@ -762,12 +790,12 @@ let () =
     ~connect ~on_close ~on_abort ()
 
 let available () =
-  match create_ring ~queue_depth:1 with
+  match create_ring ~queue_depth:1 () with
   | ring -> U.exit ring; true
   | exception (Lwt_sys.Not_available _ | Unix.Unix_error _) -> false
 
-let set ?queue_depth () =
-  Lwt_engine.set (new uring ?queue_depth ())
+let set ?queue_depth ?deferred () =
+  Lwt_engine.set (new uring ?queue_depth ?deferred ())
 
 (* [LWT_URING=0] turns io_uring off without recompiling, for instance to
    compare engines or to work around a kernel problem in production. *)
@@ -776,8 +804,8 @@ let disabled_by_environment () =
   | Some "0" -> true
   | Some _ | None -> false
 
-let set_if_available ?queue_depth () =
+let set_if_available ?queue_depth ?deferred () =
   (not (disabled_by_environment ()))
-  && (match set ?queue_depth () with
+  && (match set ?queue_depth ?deferred () with
       | () -> true
       | exception Lwt_sys.Not_available _ -> false)
