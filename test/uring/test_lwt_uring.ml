@@ -191,7 +191,7 @@ let test_io_bounds () =
   Unix.close a;
   Unix.close b
 
-(* io_uring can read a regular file asynchronously — readiness engines cannot
+(* io_uring can read a regular file asynchronously: readiness engines cannot
    poll regular files at all. *)
 let test_io_regular_file () =
   let path = Filename.temp_file "lwt_uring_test" ".dat" in

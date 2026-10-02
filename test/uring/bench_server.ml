@@ -3,11 +3,11 @@
 
 
 
-(* A request/response server benchmark over Lwt_io channels — the same I/O path
+(* A request/response server benchmark over Lwt_io channels: the same I/O path
    that cohttp-lwt-unix uses (Lwt_io reads/writes go through
    Lwt_unix.read_bigarray/write_bigarray, which the io_uring engine routes to
    completion-based recv/send). It measures throughput under the default engine
-   and then under the io_uring engine, with no change to the workload — so the
+   and then under the io_uring engine, with no change to the workload, so the
    speedup, if any, is entirely from transparently routing the existing Lwt_io
    code through io_uring. *)
 

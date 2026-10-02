@@ -11,7 +11,7 @@
    [IORING_OP_POLL_ADD] submission, a timer becomes an [IORING_OP_TIMEOUT]
    submission, and one [io_uring_enter] (via {!Uring.wait}) both flushes all
    pending submissions and reaps the completions. Registrations therefore cost
-   no immediate system call — they are batched until the next loop iteration.
+   no immediate system call: they are batched until the next loop iteration.
 
    To match the level-triggered semantics that {!Lwt_engine} expects (a
    registered callback fires every time the descriptor is ready, until the event
@@ -308,7 +308,7 @@ let get_state () =
     failwith "Lwt_uring.Io: no io_uring engine installed (use Lwt_uring.set)"
 
 (* Offset [-1] tells io_uring to use the descriptor's current position, like
-   [read(2)]/[write(2)] — used for seekable files. *)
+   [read(2)]/[write(2)], used for seekable files. *)
 let current_offset = Optint.Int63.minus_one
 
 (* Submit a completion-based operation built by [make] on the ring of [st] and
@@ -368,7 +368,7 @@ let unit_result : int -> unit = fun _ -> ()
 
 (* Pick the io_uring operation to read into / write from a [Cstruct.t], by
    descriptor kind:
-   - sockets use [recv]/[send] (offsetless — the correct op, and reading/writing
+   - sockets use [recv]/[send] (offsetless: the correct op, and reading/writing
      a socket through positioned [read]/[write] with offset -1 can stall);
    - regular files use positioned [read]/[write] at the current offset (-1);
    - other (pipes, ttys, …) are non-seekable, so [read]/[write] with offset 0

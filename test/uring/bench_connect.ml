@@ -5,7 +5,7 @@
 
 (* A new-connection benchmark: each request opens a fresh TCP connection (connect
    + accept), exchanges one small request/response, and closes. Unlike the
-   keep-alive server benchmark, the cost here is dominated by connection setup —
+   keep-alive server benchmark, the cost here is dominated by connection setup,
    so it isolates the benefit of routing accept/connect through io_uring
    (IORING_OP_ACCEPT / IORING_OP_CONNECT) rather than the data path. The same
    workload is measured under the default engine and then under io_uring. *)
