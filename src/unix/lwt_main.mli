@@ -122,6 +122,12 @@ module Leave_iter_hooks :
 (** Promise-returning hooks, of type [unit -> unit Lwt.t], that are called at
     process exit. Exceptions raised by these hooks are ignored.
 
+    The hooks are per domain: those registered on a domain other than the main
+    one run when that domain's loop is retired, at its exit. At process exit,
+    the hooks that run are those of the domain that called [Stdlib.exit] (or
+    returned from the program, the main one): an [exit] called from another
+    domain does not run the main domain's hooks. Call it from the main domain.
+
     @since 4.2.0 *)
 module Exit_hooks :
   Hooks with type 'return_value kind = 'return_value Lwt.t

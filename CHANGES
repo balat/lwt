@@ -40,9 +40,9 @@
     core, each with its own listening socket on the same port through
     SO_REUSEPORT. See "Several loops, one per domain" in the manual, which has
     the recipe in full, the mistakes that are easy to make, and what is still
-    restricted (fork, Lwt_preemptive's process-wide bounds). Lwt_io.stdout,
-    stderr and stdin, and Lwt_fmt.stdout and stderr, stand for one channel per
-    domain, so every loop can print.
+    restricted (fork, exit from another domain, Lwt_preemptive's process-wide
+    bounds). Lwt_io.stdout, stderr and stdin, and Lwt_fmt.stdout and stderr,
+    stand for one channel per domain, so every loop can print.
 
   * lwt_multicore: a new optional package (OCaml >= 5) for the cases where work
     does have to cross a domain boundary: run_on, a shared value with await and
