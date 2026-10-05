@@ -48,6 +48,13 @@
     library's module-level mutex, pool or other container, which otherwise
     belongs to the main domain's loop and is refused by the others.
 
+  * One version for every package of the repository, 6.2.0, each requiring
+    the lwt of the same version: lwt_react (was 1.2.0), lwt_retry (5.9.0),
+    lwt_ppx (6.1.0), lwt_direct and lwt_runtime_events (6.0.0) move to it.
+    Several use internals of lwt that move between versions, so a looser
+    constraint let opam pair them with an lwt they do not compile against. lwt
+    conflicts with an lwt_direct of another version for the same reason.
+
   * lwt_multicore: a new optional package (OCaml >= 5) for the cases where work
     does have to cross a domain boundary: run_on, a shared value with await and
     resolve, adopt for a foreign promise, and Mutex, Semaphore, Condition,

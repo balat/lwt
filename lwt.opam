@@ -32,6 +32,11 @@ depends: [
   "ocplib-endian"
 ]
 depopts: ["base-threads" "base-unix" "conf-libev" "lwt_runtime_events"]
+conflicts: [
+  "lwt_direct" {!= version}
+  "lwt_multicore" {!= version}
+  "lwt_runtime_events" {!= version}
+]
 dev-repo: "git+https://github.com/ocsigen/lwt.git"
 build: [
   ["dune" "subst"] {dev}
