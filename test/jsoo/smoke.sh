@@ -26,10 +26,19 @@ build=${LWT_JSOO_BUILD_DIR:-_build-jsoo}
 tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"' EXIT
 
-dune build --build-dir="$build" src/core/lwt.cma
+dune build --build-dir="$build" \
+  src/core/lwt.cma src/runtime_events/lwt_runtime_events.cma
 
+# lwt.cma's Lwt_rte is the variant that calls lwt_runtime_events whenever that
+# library is available, which it always is in the tree, so the hand link needs
+# it and the runtime's runtime_events too (OCaml >= 5.1, which js_of_ocaml on
+# OCaml 5 implies). A program built by dune gets both through lwt's
+# dependencies.
 ocamlc -w -a \
+  -I +runtime_events \
   -I "$build/default/src/core/.lwt.objs/byte" \
+  runtime_events.cma \
+  "$build/default/src/runtime_events/lwt_runtime_events.cma" \
   "$build/default/src/core/lwt.cma" \
   test/core/test_browser_invariants.ml \
   -o "$tmp/smoke.bc"
