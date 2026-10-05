@@ -1000,14 +1000,14 @@ let () =
   on a different core, your normal I/O-bound tasks continue running on the
   original core.
 
-  The module {!Lwt_domain} from the [lwt_domain] package provides all the
-  necessary helpers to achieve this. It is based on the [Domainslib] library
-  and uses similar concepts (such as tasks and pools).
+  [Lwt_multicore.Pool] from the [lwt_multicore] package does this:
+  [Lwt_multicore.Pool.detach pool f x] runs [f x] on one of the pool's domains
+  and returns a promise of its result. The domains it detaches to are Lwt loops
+  themselves (see {{!several_loops}several Lwt loops}), so the detached work may
+  also do I/O and use Lwt.
 
-  [Lwt_multicore.Pool] from the [lwt_multicore] package does the same job for a
-  program that already runs {{!several_loops}several Lwt loops}: the
-  domains it detaches to are Lwt loops themselves, so the detached work may do I/O
-  and use Lwt, which a [Domainslib] task may not.
+  The separate [lwt_domain] package offers the same on top of the [Domainslib]
+  library, with its tasks and pools, for work that uses neither Lwt nor I/O.
 
   First, you need to create a task pool:
 
