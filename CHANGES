@@ -90,7 +90,9 @@
   * Lwt_direct.await works in any callback the event loop runs, not only
     inside Lwt_direct.spawn: in a bind continuation, an on_success callback,
     a completion handler. A function written in direct style can then be
-    called from monadic code with no wrapping. An await suspends the current
+    called from monadic code with no wrapping, except by the _p combinators,
+    which run sequentially if it awaits unless it is started with
+    Lwt_direct.spawn. An await suspends the current
     task, that is the callback and whatever called it synchronously; the
     event loop runs each pause, I/O completion and timer as a task of its
     own, so an awaiting callback never delays the callbacks of other events,

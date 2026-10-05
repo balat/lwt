@@ -6,7 +6,12 @@
 (** List helpers *)
 
 (** Note: this module use the same naming convention as
-    {!Lwt_stream}. *)
+    {!Lwt_stream}.
+
+    The [_p] functions call [f] on one element after the other, synchronously,
+    and wait for the resulting promises together. An [f] that suspends with
+    [Lwt_direct.await] therefore makes them sequential; see [Lwt_direct.await]
+    for how to keep them concurrent. *)
 
 (** {2 List iterators} *)
 

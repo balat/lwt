@@ -103,6 +103,15 @@ val await : 'a Lwt.t -> 'a
     second. When that matters, start a task with {!spawn} inside the
     callback.
 
+    That includes the functions that call their argument synchronously on
+    each element, the [_p] combinators of {!Lwt_list}, [Lwt_seq] and
+    {!Lwt_stream}, and {!Lwt_switch.turn_off} on its hooks: they call [f x]
+    for one element after the other and wait for the promises together, so
+    an [f] that awaits suspends them at the first element, and the next
+    element starts only when it resumes. The combinator is then sequential.
+    To keep it concurrent, have [f] start a task:
+    [Lwt_list.iter_p (fun x -> spawn (fun () -> g x)) l].
+
     Where suspension is refused, [await] on a pending promise raises
     {!Suspension_forbidden} at the call: inside {!no_await}, inside a
     propagation started by a setter of [Lwt_react], and inside the event
