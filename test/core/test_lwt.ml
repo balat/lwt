@@ -529,6 +529,11 @@ let catch_tests = suite "catch" [
     state_is (Lwt.Return "foo") p
   end;
 
+  test "fulfilled: the promise itself" begin fun () ->
+    let p = Lwt.return "foo" in
+    Lwt.return (Lwt.catch (fun () -> p) (fun _ -> Lwt.return "bar") == p)
+  end;
+
   test "f raises" begin fun () ->
     let p =
       Lwt.catch

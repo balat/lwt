@@ -1011,8 +1011,11 @@ let ( >|= ) p f = map f p
    exception filter allows), as is a rejection of [f ()]'s promise, mirroring
    Lwt. On the already-resolved fast paths [g]/[h] are applied plainly, so their
    own synchronous exceptions escape to the caller — as in Lwt. *)
-let try_bind (f : unit -> 'a t) (g : 'a -> 'b t) (h : exn -> 'b t) : 'b t =
-  let p = try f () with e when Exception_filter.run e -> inj { st = Rejected e } in
+let call_guarded (f : unit -> 'a t) : 'a t =
+  try f () with e when Exception_filter.run e -> inj { st = Rejected e }
+
+(* [try_bind] once [f ()] has given [p]. *)
+let try_bind_promise (p : 'a t) (g : 'a -> 'b t) (h : exn -> 'b t) : 'b t =
   match (prj p).st with
   | Fulfilled v -> g v
   | Rejected e -> h e
@@ -1028,7 +1031,17 @@ let try_bind (f : unit -> 'a t) (g : 'a -> 'b t) (h : exn -> 'b t) : 'b t =
       sched.storage <- outer);
     result
 
-let catch (f : unit -> 'a t) (h : exn -> 'a t) : 'a t = try_bind f return h
+let try_bind (f : unit -> 'a t) (g : 'a -> 'b t) (h : exn -> 'b t) : 'b t =
+  try_bind_promise (call_guarded f) g h
+
+(* A fulfilled [f ()] is returned as it is, as the historical core did, rather
+   than as a copy made by [return]: [catch (fun () -> p) h == p], and nothing
+   is allocated on that path. *)
+let catch (f : unit -> 'a t) (h : exn -> 'a t) : 'a t =
+  let p = call_guarded f in
+  match (prj p).st with
+  | Fulfilled _ -> p
+  | Rejected _ | Pending _ -> try_bind_promise p return h
 
 (* Lwt's [both] waits for {e both} promises even when one is already rejected
    (the result stays pending until the other resolves), then rejects with the
