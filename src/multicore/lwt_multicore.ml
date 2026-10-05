@@ -165,7 +165,20 @@ type 'a waiter = {
   (* The epoch of the queue the waiter is in, or -1 once it has left it, served
      or taken; see [waiters] below. Under the queue's lock, like the flag. *)
   mutable w_epoch : int;
+  (* Who has the waiter: see [wake]. One of the four constants below. *)
+  w_state : int Atomic.t;
+  (* How to hand back what the waiter was served, should it be cancelled before
+     it takes it. Written by the server before it marks the waiter served, so
+     whoever sees it served sees this too. *)
+  mutable w_give_back : unit -> unit;
 }
+
+let waiting = 0
+let cancelled = 1
+let served = 2
+let settled = 3
+
+let no_give_back () = ()
 
 (* Built OUTSIDE any critical section, always: a promise is an allocation and an
    Lwt operation, and the rule for the locks in this module is that a critical
@@ -173,33 +186,62 @@ type 'a waiter = {
 let new_waiter () =
   let promise, resolver = Lwt.task () in
   { w_loop = self (); w_promise = promise; w_resolver = resolver;
-    w_withdrawn = false; w_epoch = -1 }
+    w_withdrawn = false; w_epoch = -1; w_state = Atomic.make waiting;
+    w_give_back = no_give_back }
 
-(* [w]'s promise belongs to [w]'s domain, so this has to happen there. Returns
-   whether it actually resolved it: a waiter whose promise was cancelled
-   meanwhile is a case the callers below must handle, since a resource may have
-   been handed to it. *)
-let wake_now w v =
-  if Lwt.is_sleeping w.w_promise then (Lwt.wakeup w.w_resolver v; true)
-  else false
+(* SERVING A WAITER, AND THE RACE WITH ITS CANCELLATION. The server chooses [w]
+   under the primitive's lock and wakes it outside; [w]'s own domain may cancel
+   it at any point. Who then has the resource is decided by compare-and-set on
+   [w_state], as Eio decides it for its waiters, so that it never waits for a
+   loop to run:
 
-(* Resolves [w] on its own loop, wherever that is. [on_dead] is for the caller to
-   undo whatever it handed over, and runs on the waiter's loop too. *)
+   - the server moves [w] from [waiting] to [served]; if [w] was cancelled first,
+     that fails, and the server hands the resource on at once ([on_dead]);
+   - the cancellation moves [w] from [waiting] to [cancelled] and withdraws it
+     from the queue; if [w] has been served already, it moves it from [served]
+     to [settled] and hands the resource back at once ([w_give_back]), on its
+     own domain, instead of leaving it held until the posted wake-up runs;
+   - the posted wake-up, the retirement of the loop it was posted to, and a
+     post refused because that loop is gone, each move [w] from [served] to
+     [settled] too, and only the one that does so delivers or hands back.
+
+   So exactly one party disposes of the resource, and promptly. Unlike Eio, a
+   cancelled waiter that was served does not keep what it was given: its promise
+   is already rejected, so its caller will never release it.
+
+   [resolve] resolves [w]'s promise, and runs on [w]'s own domain; [on_dead]
+   runs wherever the race is decided, so it must be callable from any domain,
+   which the release paths of this module are. [here] is the caller's loop. *)
+let wake_with ~here w ~resolve ~on_dead =
+  w.w_give_back <- on_dead;
+  if not (Atomic.compare_and_set w.w_state waiting served) then on_dead ()
+  else begin
+    let deliver () =
+      if Atomic.compare_and_set w.w_state served settled then
+        resolve w.w_resolver
+    and give_back () =
+      if Atomic.compare_and_set w.w_state served settled then on_dead ()
+    in
+    if w.w_loop == here then deliver ()
+    else
+      (* If the loop is retired before the wake-up runs, the resource had been
+         handed to a waiter that will never take it, and goes back. *)
+      match post w.w_loop { run = deliver; abandon = give_back } with
+      | () -> ()
+      | exception Loop_terminated -> give_back ()
+  end
+
 let wake w v ~on_dead =
-  let here = self () in
-  if w.w_loop == here then (if not (wake_now w v) then on_dead ())
-  else
-    (* Posted with [on_dead] as what to do if the loop is retired before the
-       wake-up runs: the resource had been handed to a waiter that will never
-       take it, and must go back. Without that, a lock handed to a loop that
-       left stayed held for ever. *)
-    match
-      post w.w_loop
-        { run = (fun () -> if not (wake_now w v) then on_dead ());
-          abandon = on_dead }
-    with
-    | () -> ()
-    | exception Loop_terminated -> on_dead ()
+  wake_with ~here:(self ()) w ~resolve:(fun r -> Lwt.wakeup r v) ~on_dead
+
+(* The other half of the race, run by the waiter's promise when it is cancelled,
+   on its own domain. [withdraw] takes [w] out of its queue, under the lock. *)
+let cancel_waiter w ~withdraw =
+  if Atomic.compare_and_set w.w_state waiting cancelled then withdraw ()
+  else if Atomic.compare_and_set w.w_state served settled then w.w_give_back ()
+
+let on_cancel_withdraw w ~withdraw =
+  Lwt.on_cancel w.w_promise (fun () -> cancel_waiter w ~withdraw)
 
 (* A first-in, first-out queue kept as a pair of lists. Short by nature: these are
    domain boundaries, not hot paths. Holds waiters below, and stream items too. *)
@@ -317,35 +359,21 @@ let is_pending t =
   Mutex.unlock t.mutex;
   pending
 
-(* Runs on the waiter's own domain, so it may resolve the waiter's promise. The
-   promise may have been cancelled meanwhile, hence the test, which is Lwt's own
-   idiom for a resolver that may have been raced. *)
-let deliver w result =
-  if Lwt.is_sleeping w.w_promise then
-    match result with
-    | Ok v -> Lwt.wakeup w.w_resolver v
-    | Error e -> Lwt.wakeup_exn w.w_resolver e
-
 let wake_all waiters result =
   (* Read once: [self ()] is a slot lookup, and this loop is the same for every
-     waiter in the list. *)
+     waiter in the list. A waiter of this loop is resolved now rather than
+     posted to ourselves. That is not only cheaper, it is the right semantics:
+     [Lwt.wakeup] resolves synchronously, and a [resolve] that quietly became
+     asynchronous for the local case would be a trap. A waiter whose loop has
+     gone is skipped: it is not the resolver's business that someone has
+     terminated, and that loop's promise died with its domain. *)
   let here = self () in
-  List.iter
-    (fun w ->
-      if w.w_loop == here then
-        (* Our own waiter, so resolve it now rather than posting to ourselves.
-           That is not only cheaper, it is the right semantics: [Lwt.wakeup]
-           resolves synchronously, and a [resolve] that quietly became
-           asynchronous for the local case would be a trap. *)
-        deliver w result
-      else
-        (* A waiter whose loop has gone is skipped: it is not the resolver's
-           business that someone has terminated, and that loop's promise died
-           with its domain. *)
-        match run_on w.w_loop (fun () -> deliver w result) with
-        | () -> ()
-        | exception Loop_terminated -> ())
-    waiters
+  let resolve r =
+    match result with
+    | Ok v -> Lwt.wakeup r v
+    | Error e -> Lwt.wakeup_exn r e
+  in
+  List.iter (fun w -> wake_with ~here w ~resolve ~on_dead:no_give_back) waiters
 
 (* Settles [t], or reports that it was settled already. Returns the waiters to
    wake, so that the waking is done by the caller, outside the lock. *)
@@ -386,23 +414,19 @@ let await t =
      operation, and neither belongs in a critical section shared with other
      domains. If [t] turns out to be settled, this promise is simply resolved at
      once. *)
-  let promise, resolver = Lwt.task () in
-  let w =
-    { w_loop = self (); w_promise = promise; w_resolver = resolver;
-      w_withdrawn = false; w_epoch = -1 }
-  in
+  let w = new_waiter () in
   Mutex.lock t.mutex;
   let state = t.state in
   (match state with Pending -> waiters_push t.waiters w | _ -> ());
   Mutex.unlock t.mutex;
   match state with
-  | Fulfilled v -> Lwt.wakeup resolver v; promise
-  | Rejected e -> Lwt.wakeup_exn resolver e; promise
+  | Fulfilled v -> Lwt.wakeup w.w_resolver v; w.w_promise
+  | Rejected e -> Lwt.wakeup_exn w.w_resolver e; w.w_promise
   | Pending ->
     (* Cancelling the local promise withdraws this loop's interest and leaves [t]
        and the other waiters alone. *)
-    Lwt.on_cancel promise (fun () -> withdraw t w);
-    promise
+    on_cancel_withdraw w ~withdraw:(fun () -> withdraw t w);
+    w.w_promise
 
 (* +-----------------------------------------------------------------+
    | Adopting a foreign promise                                      |
@@ -458,10 +482,11 @@ let adopt (p : 'a Lwt.t) : 'a Lwt.t =
    The protocol that needs care is HANDING THE RESOURCE OVER. Serving a waiter
    means choosing it under the lock and waking it outside, and in between its
    promise may be cancelled by its own domain. Then the resource has been handed
-   to nobody, so the waking function hands it BACK, on the waiter's loop, by
-   calling the release path again. Every round consumes one waiter, so this
-   terminates. That is what the [~on_dead] argument of [wake] is for, and it is
-   the only subtle thing in these hundred lines. *)
+   to nobody, so it is handed BACK by calling the release path again: by the
+   server if the cancellation came first, by the cancellation if the serving
+   did, at once either way (see [wake]). Every round consumes one waiter, so
+   this terminates. That is what the [~on_dead] argument of [wake] is for, and
+   it is the only subtle thing in these hundred lines. *)
 
 module Mutex = struct
   type t = {
@@ -511,7 +536,7 @@ module Mutex = struct
     Stdlib.Mutex.unlock t.guard;
     if taken then Lwt.return_unit
     else begin
-      Lwt.on_cancel w.w_promise (fun () ->
+      on_cancel_withdraw w ~withdraw:(fun () ->
         Stdlib.Mutex.lock t.guard;
         waiters_withdraw t.waiters w;
         Stdlib.Mutex.unlock t.guard);
@@ -561,7 +586,7 @@ module Semaphore = struct
     Stdlib.Mutex.unlock t.guard;
     if taken then Lwt.return_unit
     else begin
-      Lwt.on_cancel w.w_promise (fun () ->
+      on_cancel_withdraw w ~withdraw:(fun () ->
         Stdlib.Mutex.lock t.guard;
         waiters_withdraw t.waiters w;
         Stdlib.Mutex.unlock t.guard);
@@ -594,7 +619,7 @@ module Condition = struct
     let taken = waiters_take_all t.waiters in
     Stdlib.Mutex.unlock t.guard;
     List.iter
-      (fun w -> wake w v ~on_dead:(fun () -> ()))
+      (fun w -> wake w v ~on_dead:no_give_back)
       (waiters_assemble taken)
 
   let wait ?mutex t =
@@ -602,7 +627,7 @@ module Condition = struct
     Stdlib.Mutex.lock t.guard;
     waiters_push t.waiters w;
     Stdlib.Mutex.unlock t.guard;
-    Lwt.on_cancel w.w_promise (fun () ->
+    on_cancel_withdraw w ~withdraw:(fun () ->
       Stdlib.Mutex.lock t.guard;
       waiters_withdraw t.waiters w;
       Stdlib.Mutex.unlock t.guard);
@@ -707,7 +732,7 @@ module Stream = struct
              push harmless: nothing has been handed over. *)
           waiters_push t.room w;
           Stdlib.Mutex.unlock t.guard;
-          Lwt.on_cancel w.w_promise (fun () ->
+          on_cancel_withdraw w ~withdraw:(fun () ->
             Stdlib.Mutex.lock t.guard;
             waiters_withdraw t.room w;
             Stdlib.Mutex.unlock t.guard);
@@ -732,7 +757,7 @@ module Stream = struct
       else begin
         waiters_push t.takers w;
         Stdlib.Mutex.unlock t.guard;
-        Lwt.on_cancel w.w_promise (fun () ->
+        on_cancel_withdraw w ~withdraw:(fun () ->
           Stdlib.Mutex.lock t.guard;
           waiters_withdraw t.takers w;
           Stdlib.Mutex.unlock t.guard);
@@ -752,21 +777,15 @@ module Stream = struct
     let room = ref (waiters_assemble !taken_room) in
     (* Consumers learn the end; producers waiting for room learn there will be
        none, since pushing to a closed stream fails. *)
-    List.iter (fun w -> wake w None ~on_dead:(fun () -> ())) !takers;
+    List.iter (fun w -> wake w None ~on_dead:no_give_back) !takers;
     (* A producer waiting for room is REJECTED rather than woken: there will be no
-       room, and retrying would only find the stream closed. [wake] carries a
-       value, so this one is spelled out. *)
-    let reject_producer w =
-      if Lwt.is_sleeping w.w_promise then Lwt.wakeup_exn w.w_resolver Closed
-    in
+       room, and retrying would only find the stream closed. *)
     let here = self () in
     List.iter
       (fun w ->
-        if w.w_loop == here then reject_producer w
-        else
-          match run_on w.w_loop (fun () -> reject_producer w) with
-          | () -> ()
-          | exception Loop_terminated -> ())
+        wake_with ~here w
+          ~resolve:(fun r -> Lwt.wakeup_exn r Closed)
+          ~on_dead:no_give_back)
       !room
 end
 

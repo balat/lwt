@@ -141,3 +141,14 @@
  (build_if
   (>= %{ocaml_version} "5.0"))
  (libraries lwt.unix lwt_multicore qcheck-stm.domain))
+
+; A waiter served by another domain and cancelled by its own before its loop
+; runs: what it was given comes back at once, and only once.
+
+(test
+ (name handover)
+ (package lwt_multicore)
+ (modules handover)
+ (build_if
+  (>= %{ocaml_version} "5.0"))
+ (libraries lwt.unix lwt_multicore))
