@@ -152,3 +152,14 @@
  (build_if
   (>= %{ocaml_version} "5.0"))
  (libraries lwt.unix lwt_multicore))
+
+; A producer waiting for room keeps its turn: the room freed for it is reserved
+; until it retries, and a later producer waits behind it.
+
+(test
+ (name stream_order)
+ (package lwt_multicore)
+ (modules stream_order)
+ (build_if
+  (>= %{ocaml_version} "5.0"))
+ (libraries lwt.unix lwt_multicore))

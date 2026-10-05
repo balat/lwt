@@ -307,8 +307,16 @@ module Stream : sig
   (** Adds an item, waiting while the stream is full. That wait is the
       back-pressure, and it is the point of the bound.
 
+      Waiting producers get room in the order they started to wait: room that
+      appears is kept for the first of them, and a producer arriving later
+      cannot take it, even while the first one's loop has not run yet, so a
+      waiting producer is never starved. Its item goes in when it uses that
+      room, on its own loop; items from different producers are therefore not
+      strictly in the order the producers started to wait.
+
       Cancelling the wait is harmless: a producer that is waiting has handed over
-      nothing, so nothing can be lost by giving up.
+      nothing, so nothing can be lost by giving up, and the room kept for it goes
+      to the next one.
 
       @raise Closed if the stream is closed, as a rejected promise. *)
 

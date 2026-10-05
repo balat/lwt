@@ -57,6 +57,7 @@ test/multicore/departed_loop.exe
 test/multicore/service_fatal.exe
 test/multicore/cancel_storm.exe
 test/multicore/handover.exe
+test/multicore/stream_order.exe
 test/multicore/lin_shared_value.exe
 test/multicore/notifications.exe
 test/multicore/stm_domain_sync.exe

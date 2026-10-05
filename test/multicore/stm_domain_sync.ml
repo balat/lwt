@@ -219,31 +219,36 @@ module Stream_spec = struct
     | Is_closed -> "is_closed"
 
   (* What is buffered, how many takers wait for an item, which pushers wait for
-     room (their domain and their value, in order), and whether the stream is
-     closed.
+     room (their domain and their value, in order), how much room is reserved,
+     and whether the stream is closed.
 
-     A pusher that waits holds NOTHING: when room appears it is woken, and it
-     RETRIES its push (see [push]). Woken by another domain, the wake-up is
-     posted to the pusher's loop, which does not run here: the room stays free
-     for anyone, and the pusher simply leaves the queue.
+     A pusher that waits holds NOTHING. When room appears it is RESERVED for the
+     first waiting pusher, in the same critical section, and the pusher is woken
+     to retry its push with it (see [push]); a newcomer counts the reserved room
+     as taken, so a waiting pusher cannot be overtaken for its room. Woken by
+     another domain, the wake-up is posted to the pusher's loop, which does not
+     run here: the room stays reserved, and the pusher leaves the queue.
 
-     Woken by its OWN domain, its promise is resolved at once and the retry runs
-     inside the [take] that made the room, but not atomically with it: the other
-     domain can push into the room first, and the retry then queues again, at
-     the back. No deterministic model says which happens, so [precond] keeps that
-     case out. It is also what the case means: a waiting producer can be
-     overtaken by a newcomer, and across domains for as long as its loop takes to
-     run, which the shared Mutex and Semaphore do not allow (they hand over). *)
+     Woken by its OWN domain, the pusher retries at once, right after the [take]
+     that made the room, but not atomically with it: the other domain may act in
+     between, and if it frees and fills another slot, or waits for an item, what
+     it sees depends on timing. [precond] keeps that case out. What it means:
+     room goes to waiting pushers in order, but an item still enters when its
+     pusher retries, so items of different pushers are not strictly in the order
+     the pushers started to wait. Strict order would need the value handed over,
+     and a cancelled push could then still deliver its value. *)
   type state = {
     items : int list;
     takers : int;
     pushers : (origin * int) list;
+    reserved : int;
     closed : bool;
   }
 
   type sut = int Lwt_multicore.Stream.t
 
-  let init_state = { items = []; takers = 0; pushers = []; closed = false }
+  let init_state =
+    { items = []; takers = 0; pushers = []; reserved = 0; closed = false }
 
   let init_sut () =
     Atomic.set finished 0;
@@ -264,12 +269,14 @@ module Stream_spec = struct
 
   let arb_cmd _ = arb_op Main
 
+  let has_room s = List.length s.items + s.reserved < capacity
+
   let push origin i s =
     if s.closed then s
     else if s.takers > 0 then
       (* Straight to the first waiting taker. *)
       { s with takers = s.takers - 1 }
-    else if List.length s.items < capacity then { s with items = s.items @ [ i ] }
+    else if has_room s then { s with items = s.items @ [ i ] }
     else { s with pushers = s.pushers @ [ (origin, i) ] }
 
   let next_state { origin; op } s =
@@ -277,10 +284,13 @@ module Stream_spec = struct
     | Push i -> push origin i s
     | Take -> (
       match s.items with
-      | _ :: rest ->
-        (* A slot was freed: the first waiting pusher is woken, and leaves. *)
-        let pushers = match s.pushers with [] -> [] | _ :: w -> w in
-        { s with items = rest; pushers }
+      | _ :: rest -> (
+        (* A slot was freed: it goes to the first waiting pusher. *)
+        let s = { s with items = rest } in
+        match s.pushers with
+        | _ :: waiting when has_room s ->
+          { s with pushers = waiting; reserved = s.reserved + 1 }
+        | _ -> s)
       | [] -> if s.closed then s else { s with takers = s.takers + 1 })
     | Close ->
       (* Takers learn the end, pushers are rejected: both queues empty. *)
@@ -290,7 +300,8 @@ module Stream_spec = struct
   (* A take that would wake a pusher of its own domain; see the state. *)
   let precond { origin; op } s =
     match (op, s.items, s.pushers) with
-    | Take, _ :: _, (o, _) :: _ -> o <> origin
+    | Take, _ :: rest, (o, _) :: _ ->
+      o <> origin || List.length rest + s.reserved >= capacity
     | _ -> true
 
   let wrap_cmd_seq = keep_alive
@@ -313,7 +324,7 @@ module Stream_spec = struct
       (match op with
        | Push _ ->
          if s.closed then "closed"
-         else if s.takers > 0 || List.length s.items < capacity then "pushed"
+         else if s.takers > 0 || has_room s then "pushed"
          else "pending"
        | Take -> (
          match s.items with

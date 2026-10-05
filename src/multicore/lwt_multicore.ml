@@ -657,6 +657,12 @@ module Stream = struct
        system call either way, so the rule for these locks was satisfied, but
        there is no reason to pay it. *)
     mutable size : int;
+    (* Room promised to woken pushers that have not retried yet. A slot that
+       appears goes to the first waiting pusher and is RESERVED for it until its
+       retry, which runs on its own loop, later when that is another domain: a
+       newcomer counts it as taken and waits its turn, so a waiting pusher
+       cannot be overtaken. A cancelled pusher gives its reservation back. *)
+    mutable reserved : int;
     mutable closed : bool;
   }
 
@@ -668,6 +674,7 @@ module Stream = struct
       takers = waiters_create ();
       room = waiters_create ();
       size = 0;
+      reserved = 0;
       closed = false }
 
   let length t =
@@ -696,16 +703,57 @@ module Stream = struct
       t.size <- t.size + 1;
       Stdlib.Mutex.unlock t.guard
 
-  (* One unit of room has appeared: let the first waiting pusher retry. *)
-  let rec offer_room t =
-    Stdlib.Mutex.lock t.guard;
-    match waiters_pop t.room with
-    | None -> Stdlib.Mutex.unlock t.guard
-    | Some w ->
-      Stdlib.Mutex.unlock t.guard;
-      wake w () ~on_dead:(fun () -> offer_room t)
+  (* Room may have appeared: reserves it for the first waiting pusher, if there
+     is one and the room is real (an item given back by [deposit] can hold the
+     stream over its bound for a while), and returns that pusher, to be woken
+     once the lock is released. Called with the lock held, in the same critical
+     section as whatever freed the room, so that nothing can come in between. *)
+  let reserve_locked t =
+    if t.size + t.reserved >= t.capacity then None
+    else
+      match waiters_pop t.room with
+      | None -> None
+      | Some w ->
+        t.reserved <- t.reserved + 1;
+        Some w
 
-  let rec push t v =
+  let rec wake_reserved t = function
+    | None -> ()
+    | Some w -> wake w () ~on_dead:(fun () -> release_reservation t)
+
+  (* A reservation that will not be used, by a pusher cancelled after it was
+     served: the slot goes to the next pusher, or is free. *)
+  and release_reservation t =
+    Stdlib.Mutex.lock t.guard;
+    t.reserved <- t.reserved - 1;
+    let next = reserve_locked t in
+    Stdlib.Mutex.unlock t.guard;
+    wake_reserved t next
+
+  (* The retry of a woken pusher, which holds a reservation. *)
+  let push_reserved t v =
+    Stdlib.Mutex.lock t.guard;
+    t.reserved <- t.reserved - 1;
+    if t.closed then begin
+      Stdlib.Mutex.unlock t.guard;
+      Lwt.fail Closed
+    end
+    else
+      match waiters_pop t.takers with
+      | Some taker ->
+        (* Straight to a consumer that came meanwhile; the reserved slot is then
+           unused, and goes to the next pusher. *)
+        let next = reserve_locked t in
+        Stdlib.Mutex.unlock t.guard;
+        wake taker (Some v) ~on_dead:(fun () -> deposit t v);
+        wake_reserved t next;
+        Lwt.return_unit
+      | None ->
+        queue_push t.items v;
+        t.size <- t.size + 1;
+        Stdlib.Mutex.unlock t.guard;
+        Lwt.return_unit
+  let push t v =
     let w = new_waiter () in
     Stdlib.Mutex.lock t.guard;
     if t.closed then begin
@@ -720,23 +768,24 @@ module Stream = struct
         wake taker (Some v) ~on_dead:(fun () -> deposit t v);
         Lwt.return_unit
       | None ->
-        if t.size < t.capacity then begin
+        if t.size + t.reserved < t.capacity then begin
           queue_push t.items v;
           t.size <- t.size + 1;
           Stdlib.Mutex.unlock t.guard;
           Lwt.return_unit
         end
         else begin
-          (* Full: this is the back-pressure. Wait for room and RETRY rather than
-             leaving the value with the queue, which is what makes cancelling a
-             push harmless: nothing has been handed over. *)
+          (* Full, reservations included: this is the back-pressure. Wait for
+             room, which will be reserved for us, and retry then, rather than
+             leaving the value with the queue: that is what makes cancelling a
+             push harmless, since nothing has been handed over. *)
           waiters_push t.room w;
           Stdlib.Mutex.unlock t.guard;
           on_cancel_withdraw w ~withdraw:(fun () ->
             Stdlib.Mutex.lock t.guard;
             waiters_withdraw t.room w;
             Stdlib.Mutex.unlock t.guard);
-          Lwt.bind w.w_promise (fun () -> push t v)
+          Lwt.bind w.w_promise (fun () -> push_reserved t v)
         end
 
   let take t =
@@ -745,9 +794,10 @@ module Stream = struct
     match queue_pop t.items with
     | Some v ->
       t.size <- t.size - 1;
-      Stdlib.Mutex.unlock t.guard;
       (* Taking freed a slot, so a blocked producer may go. *)
-      offer_room t;
+      let next = reserve_locked t in
+      Stdlib.Mutex.unlock t.guard;
+      wake_reserved t next;
       Lwt.return (Some v)
     | None ->
       if t.closed then begin
