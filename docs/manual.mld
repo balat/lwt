@@ -743,6 +743,20 @@ let () =
   above, the promise crosses but using the container does not, and you will get the
   [Invalid_argument] above at the point of use.
 
+  A value created when a module is initialised, a library's top-level mutex or
+  pool for instance, belongs to the main domain's loop, so a library written that
+  way works with one loop and fails with several. [Lwt_per_loop] keeps such a
+  value at top level with an instance per loop:
+
+{[
+  let lock = Lwt_per_loop.make Lwt_mutex.create
+
+  let with_resource f = Lwt_mutex.with_lock (Lwt_per_loop.get lock) f
+]}
+
+  The standard channels of [Lwt_io] and [Lwt_fmt] are the exception that needs
+  none of this: each already stands for one channel per domain.
+
 {2 One listener per domain, on the same port }
 
   The shape to reach for first needs no communication at all: one domain per core,

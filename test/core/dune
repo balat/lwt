@@ -10,6 +10,7 @@
   test_sched_domains
   test_ownership
   test_containers_domains
+  test_per_loop
   test_browser_invariants)
  (libraries lwttester))
 
@@ -79,6 +80,17 @@
  (name test_storage_domains)
  (package lwt)
  (modules test_storage_domains)
+ (build_if
+  (>= %{ocaml_version} "5.0"))
+ (libraries lwt))
+
+; Lwt_per_loop: a top-level value with one instance per loop. Needs a second
+; domain, hence OCaml 5.
+
+(test
+ (name test_per_loop)
+ (package lwt)
+ (modules test_per_loop)
  (build_if
   (>= %{ocaml_version} "5.0"))
  (libraries lwt))

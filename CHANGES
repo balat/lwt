@@ -44,6 +44,10 @@
     bounds). Lwt_io.stdout, stderr and stdin, and Lwt_fmt.stdout and stderr,
     stand for one channel per domain, so every loop can print.
 
+  * Lwt_per_loop: a value kept at top level with one instance per loop, for a
+    library's module-level mutex, pool or other container, which otherwise
+    belongs to the main domain's loop and is refused by the others.
+
   * lwt_multicore: a new optional package (OCaml >= 5) for the cases where work
     does have to cross a domain boundary: run_on, a shared value with await and
     resolve, adopt for a foreign promise, and Mutex, Semaphore, Condition,

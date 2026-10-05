@@ -42,7 +42,12 @@ let create_user name =
     If you want to have such pool, consider using {!Lwt_preemptive}. *)
 
 type 'a t
-  (** A pool containing elements of type ['a]. *)
+  (** A pool containing elements of type ['a].
+
+      A pool belongs to the loop of the domain that creates it, and using it
+      from another domain raises [Invalid_argument]. One created when a module
+      is initialised therefore belongs to the main domain; to keep one at top
+      level with an instance per loop, use {!Lwt_per_loop}. *)
 
 val create :
   int ->

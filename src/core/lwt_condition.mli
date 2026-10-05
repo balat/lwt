@@ -32,7 +32,12 @@
 
 type 'a t
     (** Condition variable type. The type parameter denotes the type of
-        value propagated from notifier to waiter. *)
+        value propagated from notifier to waiter.
+
+        A condition variable belongs to the loop of the domain that creates it,
+        and using it from another domain raises [Invalid_argument]. One created
+        when a module is initialised therefore belongs to the main domain; to
+        keep one at top level with an instance per loop, use {!Lwt_per_loop}. *)
 
 val create : unit -> 'a t
     (** [create ()] creates a new condition variable. *)

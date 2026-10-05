@@ -6,7 +6,12 @@
 (** Cooperative locks for mutual exclusion *)
 
 type t
-  (** Type of Lwt mutexes *)
+  (** Type of Lwt mutexes.
+
+      A mutex belongs to the loop of the domain that creates it, and using it
+      from another domain raises [Invalid_argument]. One created when a module
+      is initialised therefore belongs to the main domain; to keep one at top
+      level with an instance per loop, use {!Lwt_per_loop}. *)
 
 val create : unit -> t
   (** [create ()] creates a new mutex, which is initially unlocked *)
