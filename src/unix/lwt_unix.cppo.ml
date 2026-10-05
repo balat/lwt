@@ -511,6 +511,15 @@ type file_descr = {
      operation already calls: measured at 27 instructions per check, so some 6%
      on a socket write-then-read round trip. *)
 
+  shared : bool;
+  (* The exception: [stdin], [stdout] and [stderr] are created when this module
+     is initialised, on the main domain, and every loop needs them. They are
+     blocking, so reading and writing them is a job, which runs for the calling
+     domain; what a foreign domain must not touch is the readiness machinery
+     above, which [wait_read], [wait_write] and [wrap_syscall] then skip, the
+     job waiting in its worker instead. Closing and aborting stay the main
+     domain's. *)
+
   mutable io_kind : Unix.file_kind option;
   (* Cached [Unix.fstat] kind of the descriptor, computed lazily by {!fd_kind}.
      Used by a completion-based I/O backend (e.g. io_uring) to pick the right
@@ -581,13 +590,14 @@ let mk_ch ?blocking ?(set_flags=true) fd = {
   hooks_readable = Lwt_sequence.create ();
   hooks_writable = Lwt_sequence.create ();
   io_kind = None;
+  shared = false;
   owner = Lwt_dls.self_token ();
 }
 
 let check_descriptor ch =
   (* Comparison written out rather than [check_owner]: this runs on every
      operation, and the call costs more than the check. *)
-  if ch.owner <> Lwt_dls.self_token () then
+  if ch.owner <> Lwt_dls.self_token () && not ch.shared then
     Lwt_dls.foreign "Lwt_unix file descriptor";
   match ch.state with
   | Opened ->
@@ -730,9 +740,16 @@ let fd_kind ch =
 
 let of_unix_file_descr = mk_ch
 
-let stdin = of_unix_file_descr ~set_flags:false ~blocking:true Unix.stdin
-let stdout = of_unix_file_descr ~set_flags:false ~blocking:true Unix.stdout
-let stderr = of_unix_file_descr ~set_flags:false ~blocking:true Unix.stderr
+(* Shared by every domain: see [shared]. Their blocking mode is settled here,
+   once, by forcing it: a lazy forced by two domains at once fails. *)
+let standard fd =
+  let ch = { (mk_ch ~set_flags:false ~blocking:true fd) with shared = true } in
+  ignore (Lazy.force ch.blocking);
+  ch
+
+let stdin = standard Unix.stdin
+let stdout = standard Unix.stdout
+let stderr = standard Unix.stderr
 
 (* +-----------------------------------------------------------------+
    | Actions on file descriptors                                     |
@@ -846,7 +863,10 @@ let wrap_syscall event ch action =
   check_descriptor ch;
   Lazy.force ch.blocking >>= fun blocking ->
   try
-    if not blocking || (event = Read && unix_readable ch.fd) || (event = Write && unix_writable ch.fd) then
+    (* A shared standard descriptor of another domain does not wait for its
+       readiness: that would register an event in its owner's engine. *)
+    if not blocking || (event = Read && unix_readable ch.fd) || (event = Write && unix_writable ch.fd)
+       || ch.owner <> Lwt_dls.self_token () then
       Lwt.return (action ())
     else
       register_action event ch action
@@ -911,7 +931,9 @@ let close ch =
 let wait_read ch =
   Lwt.catch
     (fun () ->
-       if readable ch then
+       (* A shared standard descriptor of another domain: no event in its
+          owner's engine, the job that follows waits in its worker. *)
+       if readable ch || ch.owner <> Lwt_dls.self_token () then
          Lwt.return_unit
        else
          register_action Read ch ignore)
@@ -984,7 +1006,8 @@ let read_bigarray function_name fd buf pos len =
 let wait_write ch =
   Lwt.catch
     (fun () ->
-       if writable ch then
+       (* As in [wait_read]. *)
+       if writable ch || ch.owner <> Lwt_dls.self_token () then
          Lwt.return_unit
        else
          register_action Write ch ignore)
@@ -1560,9 +1583,11 @@ let dup ?cloexec ch =
     hooks_readable = Lwt_sequence.create ();
     hooks_writable = Lwt_sequence.create ();
     io_kind = None;
-    (* [check_descriptor] above already established that we own [ch], so the
-       duplicate is ours too. *)
-    owner = ch.owner;
+    (* [check_descriptor] above established that we own [ch], or that it is a
+       shared standard descriptor; either way the duplicate is ours, and ours
+       only. *)
+    owner = Lwt_dls.self_token ();
+    shared = false;
   }
 
 let dup2 ?cloexec ch1 ch2 =

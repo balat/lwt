@@ -804,9 +804,6 @@ let () =
   {- [Lwt_unix.fork], and therefore [Lwt_process], must be called from the domain
      that initialised [Lwt_unix]: the OCaml runtime does not support forking with
      several domains running.}
-  {- [Lwt_io.stdout], [stderr] and [stdin] belong to the domain that initialised
-     the module. Another domain that writes to standard output should make its own
-     channel over the descriptor.}
   {- [Lwt_preemptive]'s bounds are process-wide settings applied per loop, so a
      program with several loops gets more threads than the same program with one.}
   {- Two loops both waiting for {e any} child race for whichever exits first,

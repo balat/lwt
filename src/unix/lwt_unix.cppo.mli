@@ -283,7 +283,11 @@ val system : string -> process_status Lwt.t
 (** {2 Basic file input/output} *)
 
 val stdin : file_descr
-  (** The {b file descriptor} for standard input. *)
+  (** The {b file descriptor} for standard input.
+
+      Unlike other descriptors, the three standard ones may be read and written
+      from any domain: they are blocking, so each operation is a job of the
+      calling domain. Only the main domain may close or abort them. *)
 
 val stdout : file_descr
   (** The {b file descriptor} for standard output. *)

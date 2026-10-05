@@ -10,9 +10,8 @@
    single-character fast paths, which bypass [primitive] by design and would
    otherwise be the one hole in the fence.
 
-   Includes the consequence users will meet first: [Lwt_io.stdout] is created
-   when the module is initialised, so it belongs to that domain and another
-   domain must make its own channel on the same descriptor.
+   The standard channels are the exception: each stands for one channel per
+   domain (test/unix/domain_std_channels.ml), so they are usable everywhere.
 
    Needs a second domain, hence OCaml 5. *)
 
@@ -78,10 +77,10 @@ let () =
   check "read_char on a foreign channel is refused"
     (on_other_domain (fun () -> refused (fun () -> Lwt_io.read_char ic)));
 
-  (* The consequence for the standard channels. *)
-  check "Lwt_io.stdout belongs to the domain that initialised Lwt_io"
+  (* The standard channels are the exception: one per domain. *)
+  check "Lwt_io.stdout is usable from another domain"
     (on_other_domain (fun () ->
-       refused (fun () -> Lwt_io.write Lwt_io.stdout "")));
+       not (refused (fun () -> Lwt_io.write Lwt_io.stdout ""))));
 
   (* And the way out: the other domain makes its own channel on its own
      descriptor over the same file. *)

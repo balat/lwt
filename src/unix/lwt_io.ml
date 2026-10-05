@@ -80,6 +80,12 @@ and 'mode channel = {
 
   mutable queued : unit Lwt.u Lwt_sequence.t [@ocaml.warning "-69"];
   (* Queued operations *)
+
+  mutable per_domain : 'mode channel Lwt_dls.t option;
+  (* [Some] on the values that stand for one channel PER DOMAIN, the standard
+     channels: every entry point resolves such a value into the calling
+     domain's own channel; see [resolve] and [per_domain_channel]. [None] on
+     every other channel. *)
 }
 
 and 'mode _channel = {
@@ -145,7 +151,15 @@ type direct_access = {
   da_perform : unit -> int Lwt.t;
 }
 
-let mode wrapper = wrapper.channel.mode
+(* The calling domain's own channel, for a value that stands for one per domain;
+   the channel itself otherwise. Called by every entry point that touches a
+   channel without going through [primitive] or [atomic], which call it too. *)
+let[@inline] resolve wrapper =
+  match wrapper.per_domain with
+  | None -> wrapper
+  | Some key -> Lwt_dls.get key
+
+let mode wrapper = (resolve wrapper).channel.mode
 
 (* +-----------------------------------------------------------------+
    | Creations, closing, locking, ...                                |
@@ -177,6 +191,7 @@ module Outputs = Weak.Make(struct
 
 
 let position : type mode. mode channel -> int64 = fun wrapper ->
+  let wrapper = resolve wrapper in
   let ch = wrapper.channel in
   match ch.mode with
   | Input ->
@@ -194,6 +209,7 @@ let invalid_channel ch =
   Failure (Printf.sprintf "temporary atomic channel %s no more valid" (name ch))
 
 let is_busy ch =
+  let ch = resolve ch in
   match ch.state with
   | Invalid ->
     raise (invalid_channel ch.channel)
@@ -368,6 +384,7 @@ let unlock : type m. m channel -> unit = fun wrapper -> match wrapper.state with
 
 (* Wrap primitives into atomic io operations: *)
 let primitive f wrapper =
+  let wrapper = resolve wrapper in
   Lwt_dls.check_owner "Lwt_io channel" wrapper.channel.owner;
   match wrapper.state with
   | Idle ->
@@ -409,12 +426,14 @@ let primitive f wrapper =
 
 (* Wrap a sequence of io operations into an atomic operation: *)
 let atomic f wrapper =
+  let wrapper = resolve wrapper in
   Lwt_dls.check_owner "Lwt_io channel" wrapper.channel.owner;
   match wrapper.state with
   | Idle ->
     let tmp_wrapper = { state = Idle;
                         channel = wrapper.channel;
-                        queued = Lwt_sequence.create () } in
+                        queued = Lwt_sequence.create ();
+                        per_domain = None } in
     wrapper.state <- Busy_atomic tmp_wrapper;
     Lwt.finalize
       (fun () -> f tmp_wrapper)
@@ -435,7 +454,8 @@ let atomic f wrapper =
       | Idle | Waiting_for_busy ->
         let tmp_wrapper = { state = Idle;
                             channel = wrapper.channel;
-                            queued = Lwt_sequence.create () } in
+                            queued = Lwt_sequence.create ();
+                            per_domain = None } in
         wrapper.state <- Busy_atomic tmp_wrapper;
         Lwt.finalize
           (fun () -> f tmp_wrapper)
@@ -458,6 +478,7 @@ let atomic f wrapper =
     Lwt.fail (invalid_channel wrapper.channel)
 
 let rec abort wrapper =
+  let wrapper = resolve wrapper in
   Lwt_dls.check_owner "Lwt_io.abort" wrapper.channel.owner;
   match wrapper.state with
   | Busy_atomic tmp_wrapper ->
@@ -477,6 +498,7 @@ let rec abort wrapper =
     Lazy.force wrapper.channel.close
 
 let close : type mode. mode channel -> unit Lwt.t = fun wrapper ->
+  let wrapper = resolve wrapper in
   let channel = wrapper.channel in
   if channel.main != wrapper then
     Lwt.fail
@@ -497,6 +519,7 @@ let close : type mode. mode channel -> unit Lwt.t = fun wrapper ->
            abort wrapper)
 
 let is_closed wrapper =
+  let wrapper = resolve wrapper in
   match wrapper.state with
   | Closed -> true
   | Busy_primitive | Busy_atomic _ | Waiting_for_busy | Idle | Invalid -> false
@@ -588,6 +611,7 @@ let make :
     state = Idle;
     channel = ch;
     queued = Lwt_sequence.create ();
+    per_domain = None;
   } in
   (match mode with
    | Input -> ()
@@ -619,6 +643,7 @@ let of_bytes (type m) ~(mode : m mode) bytes =
     state = Idle;
     channel = ch;
     queued = Lwt_sequence.create ();
+    per_domain = None;
   } in
   wrapper
 
@@ -653,13 +678,15 @@ let of_unix_fd :
   of_fd ?buffer ?close ~mode (Lwt_unix.of_unix_file_descr fd)
 
 let buffered : type m. m channel -> int = fun ch ->
+  let ch = resolve ch in
   match ch.channel.mode with
   | Input -> ch.channel.max - ch.channel.ptr
   | Output -> ch.channel.ptr
 
-let buffer_size ch = ch.channel.length
+let buffer_size ch = (resolve ch).channel.length
 
 let resize_buffer : type m. m channel -> int -> unit Lwt.t = fun wrapper len ->
+  let wrapper = resolve wrapper in
   if len < min_buffer_size then
     invalid_arg "Lwt_io.resize_buffer: buffer size too small";
   match wrapper.channel.typ with
@@ -1225,6 +1252,7 @@ end
    +-----------------------------------------------------------------+ *)
 
 let read_char wrapper =
+  let wrapper = resolve wrapper in
   let channel = wrapper.channel in
   (* Comparison written out rather than [check_owner]: on this path the call
      costs more than the check. *)
@@ -1239,6 +1267,7 @@ let read_char wrapper =
     primitive Primitives.read_char wrapper
 
 let read_char_opt wrapper =
+  let wrapper = resolve wrapper in
   let channel = wrapper.channel in
   (* Comparison written out rather than [check_owner]: on this path the call
      costs more than the check. *)
@@ -1277,6 +1306,7 @@ let read_value ic =
 let flush oc = primitive Primitives.flush oc
 
 let write_char wrapper x =
+  let wrapper = resolve wrapper in
   let channel = wrapper.channel in
   (* Comparison written out rather than [check_owner]: on this path the call
      costs more than the check. *)
@@ -1391,23 +1421,46 @@ let read_lines ic = Lwt_stream.from (fun _ -> read_line_opt ic)
 let write_lines oc lines =
   Lwt_stream.iter_s (fun line -> write_line oc line) lines
 
+(* ONE VALUE, ONE CHANNEL PER DOMAIN. A channel is a buffer and a lock made of
+   Lwt promises, so it belongs to one domain; but the values below are created
+   when this module is initialised, on the main domain, and every loop needs
+   them, to log first of all. So each stands for a channel per domain: it is
+   the main domain's own, and on any other domain [resolve] turns it into that
+   domain's, made by [make_one] on first use there. Each domain's output
+   channel is registered with that domain's table of outputs, so it is flushed
+   when that domain's loop is retired, as the main domain's is at exit. *)
+let per_domain_channel make_one =
+  let key = Lwt_dls.new_key make_one in
+  let main = Lwt_dls.get key in
+  main.per_domain <- Some key;
+  main
+
 let zero =
-  make
-    ~mode:input
-    ~buffer:(Lwt_bytes.create min_buffer_size)
-    (fun str ofs len -> Lwt_bytes.fill str ofs len '\x00'; Lwt.return len)
+  per_domain_channel (fun () ->
+    make
+      ~mode:input
+      ~buffer:(Lwt_bytes.create min_buffer_size)
+      (fun str ofs len -> Lwt_bytes.fill str ofs len '\x00'; Lwt.return len))
 
 let null =
-  make
-    ~mode:output
-    ~buffer:(Lwt_bytes.create min_buffer_size)
-    (fun _str _ofs len -> Lwt.return len)
+  per_domain_channel (fun () ->
+    make
+      ~mode:output
+      ~buffer:(Lwt_bytes.create min_buffer_size)
+      (fun _str _ofs len -> Lwt.return len))
 
-(* Do not close standard ios on close, otherwise uncaught exceptions
-   will not be printed *)
-let stdin = of_fd ~mode:input Lwt_unix.stdin
-let stdout = of_fd ~mode:output Lwt_unix.stdout
-let stderr = of_fd ~mode:output Lwt_unix.stderr
+(* The standard descriptors are shared by every domain (see Lwt_unix.stdin),
+   and only the main domain may close them: closing another domain's standard
+   channel flushes it and marks it closed, and leaves the descriptor open for
+   the others. *)
+let standard ~mode fd =
+  per_domain_channel (fun () ->
+    if Lwt_dls.is_main_domain () then of_fd ~mode fd
+    else of_fd ~close:(fun () -> Lwt.return_unit) ~mode fd)
+
+let stdin = standard ~mode:input Lwt_unix.stdin
+let stdout = standard ~mode:output Lwt_unix.stdout
+let stderr = standard ~mode:output Lwt_unix.stderr
 
 let fprint oc txt = write oc txt
 let fprintl oc txt = write_line oc txt
@@ -1922,7 +1975,7 @@ let establish_server_deprecated ?fd ?buffer_size ?backlog sockaddr f =
    domain, where closing would raise from inside the finaliser, at whatever
    allocation that domain was doing. Nothing is done with it then: its loop is
    gone, and with it any way to flush or to run its close hook. *)
-let owned ch = ch.channel.owner = Lwt_dls.self_token ()
+let owned ch = (resolve ch).channel.owner = Lwt_dls.self_token ()
 
 let ignore_close ch =
   if owned ch then ignore (close ch)

@@ -43,10 +43,10 @@ type 'mode channel
       A channel belongs to the domain that created it: it is a mutable buffer
       plus a lock built out of Lwt promises, and its operations run on the
       domain whose loop owns those promises. Using a channel from another domain
-      raises [Invalid_argument] rather than corrupting the buffer. {!stdout},
-      {!stderr} and {!stdin} are created when this module is initialised, so they
-      belong to that domain; another domain writing to standard output makes its
-      own channel over the same descriptor with {!of_unix_fd} [Unix.stdout]. *)
+      raises [Invalid_argument] rather than corrupting the buffer. The exceptions
+      are {!stdin}, {!stdout}, {!stderr}, {!zero} and {!null}: each stands for
+      one channel per domain, made on first use there, so every loop can use
+      them. *)
 
 type input
   (** Input mode *)
@@ -80,7 +80,16 @@ val stdin : input_channel
   (** The standard input, it reads data from {!Lwt_unix.stdin} *)
 
 val stdout : output_channel
-  (** The standard output, it writes data to {!Lwt_unix.stdout} *)
+  (** The standard output, it writes data to {!Lwt_unix.stdout}.
+
+      One channel PER DOMAIN, behind this one value: each domain that uses it
+      has its own buffer over the same descriptor, flushed when that domain's
+      loop is retired (at exit for the main domain). Output from several
+      domains therefore interleaves by flushes, not by bytes. Closing it from a
+      domain other than the main one flushes and closes that domain's channel
+      and leaves the descriptor open for the others. The same holds for
+      {!stderr} and {!stdin}; several domains reading standard input share it
+      by the chunk their buffers read. *)
 
 val stderr : output_channel
   (** The standard output for error messages, it writes data to

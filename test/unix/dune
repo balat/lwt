@@ -24,6 +24,7 @@
    domain_notifications
    domain_signals
    signal_full_buffer
+   domain_std_channels
    domain_gc
    domain_reuseport
    bench_reuseport
@@ -309,4 +310,15 @@
  (name signal_full_buffer)
  (package lwt)
  (modules signal_full_buffer)
+ (libraries lwt.unix))
+
+; The standard channels of Lwt_io and Lwt_fmt from every loop: one per domain,
+; over the shared standard descriptors. Needs other domains, hence OCaml 5.
+
+(test
+ (name domain_std_channels)
+ (package lwt)
+ (modules domain_std_channels)
+ (build_if
+  (>= %{ocaml_version} "5.0"))
  (libraries lwt.unix))
