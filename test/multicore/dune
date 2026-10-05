@@ -183,3 +183,14 @@
  (build_if
   (>= %{ocaml_version} "5.0"))
  (libraries lwt.unix lwt_multicore))
+
+; A domain that never runs Lwt can resolve, unlock, release and push without
+; building a loop.
+
+(test
+ (name loopless)
+ (package lwt_multicore)
+ (modules loopless)
+ (build_if
+  (>= %{ocaml_version} "5.0"))
+ (libraries lwt.unix lwt_multicore))

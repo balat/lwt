@@ -223,8 +223,10 @@ let new_waiter () =
 
    [resolve] resolves [w]'s promise, and runs on [w]'s own domain; [on_dead]
    runs wherever the race is decided, so it must be callable from any domain,
-   which the release paths of this module are. [here] is the caller's loop. *)
-let wake_with ~here w ~resolve ~on_dead =
+   which the release paths of this module are. Deciding where we are compares
+   domains, without making this domain a loop handle it may never need: a
+   domain that never runs Lwt can resolve, unlock or release for free. *)
+let wake_with w ~resolve ~on_dead =
   w.w_give_back <- on_dead;
   if not (Atomic.compare_and_set w.w_state waiting served) then on_dead ()
   else begin
@@ -238,7 +240,8 @@ let wake_with ~here w ~resolve ~on_dead =
        thread of the same domain posts too, to its own loop, since resolving
        from there would run callbacks beside the loop and leave it asleep in its
        engine. *)
-    if w.w_loop == here && Lwt_main.on_loop_thread () then deliver ()
+    if w.w_loop.dom = (Domain.self () :> int) && Lwt_main.on_loop_thread ()
+    then deliver ()
     else
       (* If the loop is retired before the wake-up runs, the resource had been
          handed to a waiter that will never take it, and goes back. *)
@@ -248,7 +251,7 @@ let wake_with ~here w ~resolve ~on_dead =
   end
 
 let wake w v ~on_dead =
-  wake_with ~here:(self ()) w ~resolve:(fun r -> Lwt.wakeup r v) ~on_dead
+  wake_with w ~resolve:(fun r -> Lwt.wakeup r v) ~on_dead
 
 (* The other half of the race, run by the waiter's promise when it is cancelled,
    on its own domain. [withdraw] takes [w] out of its queue, under the lock. *)
@@ -376,20 +379,17 @@ let is_pending t =
   pending
 
 let wake_all waiters result =
-  (* Read once: [self ()] is a slot lookup, and this loop is the same for every
-     waiter in the list. A waiter of this loop is resolved now rather than
-     posted to ourselves. That is not only cheaper, it is the right semantics:
+  (* A waiter of this loop is resolved now rather than posted to ourselves. That is not only cheaper, it is the right semantics:
      [Lwt.wakeup] resolves synchronously, and a [resolve] that quietly became
      asynchronous for the local case would be a trap. A waiter whose loop has
      gone is skipped: it is not the resolver's business that someone has
      terminated, and that loop's promise died with its domain. *)
-  let here = self () in
   let resolve r =
     match result with
     | Ok v -> Lwt.wakeup r v
     | Error e -> Lwt.wakeup_exn r e
   in
-  List.iter (fun w -> wake_with ~here w ~resolve ~on_dead:no_give_back) waiters
+  List.iter (fun w -> wake_with w ~resolve ~on_dead:no_give_back) waiters
 
 (* Settles [t], or reports that it was settled already. Returns the waiters to
    wake, so that the waking is done by the caller, outside the lock. *)
@@ -426,23 +426,25 @@ let withdraw t w =
   Mutex.unlock t.mutex
 
 let await t =
-  (* Built BEFORE the lock is taken: a promise is an allocation and an Lwt
-     operation, and neither belongs in a critical section shared with other
-     domains. If [t] turns out to be settled, this promise is simply resolved at
-     once. *)
-  let w = new_waiter () in
-  Mutex.lock t.mutex;
-  let state = t.state in
-  (match state with Pending -> waiters_push t.waiters w | _ -> ());
-  Mutex.unlock t.mutex;
-  match state with
-  | Fulfilled v -> Lwt.wakeup w.w_resolver v; w.w_promise
-  | Rejected e -> Lwt.wakeup_exn w.w_resolver e; w.w_promise
-  | Pending ->
-    (* Cancelling the local promise withdraws this loop's interest and leaves [t]
-       and the other waiters alone. *)
-    on_cancel_withdraw w ~withdraw:(fun () -> withdraw t w);
-    w.w_promise
+  (* A settled value is answered at once, with nothing allocated beyond the
+     promise; a waiter is made only for a pending one (see [Mutex.lock]). *)
+  let rec attempt waiter =
+    Mutex.lock t.mutex;
+    match t.state, waiter with
+    | Fulfilled v, _ -> Mutex.unlock t.mutex; Lwt.return v
+    | Rejected e, _ -> Mutex.unlock t.mutex; Lwt.fail e
+    | Pending, None ->
+      Mutex.unlock t.mutex;
+      attempt (Some (new_waiter ()))
+    | Pending, Some w ->
+      waiters_push t.waiters w;
+      Mutex.unlock t.mutex;
+      (* Cancelling the local promise withdraws this loop's interest and
+         leaves [t] and the other waiters alone. *)
+      on_cancel_withdraw w ~withdraw:(fun () -> withdraw t w);
+      w.w_promise
+  in
+  attempt None
 
 (* +-----------------------------------------------------------------+
    | Adopting a foreign promise                                      |
@@ -542,22 +544,34 @@ module Mutex = struct
       hand_over t
     end
 
+  (* The fast path allocates nothing: no waiter, and no loop handle, which a
+     domain that never runs Lwt would otherwise have to build. A waiter is made
+     only when one is needed, outside the lock as the rule for these locks
+     wants, and the test is made again with it in hand. The same shape serves
+     [Semaphore.acquire], [Stream.push], [Stream.take] and [await]. *)
   let lock t =
-    let w = new_waiter () in
-    Stdlib.Mutex.lock t.guard;
-    let taken =
-      if t.held then (waiters_push t.waiters w; false)
-      else (t.held <- true; true)
+    let rec attempt waiter =
+      Stdlib.Mutex.lock t.guard;
+      if not t.held then begin
+        t.held <- true;
+        Stdlib.Mutex.unlock t.guard;
+        Lwt.return_unit
+      end
+      else
+        match waiter with
+        | None ->
+          Stdlib.Mutex.unlock t.guard;
+          attempt (Some (new_waiter ()))
+        | Some w ->
+          waiters_push t.waiters w;
+          Stdlib.Mutex.unlock t.guard;
+          on_cancel_withdraw w ~withdraw:(fun () ->
+            Stdlib.Mutex.lock t.guard;
+            waiters_withdraw t.waiters w;
+            Stdlib.Mutex.unlock t.guard);
+          w.w_promise
     in
-    Stdlib.Mutex.unlock t.guard;
-    if taken then Lwt.return_unit
-    else begin
-      on_cancel_withdraw w ~withdraw:(fun () ->
-        Stdlib.Mutex.lock t.guard;
-        waiters_withdraw t.waiters w;
-        Stdlib.Mutex.unlock t.guard);
-      w.w_promise
-    end
+    attempt None
 
   let with_lock t f =
     Lwt.bind (lock t) (fun () ->
@@ -593,21 +607,28 @@ module Semaphore = struct
       wake w () ~on_dead:(fun () -> release t)
 
   let acquire t =
-    let w = new_waiter () in
-    Stdlib.Mutex.lock t.guard;
-    let taken =
-      if t.count > 0 then (t.count <- t.count - 1; true)
-      else (waiters_push t.waiters w; false)
+    let rec attempt waiter =
+      Stdlib.Mutex.lock t.guard;
+      if t.count > 0 then begin
+        t.count <- t.count - 1;
+        Stdlib.Mutex.unlock t.guard;
+        Lwt.return_unit
+      end
+      else
+        match waiter with
+        | None ->
+          Stdlib.Mutex.unlock t.guard;
+          attempt (Some (new_waiter ()))
+        | Some w ->
+          waiters_push t.waiters w;
+          Stdlib.Mutex.unlock t.guard;
+          on_cancel_withdraw w ~withdraw:(fun () ->
+            Stdlib.Mutex.lock t.guard;
+            waiters_withdraw t.waiters w;
+            Stdlib.Mutex.unlock t.guard);
+          w.w_promise
     in
-    Stdlib.Mutex.unlock t.guard;
-    if taken then Lwt.return_unit
-    else begin
-      on_cancel_withdraw w ~withdraw:(fun () ->
-        Stdlib.Mutex.lock t.guard;
-        waiters_withdraw t.waiters w;
-        Stdlib.Mutex.unlock t.guard);
-      w.w_promise
-    end
+    attempt None
 
   let with_resource t f =
     Lwt.bind (acquire t) (fun () ->
@@ -770,65 +791,78 @@ module Stream = struct
         Stdlib.Mutex.unlock t.guard;
         Lwt.return_unit
   let push t v =
-    let w = new_waiter () in
-    Stdlib.Mutex.lock t.guard;
-    if t.closed then begin
-      Stdlib.Mutex.unlock t.guard;
-      Lwt.fail Closed
-    end
-    else
-      match waiters_pop t.takers with
-      | Some taker ->
-        (* Straight to a waiting consumer, without touching the buffer. *)
-        Stdlib.Mutex.unlock t.guard;
-        wake taker (Some v) ~on_dead:(fun () -> deposit t v);
-        Lwt.return_unit
-      | None ->
-        if t.size + t.reserved < t.capacity then begin
-          queue_push t.items v;
-          t.size <- t.size + 1;
-          Stdlib.Mutex.unlock t.guard;
-          Lwt.return_unit
-        end
-        else begin
-          (* Full, reservations included: this is the back-pressure. Wait for
-             room, which will be reserved for us, and retry then, rather than
-             leaving the value with the queue: that is what makes cancelling a
-             push harmless, since nothing has been handed over. *)
-          waiters_push t.room w;
-          Stdlib.Mutex.unlock t.guard;
-          on_cancel_withdraw w ~withdraw:(fun () ->
-            Stdlib.Mutex.lock t.guard;
-            waiters_withdraw t.room w;
-            Stdlib.Mutex.unlock t.guard);
-          Lwt.bind w.w_promise (fun () -> push_reserved t v)
-        end
-
-  let take t =
-    let w = new_waiter () in
-    Stdlib.Mutex.lock t.guard;
-    match queue_pop t.items with
-    | Some v ->
-      t.size <- t.size - 1;
-      (* Taking freed a slot, so a blocked producer may go. *)
-      let next = reserve_locked t in
-      Stdlib.Mutex.unlock t.guard;
-      wake_reserved t next;
-      Lwt.return (Some v)
-    | None ->
+    let rec attempt waiter =
+      Stdlib.Mutex.lock t.guard;
       if t.closed then begin
         Stdlib.Mutex.unlock t.guard;
-        Lwt.return_none
+        Lwt.fail Closed
       end
-      else begin
-        waiters_push t.takers w;
+      else
+        match waiters_pop t.takers with
+        | Some taker ->
+          (* Straight to a waiting consumer, without touching the buffer. *)
+          Stdlib.Mutex.unlock t.guard;
+          wake taker (Some v) ~on_dead:(fun () -> deposit t v);
+          Lwt.return_unit
+        | None ->
+          if t.size + t.reserved < t.capacity then begin
+            queue_push t.items v;
+            t.size <- t.size + 1;
+            Stdlib.Mutex.unlock t.guard;
+            Lwt.return_unit
+          end
+          else
+            (* Full, reservations included: this is the back-pressure. Wait
+               for room, which will be reserved for us, and retry then, rather
+               than leaving the value with the queue: that is what makes
+               cancelling a push harmless, since nothing has been handed over.
+               The waiter is made only now (see [Mutex.lock]). *)
+            match waiter with
+            | None ->
+              Stdlib.Mutex.unlock t.guard;
+              attempt (Some (new_waiter ()))
+            | Some w ->
+              waiters_push t.room w;
+              Stdlib.Mutex.unlock t.guard;
+              on_cancel_withdraw w ~withdraw:(fun () ->
+                Stdlib.Mutex.lock t.guard;
+                waiters_withdraw t.room w;
+                Stdlib.Mutex.unlock t.guard);
+              Lwt.bind w.w_promise (fun () -> push_reserved t v)
+    in
+    attempt None
+
+  let take t =
+    let rec attempt waiter =
+      Stdlib.Mutex.lock t.guard;
+      match queue_pop t.items with
+      | Some v ->
+        t.size <- t.size - 1;
+        (* Taking freed a slot, so a blocked producer may go. *)
+        let next = reserve_locked t in
         Stdlib.Mutex.unlock t.guard;
-        on_cancel_withdraw w ~withdraw:(fun () ->
-          Stdlib.Mutex.lock t.guard;
-          waiters_withdraw t.takers w;
-          Stdlib.Mutex.unlock t.guard);
-        w.w_promise
-      end
+        wake_reserved t next;
+        Lwt.return (Some v)
+      | None ->
+        if t.closed then begin
+          Stdlib.Mutex.unlock t.guard;
+          Lwt.return_none
+        end
+        else
+          match waiter with
+          | None ->
+            Stdlib.Mutex.unlock t.guard;
+            attempt (Some (new_waiter ()))
+          | Some w ->
+            waiters_push t.takers w;
+            Stdlib.Mutex.unlock t.guard;
+            on_cancel_withdraw w ~withdraw:(fun () ->
+              Stdlib.Mutex.lock t.guard;
+              waiters_withdraw t.takers w;
+              Stdlib.Mutex.unlock t.guard);
+            w.w_promise
+    in
+    attempt None
 
   let close t =
     Stdlib.Mutex.lock t.guard;
@@ -846,10 +880,9 @@ module Stream = struct
     List.iter (fun w -> wake w None ~on_dead:no_give_back) !takers;
     (* A producer waiting for room is REJECTED rather than woken: there will be no
        room, and retrying would only find the stream closed. *)
-    let here = self () in
     List.iter
       (fun w ->
-        wake_with ~here w
+        wake_with w
           ~resolve:(fun r -> Lwt.wakeup_exn r Closed)
           ~on_dead:no_give_back)
       !room
