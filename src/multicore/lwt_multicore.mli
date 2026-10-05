@@ -214,7 +214,11 @@ val adopt : 'a Lwt.t -> 'a Lwt.t
 module Mutex : sig
   type t
   (** A mutex several loops can contend for. Unlike {!Lwt_mutex.t}, which belongs
-      to one loop and refuses any other, this one is meant to be shared. *)
+      to one loop and refuses any other, this one is meant to be shared.
+
+      Nothing releases it on behalf of a loop that holds it when its domain
+      terminates: it stays held. Use {!with_lock}, which releases it whatever
+      the function does, and do not let a domain end while it holds the lock. *)
 
   val create : unit -> t
 
@@ -247,7 +251,9 @@ module Semaphore : sig
       it. *)
 
   val create : int -> t
-  (** [create n] starts with [n] units available. *)
+  (** [create n] starts with [n] units available.
+
+      @raise Invalid_argument if [n] is negative. *)
 
   val available : t -> int
   (** A snapshot. *)
@@ -301,7 +307,9 @@ module Stream : sig
 
       The bound is exceeded transiently by an item handed to a consumer whose
       promise was cancelled meanwhile: the item comes back to the front rather
-      than being lost, even when the stream is full by then. *)
+      than being lost, even when the stream is full by then.
+
+      @raise Invalid_argument if [capacity] is less than 1. *)
 
   val push : 'a t -> 'a -> unit Lwt.t
   (** Adds an item, waiting while the stream is full. That wait is the
@@ -374,7 +382,10 @@ module Service : sig
       A service whose handler let through an exception the loop does not catch
       (a runtime exception such as [Stack_overflow], which the default
       {!Lwt.Exception_filter} leaves alone) is dead: its queued calls are
-      rejected with that exception, and so is this promise. *)
+      rejected with that exception, and so is this promise.
+
+      It waits for the request being served: a handler that never finishes
+      keeps [shutdown] waiting for ever, and the domain unreaped. *)
 end
 
 module Pool : sig
@@ -390,7 +401,9 @@ module Pool : sig
   val create : ?capacity:int -> ?count:int -> unit -> t
   (** [create ()] spawns [count] domains, defaulting to one fewer than
       [Domain.recommended_domain_count], on the assumption that the calling
-      domain is doing something too. [capacity] bounds each worker's queue. *)
+      domain is doing something too. [capacity] bounds each worker's queue.
+
+      @raise Invalid_argument if [count] is given and is not positive. *)
 
   val detach : t -> ('a -> 'b) -> 'a -> 'b Lwt.t
   (** [detach t f x] runs [f x] on one of the pool's domains and gives back the
