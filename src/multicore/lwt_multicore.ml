@@ -44,8 +44,20 @@ exception Loop_terminated
    no handler to run then, but the guard keeps the shape obvious. *)
 let drain inbox armed =
   Atomic.set armed false;
+  (* What was in the inbox when the drain began, and nothing more: work posted
+     meanwhile, by another domain or by the work being served (a job that
+     reposts itself to its own loop, say), goes behind this mark, to the next
+     drain. Draining until empty served such a chain in one pass, and nothing
+     else of the loop ran, I/O and timers included, until it ended. The post
+     that queued it after [armed] was cleared has sent the wake-up for the next
+     drain. *)
+  let mark = { run = ignore; abandon = ignore } in
+  (match Inbox.push inbox mark with
+   | () -> ()
+   | exception Inbox.Closed -> ());
   let rec go () =
     match Inbox.pop_opt inbox with
+    | Some job when job == mark -> ()
     | Some job ->
       (* An exception out of the work goes where an exception out of an
          ordinary Lwt callback goes, and the rest of the inbox is served. It

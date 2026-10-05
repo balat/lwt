@@ -173,3 +173,13 @@
  (build_if
   (>= %{ocaml_version} "5.0"))
  (libraries lwt.unix lwt_multicore threads.posix))
+
+; Work that reposts itself to its own loop does not keep the loop to itself.
+
+(test
+ (name drain_bound)
+ (package lwt_multicore)
+ (modules drain_bound)
+ (build_if
+  (>= %{ocaml_version} "5.0"))
+ (libraries lwt.unix lwt_multicore))
