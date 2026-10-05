@@ -222,7 +222,11 @@ let wake_with ~here w ~resolve ~on_dead =
     and give_back () =
       if Atomic.compare_and_set w.w_state served settled then on_dead ()
     in
-    if w.w_loop == here then deliver ()
+    (* At once only on the waiter's own loop AND its own thread: a system
+       thread of the same domain posts too, to its own loop, since resolving
+       from there would run callbacks beside the loop and leave it asleep in its
+       engine. *)
+    if w.w_loop == here && Lwt_main.on_loop_thread () then deliver ()
     else
       (* If the loop is retired before the wake-up runs, the resource had been
          handed to a waiter that will never take it, and goes back. *)

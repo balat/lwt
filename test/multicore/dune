@@ -163,3 +163,13 @@
  (build_if
   (>= %{ocaml_version} "5.0"))
  (libraries lwt.unix lwt_multicore))
+
+; Resolving from a system thread of the waiter's own domain wakes its loop.
+
+(test
+ (name systhread)
+ (package lwt_multicore)
+ (modules systhread)
+ (build_if
+  (>= %{ocaml_version} "5.0"))
+ (libraries lwt.unix lwt_multicore threads.posix))

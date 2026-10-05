@@ -129,3 +129,10 @@ module Exit_hooks :
 val at_exit : (unit -> unit Lwt.t) -> unit
 (** [Lwt_main.at_exit hook] is the same as
     [ignore (Lwt_main.Exit_hooks.add_first hook)]. *)
+
+val on_loop_thread : unit -> bool
+  [@@alert lwt_internal "Internal to the Lwt packages, keep away."]
+(** [on_loop_thread ()] is [true] if the calling system thread may resolve this
+    domain's promises on the spot: it is the thread inside {!run}, or no loop
+    runs on this domain. While a loop runs, another thread of the same domain
+    must hand the resolution to the loop instead, which [Lwt_multicore] does. *)

@@ -53,6 +53,11 @@ type hooks = {
      one-slot rule. *)
   mutable running : [ `No | `From_somewhere | `From of string ];
   running_mutex : Mutex.t;
+
+  (* The id of the system thread inside [run], or -1 when no loop runs on this
+     domain. Read without the mutex by other threads of the domain, hence the
+     atomic: see [on_loop_thread]. *)
+  loop_thread : int Atomic.t;
 }
 
 let drain_exit_hooks = ref (fun () -> ())
@@ -76,6 +81,7 @@ let hooks : hooks Lwt_dls.t =
       exits = Lwt_sequence.create ();
       running = `No;
       running_mutex = Mutex.create ();
+      loop_thread = Atomic.make (-1);
     })
 
 let enter_iter_hooks () = (Lwt_dls.get hooks).enter_iter
@@ -147,7 +153,18 @@ let finished () =
   let h = Lwt_dls.get hooks in
   Mutex.lock h.running_mutex;
   h.running <- `No;
+  Atomic.set h.loop_thread (-1);
   Mutex.unlock h.running_mutex
+
+(* Whether the calling system thread may resolve this domain's promises on the
+   spot: it is the thread running the loop, or no loop runs here and Lwt's
+   classic rule applies (one thread uses Lwt). Another thread of the domain,
+   while the loop runs, must post to the loop instead: resolving from there
+   would run callbacks beside the loop, and nothing would wake the loop if it
+   sleeps in its engine. *)
+let on_loop_thread () =
+  let t = Atomic.get (Lwt_dls.get hooks).loop_thread in
+  t < 0 || t = Thread.id (Thread.self ())
 
 let run p =
   (* Fail in case a call to Lwt_main.run is nested under another invocation of
@@ -189,6 +206,7 @@ let run p =
           `From_somewhere
       in
       h.running <- called_from;
+      Atomic.set h.loop_thread (Thread.id (Thread.self ()));
       None
   in
 
