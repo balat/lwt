@@ -346,11 +346,29 @@ let inj = Public_handle.inj
 (* Follow alias links to the canonical cell ([forward]'s reverse-merged proxy),
    with path compression. The overwhelmingly common case — a promise that was
    never forwarded — pays one [None] check. *)
-let rec underlying (p : 'a promise) : 'a promise =
+(* In two passes, both tail-recursive: find the root, then point every link on
+   the way at it. A recursion that compressed on the way back used the stack
+   in proportion to the chain, and a chain of a million aliases (each
+   continuation of a bind returning the previous accumulator) overflowed it on
+   OCaml 4.14, as in the historical core. As before, a link is rewritten only
+   when it does not already name the root, and only with [Some root]. *)
+let rec root_of (p : 'a promise) : 'a promise =
   match p.st with
-  | Pending ({ link = Some p'; _ } as pe) ->
-    let root = underlying p' in
-    if root != p' then pe.link <- Some root;
+  | Pending { link = Some p'; _ } -> root_of p'
+  | Pending { link = None; _ } | Fulfilled _ | Rejected _ -> p
+
+let rec compress (p : 'a promise) (root : 'a promise) =
+  match p.st with
+  | Pending ({ link = Some p'; _ } as pe) when p' != root ->
+    pe.link <- Some root;
+    compress p' root
+  | Pending _ | Fulfilled _ | Rejected _ -> ()
+
+let underlying (p : 'a promise) : 'a promise =
+  match p.st with
+  | Pending { link = Some _; _ } ->
+    let root = root_of p in
+    compress p root;
     root
   | Pending { link = None; _ } | Fulfilled _ | Rejected _ -> p
 

@@ -11,6 +11,7 @@
   test_ownership
   test_containers_domains
   test_per_loop
+  test_alias_chain
   test_browser_invariants)
  (libraries lwttester))
 
@@ -93,4 +94,12 @@
  (modules test_per_loop)
  (build_if
   (>= %{ocaml_version} "5.0"))
+ (libraries lwt))
+
+; A chain of a million aliases walked in constant stack, on every OCaml.
+
+(test
+ (name test_alias_chain)
+ (package lwt)
+ (modules test_alias_chain)
  (libraries lwt))
