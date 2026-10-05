@@ -81,12 +81,6 @@
     dup2. Its functions are optional arguments, so that later versions can
     add some without breaking existing backends.
 
-====== Fixes ======
-
-  * Lwt_engine: stopping an event through the handle its registration returned
-    works after any number of engine replacements. From the second one on, it
-    stopped nothing, and libev could then abort on a closed descriptor.
-
   * Lwt_direct.await works in any callback the event loop runs, not only
     inside Lwt_direct.spawn: in a bind continuation, an on_success callback,
     a completion handler. A function written in direct style can then be
@@ -104,6 +98,17 @@
     a callback invoked from C (the libev engine does so for callbacks handed
     directly to Lwt_engine), await and yield raise Failure.
 
+  * Lwt_direct.main, the entry point of a program written in direct style
+    (Lwt_main.run (spawn f)); and Lwt_direct.no_await, a region in which an
+    await on a pending promise, or a yield, raises Suspension_forbidden at
+    the point of the call instead of suspending, for code that must run
+    without interleaving. The senders and setters returned by
+    Lwt_react.E.create and Lwt_react.S.create open such a region around the
+    propagation they start, so an await in a React node function raises
+    instead of leaving the update step in progress.
+
+====== Changes ======
+
   * Lwt_direct.yield suspends the task until the next lap of the event loop,
     after one engine iteration, so a task that yields in a loop starves
     nothing; it used to re-queue the task at once, and a loop of yields kept
@@ -120,19 +125,19 @@
     of running them on the engine's stack; they run as soon as the iteration
     returns. Everywhere else its immediacy is unchanged.
 
-  * Lwt_direct.main, the entry point of a program written in direct style
-    (Lwt_main.run (spawn f)); and Lwt_direct.no_await, a region in which an
-    await on a pending promise, or a yield, raises Suspension_forbidden at
-    the point of the call instead of suspending, for code that must run
-    without interleaving. The senders and setters returned by
-    Lwt_react.E.create and Lwt_react.S.create open such a region around the
-    propagation they start, so an await in a React node function raises
-    instead of leaving the update step in progress.
-
   * Lwt_direct requires OCaml 5.3 (it uses the effect-handler syntax); lwt
     itself still requires OCaml 4.14.
 
+  * Printexc.to_string Lwt.Canceled is "Lwt.Canceled". The exception is
+    the same, but it was defined in an internal module, and printed as
+    "Lwt.Resolution_loop.Canceled"; code that compares that string must
+    follow.
+
 ====== Fixes ======
+
+  * Lwt_engine: stopping an event through the handle its registration returned
+    works after any number of engine replacements. From the second one on, it
+    stopped nothing, and libev could then abort on a closed descriptor.
 
   * Lwt.key: the sequence-associated storage no longer routes values through a
     mutable cell held in the key. A key is a single process-wide value, so two
