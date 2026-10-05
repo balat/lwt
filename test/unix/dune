@@ -23,6 +23,7 @@
    domain_upstream_scenarios
    domain_notifications
    domain_signals
+   signal_full_buffer
    domain_gc
    domain_reuseport
    bench_reuseport
@@ -299,4 +300,13 @@
   (and
    (>= %{ocaml_version} "5.0")
    (<> %{os_type} Win32)))
+ (libraries lwt.unix))
+
+; A signal arriving while the notification buffer is full is delivered,
+; without the handler growing the buffer.
+
+(test
+ (name signal_full_buffer)
+ (package lwt)
+ (modules signal_full_buffer)
  (libraries lwt.unix))

@@ -41,6 +41,7 @@ test/unix/domain_io_affinity.exe
 test/unix/domain_notifications.exe
 test/unix/domain_reuseport.exe
 test/unix/domain_signals.exe
+test/unix/signal_full_buffer.exe
 test/unix/domain_timeouts.exe
 test/unix/domain_two_loops.exe
 test/unix/domain_unix_policy.exe
