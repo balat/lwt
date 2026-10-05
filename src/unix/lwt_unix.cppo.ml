@@ -2703,8 +2703,9 @@ let () =
         notif.signals;
       notif.signals <- Signal_map.empty
 
-(* Subscribing again would not do it: this loop is already counted, and only
-   the first subscriber installs the process-wide handler. *)
+(* Subscribing again would not do it: this loop's subscription is already
+   counted, and only the first one that needs the process-wide handler installs
+   it. *)
 let reinstall_signal_handler signum =
   if Signal_map.mem signum (self_notif ()).signals
   && not (Lwt_engine.forwards_signal signum) then

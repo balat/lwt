@@ -25,6 +25,7 @@
    domain_signals
    signal_full_buffer
    domain_std_channels
+   domain_signal_forwarding
    domain_gc
    domain_reuseport
    bench_reuseport
@@ -319,6 +320,17 @@
  (name domain_std_channels)
  (package lwt)
  (modules domain_std_channels)
+ (build_if
+  (>= %{ocaml_version} "5.0"))
+ (libraries lwt.unix))
+
+; A loop subscribing to a signal after one whose engine forwards it still gets
+; the process-wide handler. Needs other domains, hence OCaml 5.
+
+(test
+ (name domain_signal_forwarding)
+ (package lwt)
+ (modules domain_signal_forwarding)
  (build_if
   (>= %{ocaml_version} "5.0"))
  (libraries lwt.unix))

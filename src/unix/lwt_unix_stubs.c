@@ -1208,23 +1208,24 @@ static void handle_signal(int signum) {
 }
 
 /* Serialises the changes of subscription across loops. Whether a loop is the
-   first subscriber (and installs the process-wide handler) or the last one to
-   leave (and uninstalls it) is decided by counting the table, and the count,
-   the write and the installation must be one step: two loops changing their
+   first that needs the process-wide handler (and installs it) or the last one
+   (and uninstalls it) is decided by the counts below, and the count, the write
+   and the installation must be one step: two loops changing their
    subscriptions at the same time could otherwise leave a subscribed loop with
    no handler, SIGCHLD included. The runtime lock orders nothing here, since in
    OCaml 5 every domain has its own. [handle_signal] never takes this mutex: it
    only reads the table, one word at a time. The mutex itself is declared next
    to [lwt_unix_init_notifications], which initialises it on Windows. */
 
-/* How many loops are subscribed to this signal. Called under
+/* The subscriptions that NEED the process-wide handler, per signal: those whose
+   loop's engine does not forward the signal itself. Counting subscribers would
+   not do: a first subscriber whose engine forwards it does not install the
+   handler, and a later one whose engine does not would then go without. And
+   which subscriptions were counted is remembered, rather than asked again of
+   the engine when they leave, since a loop may change engines meanwhile. Under
    [signal_table_mutex]. */
-static int signal_subscriber_count(int signum) {
-  int i, n = 0;
-  for (i = 0; i < LWT_NOTIFICATION_CHANNELS; i++)
-    if (signal_notifications[signum][i] != 0) n++;
-  return n;
-}
+static int signal_handler_users[NSIG];
+static char signal_counted[NSIG][LWT_NOTIFICATION_CHANNELS];
 
 /* Installs the process-wide handler for [signum]. Returns 0, or the error code
    with the name of the call that failed in [*name], so that the caller can
@@ -1312,7 +1313,6 @@ CAMLprim value lwt_unix_set_signal(value val_signum, value val_notification, val
   int signum = caml_convert_signal_number(Int_val(val_signum));
   intnat notification = Long_val(val_notification);
   int slot;
-  int first;
   int error = 0;
   const char *name = NULL;
 
@@ -1323,14 +1323,19 @@ CAMLprim value lwt_unix_set_signal(value val_signum, value val_notification, val
      the subscription. */
   slot = LWT_NOTIFICATION_INDEX(notification);
   lwt_unix_mutex_lock(&signal_table_mutex);
-  first = (signal_subscriber_count(signum) == 0);
   LWT_STORE_RELEASE(&signal_notifications[signum][slot], notification);
 
-  /* The process-wide handler is installed by the FIRST subscriber only; a second
-     loop subscribing must not reinstall it, and must not be told it failed. */
-  if (!Bool_val(val_forwarded) && first) {
-    error = install_process_handler(signum, &name);
-    if (error != 0) LWT_STORE_RELEASE(&signal_notifications[signum][slot], 0);
+  /* The process-wide handler is installed by the first subscription that needs
+     it only; another one must not reinstall it, and must not be told it
+     failed. */
+  if (!Bool_val(val_forwarded) && !signal_counted[signum][slot]) {
+    if (signal_handler_users[signum] == 0)
+      error = install_process_handler(signum, &name);
+    if (error == 0) {
+      signal_handler_users[signum]++;
+      signal_counted[signum][slot] = 1;
+    } else
+      LWT_STORE_RELEASE(&signal_notifications[signum][slot], 0);
   }
   lwt_unix_mutex_unlock(&signal_table_mutex);
 
@@ -1346,11 +1351,16 @@ CAMLprim value lwt_unix_remove_signal(value val_signum, value val_notification,
      set_signal. */
   int signum = caml_convert_signal_number(Int_val(val_signum));
   int slot = LWT_NOTIFICATION_INDEX(Long_val(val_notification));
+  /* Whether this subscription counted is what was recorded when it was made:
+     the engine asked now may not be the one asked then. */
+  (void)val_forwarded;
 
   lwt_unix_mutex_lock(&signal_table_mutex);
   LWT_STORE_RELEASE(&signal_notifications[signum][slot], 0);
-  if (!Bool_val(val_forwarded) && signal_subscriber_count(signum) == 0)
-    uninstall_process_handler(signum);
+  if (signal_counted[signum][slot]) {
+    signal_counted[signum][slot] = 0;
+    if (--signal_handler_users[signum] == 0) uninstall_process_handler(signum);
+  }
   lwt_unix_mutex_unlock(&signal_table_mutex);
   return Val_unit;
 }
@@ -1358,8 +1368,8 @@ CAMLprim value lwt_unix_remove_signal(value val_signum, value val_notification,
 /* Puts the process-wide handler back, for a signal some loop is subscribed to.
    What [Lwt_unix.reinstall_signal_handler] is for: another library replaced the
    handler with its own, and Lwt's subscribers would otherwise never hear the
-   signal again. Subscribing again does not do it, since the loop is already
-   counted and only the first subscriber installs. */
+   signal again. Subscribing again does not do it, since the subscription is
+   already counted and only the first one that needs the handler installs it. */
 CAMLprim value lwt_unix_reinstall_signal(value val_signum) {
   int signum = caml_convert_signal_number(Int_val(val_signum));
   int error = 0;
@@ -1369,7 +1379,7 @@ CAMLprim value lwt_unix_reinstall_signal(value val_signum) {
     caml_invalid_argument("Lwt_unix.reinstall_signal_handler: unavailable signal");
 
   lwt_unix_mutex_lock(&signal_table_mutex);
-  if (signal_subscriber_count(signum) > 0)
+  if (signal_handler_users[signum] > 0)
     error = install_process_handler(signum, &name);
   lwt_unix_mutex_unlock(&signal_table_mutex);
 
