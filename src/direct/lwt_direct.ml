@@ -65,9 +65,9 @@ type _ Effect.t +=
 let no_handler fname =
   failwith
     (fname
-    ^ ": no scheduler handler on the current stack. Either no event loop is 
-       running on this domain (start one with Lwt_direct.main or 
-       Lwt_main.run), or this callback was invoked from C code, across which 
+    ^ ": no scheduler handler on the current stack. Either no event loop is \
+       running on this domain (start one with Lwt_direct.main or \
+       Lwt_main.run), or this callback was invoked from C code, across which \
        an effect cannot be performed.")
 
 (* A region where suspension is forbidden ([no_await]) is a counter kept by the
