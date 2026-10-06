@@ -26,3 +26,13 @@ let runtime_events =
       print_endline ("unrecognised version " ^ Sys.ocaml_version);
       exit 1
 let () = Printf.printf "runtime_events=%B\n" runtime_events
+
+(* lwt_multicore runs loops on several domains: OCaml 5. *)
+let multicore =
+  match split_version with
+  | "4" :: _ -> false
+  | "5" :: _ -> true
+  | _ ->
+      print_endline ("unrecognised version " ^ Sys.ocaml_version);
+      exit 1
+let () = Printf.printf "multicore=%B\n" multicore
