@@ -102,6 +102,8 @@ let abandon_yielded_and_paused () =
    resolved, which makes the scheduler return [p]'s outcome. *)
 let run_hooks hooks = Lwt_sequence.iter_l (fun f -> f ()) hooks
 
+let nothing_to_do () = false
+
 let run (type a) (p : a Lwt.t) : a =
   (* One lap: iteration hooks, engine, pause service. The leave hooks of a lap
      run at the start of the next call, once the run queue is empty, so that
@@ -144,7 +146,13 @@ let run (type a) (p : a Lwt.t) : a =
 
   Lwt_rte.emit_sch_call_begin ();
   Fun.protect
-    ~finally:(fun () -> Lwt_rte.emit_sch_call_end ())
+    ~finally:(fun () ->
+      (* The idle hook stays installed until the next run, and this one holds
+         [p], and with it whatever [p] resolved to. Put one in its place that
+         holds nothing and answers what this one would, now that [p] is
+         resolved: that there is nothing left to do. *)
+      Lwt.Private.scheduler_set_idle nothing_to_do;
+      Lwt_rte.emit_sch_call_end ())
     (fun () ->
       Lwt.Private.scheduler_set_idle idle;
       Lwt.Private.scheduler_run (fun () -> p))

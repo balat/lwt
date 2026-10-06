@@ -27,6 +27,7 @@
    domain_std_channels
    domain_signal_forwarding
    run_queue_shrink
+   run_releases_promise
    domain_gc
    domain_reuseport
    bench_reuseport
@@ -342,4 +343,12 @@
  (name run_queue_shrink)
  (package lwt)
  (modules run_queue_shrink)
+ (libraries lwt.unix))
+
+; Lwt_main.run keeps nothing of its promise once it has returned.
+
+(test
+ (name run_releases_promise)
+ (package lwt)
+ (modules run_releases_promise)
  (libraries lwt.unix))
