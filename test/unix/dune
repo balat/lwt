@@ -12,7 +12,8 @@
    ocaml_runtime_exc_4
    ocaml_runtime_exc_5
    ocaml_runtime_exc_6
-   set_engine)))
+   set_engine
+   signal_full_buffer)))
 
 (executable
  (name dummy)
@@ -67,3 +68,12 @@
  (name set_engine)
  (libraries lwt lwt.unix)
  (modules set_engine))
+
+; A signal arriving while the notification buffer is full is delivered,
+; without the handler growing the buffer.
+
+(test
+ (name signal_full_buffer)
+ (package lwt)
+ (modules signal_full_buffer)
+ (libraries lwt.unix))

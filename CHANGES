@@ -7,6 +7,13 @@
     call and the reading of its errno, in any thread, made that code read the
     handler's value instead.
 
+  * Lwt_unix: the signal handler neither allocates nor raises. With the
+    notification buffer full it grew it with malloc, which deadlocks if the
+    signal interrupted malloc; it now marks the signal pending and the next
+    drain delivers it. A failed wake-up write raised an OCaml exception from
+    the handler; it is ignored there. Signals are blocked while the handler
+    runs, so that a second one cannot interrupt it holding the lock.
+
 ===== 6.1.2 =====
 
 ====== Fixes ======
