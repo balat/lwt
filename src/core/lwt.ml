@@ -87,6 +87,15 @@ module Run_queue = struct
     q.a.((q.head + q.len) land (Array.length q.a - 1)) <- x;
     q.len <- q.len + 1
 
+  (* Back to the initial capacity once empty, if a burst grew it past 1024: an
+     array of a million slots is 8 MB that would otherwise stay with the domain
+     for good. Called when the scheduler goes idle, not on the hot path. *)
+  let shrink q =
+    if q.len = 0 && Array.length q.a > 1024 then begin
+      q.a <- Array.make 16 q.sentinel;
+      q.head <- 0
+    end
+
   (* Caller must ensure [not (is_empty q)]; avoids allocating an option. *)
   let pop q =
     let x = q.a.(q.head) in
@@ -1473,6 +1482,7 @@ let run_scheduler (sched : sched) : unit =
          of pauses the engine still runs once per batch instead of after the
          whole pause cascade settles. Returns [false] only when there is
          nothing left to do. *)
+      Run_queue.shrink sched.queue;
       if idle_lap () && sched.drainer_gen = gen then loop ()
     end
     else begin

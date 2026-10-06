@@ -26,6 +26,7 @@
    signal_full_buffer
    domain_std_channels
    domain_signal_forwarding
+   run_queue_shrink
    domain_gc
    domain_reuseport
    bench_reuseport
@@ -333,4 +334,12 @@
  (modules domain_signal_forwarding)
  (build_if
   (>= %{ocaml_version} "5.0"))
+ (libraries lwt.unix))
+
+; The scheduler's run queue shrinks back after a burst.
+
+(test
+ (name run_queue_shrink)
+ (package lwt)
+ (modules run_queue_shrink)
  (libraries lwt.unix))
