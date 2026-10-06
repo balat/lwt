@@ -8,9 +8,10 @@ let letppx =
       exit 1
 let () = Printf.printf "letppx=%B\n" letppx
 
+(* lwt_direct uses the effect-handler syntax, which is OCaml 5.3. *)
 let direct =
   match split_version with
-  | "4" :: _ -> false
+  | "4" :: _ | "5" :: ("0"|"1"|"2") :: _ -> false
   | "5" :: _ -> true
   | _ ->
       print_endline ("unrecognised version " ^ Sys.ocaml_version);
